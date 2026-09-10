@@ -30,10 +30,12 @@ migrator는 schema 생성·DDL·Alembic version 변경 권한을, runtime은 앱
 ## Kubernetes probe와 종료
 
 - liveness: `GET /healthz`, DB와 무관하게 200
-- readiness: `GET /readyz`, DB와 필수 Alembic revision 확인; 실패 시 안전한 503
+- readiness: `GET /readyz`, pool 대기와 SQL 실행을 합친 2초 예산 안에 DB·필수 Alembic
+  revision을 확인; 실패 시 안전한 503
 - readiness probe: `timeoutSeconds: 3`, `periodSeconds: 5`, `failureThreshold: 1`
 - liveness probe: `timeoutSeconds: 1`, `periodSeconds: 10`, `failureThreshold: 3`
 - `terminationGracePeriodSeconds: 30`; Uvicorn graceful shutdown은 25초
 
 컨테이너는 read-only root filesystem으로 실행하고, 필요한 경우에만 `/tmp`를 `emptyDir`로
-마운트한다. 실제 Secret, DB 주소, 예외 원문은 로그·응답·Git에 넣지 않는다.
+마운트한다. 실제 Secret, DB 주소, 예외 원문은 로그·응답·Git에 넣지 않는다. `psycopg.pool`
+연결 실패 log도 안전한 연결 불가 분류만 기록한다.

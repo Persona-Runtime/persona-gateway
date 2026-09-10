@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -17,6 +19,28 @@ MAX_PERSONAS_PER_USER = 3
 CREATE_PERSONA_OPERATION = "create_persona"
 CREATE_PERSONA_SCOPE = "/v1/personas"
 REQUIRED_ALEMBIC_REVISION = "0001_persona_minimal"
+
+
+class SafePoolLogFilter(logging.Filter):
+    """psycopg pool의 원문 연결 오류가 운영 로그에 남지 않게 한다."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            record.msg = "database pool connection unavailable"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
+_POOL_LOG_FILTER = SafePoolLogFilter()
+
+
+def configure_pool_logging() -> None:
+    logger = logging.getLogger("psycopg.pool")
+    if _POOL_LOG_FILTER not in logger.filters:
+        logger.addFilter(_POOL_LOG_FILTER)
 
 
 class DuplicatePersonaName(Exception):
@@ -202,30 +226,51 @@ class PostgresPersonaStore:
         liveness는 DB 장애로 실패하면 안 된다. readiness만 이 검사를 사용하고,
         예상 가능한 연결·권한·스키마 오류는 외부에 세부 정보를 노출하지 않고 false로 바꾼다.
         """
+        deadline = time.monotonic() + self.pool.timeout
         try:
-            with self.pool.connection() as connection:
-                with connection.cursor() as cur:
+            with self.pool.connection(timeout=_remaining_seconds(deadline)) as connection:
+                with connection.transaction(), connection.cursor() as cur:
+                    # Pool 대기 뒤 남은 시간만 DB statement에 준다. probe timeout은 실행 중인
+                    # 동기 SQL을 취소하지 못하므로, DB가 직접 잠금 대기를 끊어야 한다.
+                    cur.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (_statement_timeout_value(deadline),),
+                    )
                     cur.execute(
                         """
                         SELECT
-                            to_regclass('persona_minimal.personas'),
-                            to_regclass('persona_minimal.alembic_version')
-                        """
+                            to_regclass('persona_minimal.personas') IS NOT NULL
+                            AND to_regclass('persona_minimal.alembic_version') IS NOT NULL
+                            AND EXISTS (
+                                SELECT 1
+                                FROM persona_minimal.alembic_version
+                                WHERE version_num = %s
+                            )
+                        """,
+                        (REQUIRED_ALEMBIC_REVISION,),
                     )
-                    personas_table, version_table = cur.fetchone()
-                    if personas_table is None or version_table is None:
-                        return False
-                    cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
                     row = cur.fetchone()
-                    return row is not None and row[0] == REQUIRED_ALEMBIC_REVISION
+                    return row is not None and bool(row[0])
         except (PoolTimeout, PsycopgError):
             return False
 
 
+def _remaining_seconds(deadline: float) -> float:
+    return max(0.001, deadline - time.monotonic())
+
+
+def _statement_timeout_value(deadline: float) -> str:
+    return f"{max(1, int(_remaining_seconds(deadline) * 1000))}ms"
+
+
 def create_pool(database_url: str, timeout_seconds: float) -> ConnectionPool:
+    configure_pool_logging()
     pool = ConnectionPool(
         conninfo=database_url,
-        kwargs={"connect_timeout": max(1, round(timeout_seconds))},
+        kwargs={
+            "connect_timeout": max(1, round(timeout_seconds)),
+            "options": f"-c statement_timeout={max(1, int(timeout_seconds * 1000))}",
+        },
         min_size=1,
         max_size=8,
         timeout=timeout_seconds,
