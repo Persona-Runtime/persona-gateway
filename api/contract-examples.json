@@ -1,0 +1,235 @@
+{
+  "description": "합성 스키마 검증 fixture. DB/서버/비즈니스 상태 검증을 대체하지 않음.",
+  "cases": [
+    {
+      "name": "synthetic-user",
+      "schema": "User",
+      "valid": true,
+      "value": {
+        "id": "demo-owner",
+        "display_name": "테스트 사용자"
+      }
+    },
+    {
+      "name": "create-persona",
+      "schema": "CreatePersona",
+      "valid": true,
+      "value": {
+        "name": "모루"
+      }
+    },
+    {
+      "name": "new-persona-needs-material",
+      "schema": "Persona",
+      "valid": true,
+      "value": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "name": "모루",
+        "status": "needs_material",
+        "active_version_id": null,
+        "draft": null,
+        "deletion_id": null,
+        "created_at": "2026-09-10T00:00:00Z"
+      }
+    },
+    {
+      "name": "empty-persona-page",
+      "schema": "PersonaPage",
+      "valid": true,
+      "value": {
+        "items": [],
+        "next_cursor": null
+      }
+    },
+    {
+      "name": "profile-only-upload",
+      "schema": "Upload",
+      "valid": true,
+      "value": {
+        "profile": [
+          "모루는 침착한 도서관 안내자다."
+        ]
+      }
+    },
+    {
+      "name": "accepted-job",
+      "schema": "JobAccepted",
+      "valid": true,
+      "value": {
+        "job_id": "00000000-0000-4000-8000-000000000010",
+        "version_id": "00000000-0000-4000-8000-000000000002",
+        "draft_revision": 1,
+        "status": "queued"
+      }
+    },
+    {
+      "name": "draft-source-edit",
+      "schema": "DraftPatch",
+      "valid": true,
+      "value": {
+        "expected_revision": 3,
+        "upsert_sources": [
+          {
+            "kind": "events",
+            "filename": "events.md",
+            "content": "개관 첫날 지도책을 찾았다."
+          }
+        ]
+      }
+    },
+    {
+      "name": "chat-request",
+      "schema": "ChatRequest",
+      "valid": true,
+      "value": {
+        "conversation_id": "00000000-0000-4000-8000-000000000003",
+        "message": "첫날 무슨 일이 있었어?"
+      }
+    },
+    {
+      "name": "activate-revision",
+      "schema": "RevisionRequest",
+      "valid": true,
+      "value": {
+        "expected_revision": 3
+      }
+    },
+    {
+      "name": "cancelled-generation",
+      "schema": "Generation",
+      "valid": true,
+      "value": {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "conversation_id": "00000000-0000-4000-8000-000000000003",
+        "user_message_id": "00000000-0000-4000-8000-000000000005",
+        "assistant_message_id": "00000000-0000-4000-8000-000000000006",
+        "version_id": "00000000-0000-4000-8000-000000000002",
+        "retry_of_generation_id": null,
+        "mode": "mock",
+        "status": "cancelled",
+        "content": "합성 부분 응답",
+        "citations": [],
+        "failure_code": "user_cancelled",
+        "can_retry": true,
+        "created_at": "2026-09-10T00:00:00Z",
+        "finished_at": "2026-09-10T00:00:02Z"
+      }
+    },
+    {
+      "name": "mock-available",
+      "schema": "ServiceStatus",
+      "valid": true,
+      "value": {
+        "generation": {
+          "mode": "mock",
+          "available": true,
+          "reason": null
+        },
+        "ingestion": {
+          "available": true,
+          "reason": null
+        },
+        "checked_at": "2026-09-10T00:00:00Z"
+      }
+    },
+    {
+      "name": "safe-error",
+      "schema": "Error",
+      "valid": true,
+      "value": {
+        "error": {
+          "code": "draft_revision_conflict",
+          "message": "초안을 다시 조회해주세요.",
+          "request_id": "00000000-0000-4000-8000-000000000099"
+        }
+      }
+    },
+    {
+      "name": "missing-persona-name",
+      "schema": "CreatePersona",
+      "valid": false,
+      "value": {}
+    },
+    {
+      "name": "untrusted-owner-field",
+      "schema": "CreatePersona",
+      "valid": false,
+      "value": {
+        "name": "모루",
+        "owner_subject": "someone-else"
+      }
+    },
+    {
+      "name": "invalid-kind",
+      "schema": "SourceUpsert",
+      "valid": false,
+      "value": {
+        "kind": "url",
+        "content": "https://example.invalid"
+      }
+    },
+    {
+      "name": "missing-revision",
+      "schema": "DraftPatch",
+      "valid": false,
+      "value": {
+        "settings": {
+          "profile": "바뀐 소개"
+        }
+      }
+    },
+    {
+      "name": "empty-patch",
+      "schema": "DraftPatch",
+      "valid": false,
+      "value": {
+        "expected_revision": 1
+      }
+    },
+    {
+      "name": "zero-revision",
+      "schema": "RevisionRequest",
+      "valid": false,
+      "value": {
+        "expected_revision": 0
+      }
+    },
+    {
+      "name": "invalid-conversation-id",
+      "schema": "ChatRequest",
+      "valid": false,
+      "value": {
+        "conversation_id": "arbitrary",
+        "message": "질문"
+      }
+    },
+    {
+      "name": "bad-job-status",
+      "schema": "JobAccepted",
+      "valid": false,
+      "value": {
+        "job_id": "00000000-0000-4000-8000-000000000010",
+        "version_id": "00000000-0000-4000-8000-000000000002",
+        "draft_revision": 1,
+        "status": "ready"
+      }
+    },
+    {
+      "name": "unknown-mode",
+      "schema": "ServiceStatus",
+      "valid": false,
+      "value": {
+        "generation": {
+          "mode": "auto",
+          "available": true,
+          "reason": null
+        },
+        "ingestion": {
+          "available": true,
+          "reason": null
+        },
+        "checked_at": "2026-09-10T00:00:00Z"
+      }
+    }
+  ]
+}

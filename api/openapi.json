@@ -1,0 +1,3330 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Persona Runtime public API",
+    "version": "1.0.0-draft.2",
+    "description": "목표 계약 초안. 초기 제품 제한·보존·토큰 메모리 보관 반영. 서버 구현 완료 아님. 동작은 service-api-v1.md, 차이는 implementation-gap-v1.md. 남은 정책은 x-pending-policy-decisions. 합성 예시만 사용."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "동일 origin의 Tailnet HTTPS 진입점. 개발 mock 이외 실제 토큰을 평문으로 보내지 않는다."
+    }
+  ],
+  "security": [
+    {
+      "BearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Identity"
+    },
+    {
+      "name": "Personas"
+    },
+    {
+      "name": "Intake"
+    },
+    {
+      "name": "Drafts"
+    },
+    {
+      "name": "Chat"
+    },
+    {
+      "name": "Operations"
+    }
+  ],
+  "paths": {
+    "/v1/me": {
+      "get": {
+        "operationId": "getMe",
+        "summary": "접속 토큰·현재 사용자 확인",
+        "tags": [
+          "Identity"
+        ],
+        "description": "접속 토큰·현재 사용자 확인",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "접속 토큰·현재 사용자 확인",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/personas": {
+      "post": {
+        "operationId": "createPersona",
+        "summary": "자료 없는 캐릭터 생성",
+        "tags": [
+          "Personas"
+        ],
+        "description": "자료 없는 캐릭터 생성. 사용자당 삭제 중 포함 최대 3개, 삭제 완료 후 슬롯 반환. 한도 초과 409 persona_limit_exceeded. 동일 키 replay는 새 캐릭터를 만들지 않으며 한도 검사·등록을 원자 처리.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "자료 없는 캐릭터 생성",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Persona"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePersona"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listPersonas",
+        "summary": "내 캐릭터 목록",
+        "tags": [
+          "Personas"
+        ],
+        "description": "내 캐릭터 목록",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "내 캐릭터 목록",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/personas/{persona_id}": {
+      "get": {
+        "operationId": "getPersona",
+        "summary": "적용본·초안 상태 포함 상세 조회",
+        "tags": [
+          "Personas"
+        ],
+        "description": "적용본·초안 상태 포함 상세 조회",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "적용본·초안 상태 포함 상세 조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deletePersona",
+        "summary": "캐릭터 비동기 삭제 접수",
+        "tags": [
+          "Operations"
+        ],
+        "description": "캐릭터 비동기 삭제 접수",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "캐릭터 비동기 삭제 접수",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeletionAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/personas/{persona_id}/uploads": {
+      "post": {
+        "operationId": "uploadMaterials",
+        "summary": "첫 초안·입력·작업 원자 접수",
+        "tags": [
+          "Intake"
+        ],
+        "description": "최초 자료 제출용. 적용본/초안이 이미 있으면 새 키 요청은 409. 기존 초안의 검색 자료 변경은 PATCH draft → process. 동일 키 성공 replay가 상태 검사보다 우선한다.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "첫 초안·입력·작업 원자 접수",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Upload"
+              },
+              "encoding": {
+                "profile": {
+                  "style": "form",
+                  "explode": true
+                },
+                "files.profile": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "text/plain, text/markdown, application/octet-stream"
+                },
+                "events": {
+                  "style": "form",
+                  "explode": true
+                },
+                "files.events": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "text/plain, text/markdown, application/octet-stream"
+                },
+                "relationships": {
+                  "style": "form",
+                  "explode": true
+                },
+                "files.relationships": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "text/plain, text/markdown, application/octet-stream"
+                },
+                "abilities": {
+                  "style": "form",
+                  "explode": true
+                },
+                "files.abilities": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "text/plain, text/markdown, application/octet-stream"
+                },
+                "speech_examples": {
+                  "style": "form",
+                  "explode": true
+                },
+                "files.speech_examples": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "text/plain, text/markdown, application/octet-stream"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "getJob",
+        "summary": "내 처리 작업 상태 조회",
+        "tags": [
+          "Intake"
+        ],
+        "description": "내 처리 작업 상태 조회",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "내 처리 작업 상태 조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/retry": {
+      "post": {
+        "operationId": "retryJob",
+        "summary": "종료된 실패 작업의 명시적 재처리",
+        "tags": [
+          "Intake"
+        ],
+        "description": "can_retry=true, 현재 초안·입력 revision 일치 시에만 새 job_id. version_id 유지, attempt count 새 작업에서 0부터. 이미 새 작업이 있으면 409.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "종료된 실패 작업의 명시적 재처리",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/personas/{persona_id}/draft": {
+      "post": {
+        "operationId": "createDraft",
+        "summary": "적용본에서 수정 초안 생성",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "요청 base_version_id가 현재 적용본과 다르면 409. 적용본 없음/기존 초안 있음도 409. 초기 revision=1.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "적용본에서 수정 초안 생성",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Draft"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDraft"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "getDraft",
+        "summary": "초안 설정·원문·revision 조회",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "초안 설정·원문·revision 조회",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "초안 설정·원문·revision 조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Draft"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "patchDraft",
+        "summary": "초안 설정·문서 변경",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "revision CAS. 의미 있는 변경마다 revision+1. 처리 중/미확인 상태는 409. 파일 추가는 웹이 UTF-8로 읽어 upsert_sources content로 전달하고 서버도 같은 검증 수행. settings와 profile/speech source 동시 충돌 수정은 422.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "초안 설정·문서 변경",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Draft"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DraftPatch"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "discardDraft",
+        "summary": "종료된 미적용 초안 폐기",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "종료된 미적용 초안 폐기",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/ExpectedRevision"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "처리 완료; 본문 없음"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/personas/{persona_id}/draft/process": {
+      "post": {
+        "operationId": "processDraft",
+        "summary": "수정된 검색 자료의 새 처리 접수",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "수정된 검색 자료의 새 처리 접수",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "수정된 검색 자료의 새 처리 접수",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/personas/{persona_id}/draft/activate": {
+      "post": {
+        "operationId": "activateDraft",
+        "summary": "검증한 최신 초안 활성화",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "검증한 최신 초안 활성화",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "검증한 최신 초안 활성화",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Activated"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/personas/{persona_id}/conversations": {
+      "post": {
+        "operationId": "createConversation",
+        "summary": "적용된 캐릭터와 새 대화",
+        "tags": [
+          "Chat"
+        ],
+        "description": "적용된 캐릭터와 새 대화",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "적용된 캐릭터와 새 대화",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Conversation"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listConversations",
+        "summary": "캐릭터별 대화 목록",
+        "tags": [
+          "Chat"
+        ],
+        "description": "캐릭터별 대화 목록",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "캐릭터별 대화 목록",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}/messages": {
+      "get": {
+        "operationId": "listMessages",
+        "summary": "질문·생성 시도별 저장 기록 조회",
+        "tags": [
+          "Chat"
+        ],
+        "description": "질문·생성 시도별 저장 기록 조회",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "질문·생성 시도별 저장 기록 조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessagePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "operationId": "createCompletion",
+        "summary": "질문 저장·응답 스트리밍",
+        "tags": [
+          "Chat"
+        ],
+        "description": "질문 최대 2000 Unicode 코드 포인트, 답변 최대 512 모델 토큰. 사용자당 활성 생성 1개, 대기열 없음. 첫 답변 60초/전체 180초는 접수 시점 기준. 초과 시 취소 요청, 종료 확인까지 슬롯 유지. 동일 키는 새 실행 없이 replay. service-api-v1.md 7·11절 참조.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "최초 접수는 SSE. 동일 키 재전송은 application/json 상태 응답이며 생성·SSE replay 없음. 응답 Content-Type으로 분기.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "event: meta\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"conversation_id\":\"00000000-0000-4000-8000-000000000003\",\"user_message_id\":\"00000000-0000-4000-8000-000000000005\",\"assistant_message_id\":\"00000000-0000-4000-8000-000000000006\",\"version_id\":\"00000000-0000-4000-8000-000000000002\",\"mode\":\"mock\"}\n\nevent: citations\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"items\":[]}\n\nevent: delta\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"index\":0,\"text\":\"합성 응답입니다.\"}\n\nevent: done\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"status\":\"completed\",\"finish_reason\":\"mock\"}\n\n"
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationReplay"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          }
+        },
+        "x-sse-events": {
+          "meta": {
+            "$ref": "#/components/schemas/SseMeta"
+          },
+          "citations": {
+            "$ref": "#/components/schemas/SseCitations"
+          },
+          "delta": {
+            "$ref": "#/components/schemas/SseDelta"
+          },
+          "done": {
+            "$ref": "#/components/schemas/SseDone"
+          },
+          "error": {
+            "$ref": "#/components/schemas/SseError"
+          }
+        }
+      }
+    },
+    "/v1/generations/{generation_id}/cancel": {
+      "post": {
+        "operationId": "cancelGeneration",
+        "summary": "생성 중단 요청·현재 상태 반환",
+        "tags": [
+          "Chat"
+        ],
+        "description": "200은 취소 완료 보장이 아님. cancel_requested일 수 있다. terminal 상태면 그대로 반환. 연결 중단도 취소 전달하며 재연결은 상태 조회만 한다.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "생성 중단 요청·현재 상태 반환",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Generation"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/generations/{generation_id}/retry": {
+      "post": {
+        "operationId": "retryGeneration",
+        "summary": "실패·중단 생성의 새 시도",
+        "tags": [
+          "Chat"
+        ],
+        "description": "대화의 최신 질문·최신 시도에 한정. 완료 생성/활성 시도 존재/옛 버전·입력 snapshot 삭제 시 409. 같은 사용자 메시지·원래 immutable 입력과 버전, 새 generation_id. 오류 후 새키는 새생성, 동일키는 JSON 상태 replay.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "최초 접수는 SSE. 동일 키 재전송은 application/json 상태 응답이며 생성·SSE replay 없음. 응답 Content-Type으로 분기.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "event: meta\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"conversation_id\":\"00000000-0000-4000-8000-000000000003\",\"user_message_id\":\"00000000-0000-4000-8000-000000000005\",\"assistant_message_id\":\"00000000-0000-4000-8000-000000000006\",\"version_id\":\"00000000-0000-4000-8000-000000000002\",\"mode\":\"mock\"}\n\nevent: citations\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"items\":[]}\n\nevent: delta\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"index\":0,\"text\":\"합성 응답입니다.\"}\n\nevent: done\ndata: {\"generation_id\":\"00000000-0000-4000-8000-000000000004\",\"status\":\"completed\",\"finish_reason\":\"mock\"}\n\n"
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationReplay"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-sse-events": {
+          "meta": {
+            "$ref": "#/components/schemas/SseMeta"
+          },
+          "citations": {
+            "$ref": "#/components/schemas/SseCitations"
+          },
+          "delta": {
+            "$ref": "#/components/schemas/SseDelta"
+          },
+          "done": {
+            "$ref": "#/components/schemas/SseDone"
+          },
+          "error": {
+            "$ref": "#/components/schemas/SseError"
+          }
+        }
+      }
+    },
+    "/v1/deletions/{deletion_id}": {
+      "get": {
+        "operationId": "getDeletion",
+        "summary": "소유자의 삭제 진행 조회",
+        "tags": [
+          "Operations"
+        ],
+        "description": "소유자의 삭제 진행 조회",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deletion_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "소유자의 삭제 진행 조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Deletion"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/service-status": {
+      "get": {
+        "operationId": "getServiceStatus",
+        "summary": "생성·ingestion 사용 가능 안내",
+        "tags": [
+          "Operations"
+        ],
+        "description": "생성·ingestion 사용 가능 안내",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "생성·ingestion 사용 가능 안내",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "사전 발급 정적 토큰 → 서버의 고정 사용자 subject. JWT 아님. 브라우저 메모리만 보관하며 새로고침/탭 종료 후 재입력. 만료·회전은 별도 운영 계약."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "field": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "field",
+                    "code"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "request_id"
+            ]
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "User": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_name"
+        ]
+      },
+      "Settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "profile": {
+            "type": "string",
+            "minLength": 1
+          },
+          "speech_examples": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "profile",
+          "speech_examples"
+        ]
+      },
+      "Source": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "profile",
+              "events",
+              "relationships",
+              "abilities",
+              "speech_examples"
+            ]
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "byte_size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "filename",
+          "content",
+          "byte_size",
+          "sha256"
+        ]
+      },
+      "SourceSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "profile",
+              "events",
+              "relationships",
+              "abilities",
+              "speech_examples"
+            ]
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "byte_size": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "filename",
+          "byte_size"
+        ]
+      },
+      "Warning": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "source_id"
+        ]
+      },
+      "DraftSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "editing",
+              "processing",
+              "ready",
+              "failed"
+            ]
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requires_processing": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "version_id",
+          "revision",
+          "status",
+          "job_id",
+          "requires_processing"
+        ]
+      },
+      "Version": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/Settings"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceSummary"
+            }
+          },
+          "activated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "settings",
+          "sources",
+          "activated_at"
+        ]
+      },
+      "Persona": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_material",
+              "preparing",
+              "review_required",
+              "ready",
+              "deleting"
+            ]
+          },
+          "active_version_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DraftSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deletion_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "status",
+          "active_version_id",
+          "draft",
+          "deletion_id",
+          "created_at"
+        ]
+      },
+      "PersonaDetail": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_material",
+              "preparing",
+              "review_required",
+              "ready",
+              "deleting"
+            ]
+          },
+          "active_version_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DraftSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deletion_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "active_version": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Version"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "status",
+          "active_version_id",
+          "draft",
+          "deletion_id",
+          "created_at",
+          "active_version"
+        ]
+      },
+      "Draft": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "editing",
+              "processing",
+              "ready",
+              "failed"
+            ]
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requires_processing": {
+            "type": "boolean"
+          },
+          "persona_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "base_version_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "settings": {
+            "$ref": "#/components/schemas/Settings"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            }
+          },
+          "can_activate": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "version_id",
+          "revision",
+          "status",
+          "job_id",
+          "requires_processing",
+          "persona_id",
+          "base_version_id",
+          "settings",
+          "sources",
+          "warnings",
+          "can_activate",
+          "updated_at"
+        ]
+      },
+      "JobResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "processed_document_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "indexed_chunk_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            }
+          }
+        },
+        "required": [
+          "processed_document_count",
+          "indexed_chunk_count",
+          "warnings"
+        ]
+      },
+      "Job": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "persona_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "draft_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "dispatching",
+              "running",
+              "retry_wait",
+              "succeeded",
+              "failed",
+              "reconciliation_required"
+            ]
+          },
+          "attempt_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2
+          },
+          "retry_of_job_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "can_retry": {
+            "type": "boolean"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "persona_id",
+          "version_id",
+          "draft_revision",
+          "status",
+          "attempt_count",
+          "retry_of_job_id",
+          "failure_code",
+          "can_retry",
+          "result",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "JobAccepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "draft_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued"
+            ]
+          }
+        },
+        "required": [
+          "job_id",
+          "version_id",
+          "draft_revision",
+          "status"
+        ]
+      },
+      "Activated": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "persona_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "activated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "persona_id",
+          "version_id",
+          "activated_at"
+        ]
+      },
+      "Conversation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "persona_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "title": {
+            "type": "string"
+          },
+          "initial_version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "material_changed": {
+            "type": "boolean"
+          },
+          "active_generation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "persona_id",
+          "title",
+          "initial_version_id",
+          "material_changed",
+          "active_generation_id",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "Citation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "source_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "title": {
+            "type": "string"
+          },
+          "excerpt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "source_id",
+          "version_id",
+          "title",
+          "excerpt"
+        ]
+      },
+      "Generation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "assistant_message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "retry_of_generation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "mock",
+              "llm"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "cancel_requested",
+              "reconciling",
+              "completed",
+              "cancelled",
+              "failed"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "citations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Citation"
+            }
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "can_retry": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "user_message_id",
+          "assistant_message_id",
+          "version_id",
+          "retry_of_generation_id",
+          "mode",
+          "status",
+          "content",
+          "citations",
+          "failure_code",
+          "can_retry",
+          "created_at",
+          "finished_at"
+        ]
+      },
+      "UserMessage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "content",
+          "created_at"
+        ]
+      },
+      "MessageTurn": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "user_message": {
+            "$ref": "#/components/schemas/UserMessage"
+          },
+          "generations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Generation"
+            }
+          }
+        },
+        "required": [
+          "user_message",
+          "generations"
+        ]
+      },
+      "PersonaPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Persona"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ]
+      },
+      "ConversationPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Conversation"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ]
+      },
+      "MessagePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MessageTurn"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ]
+      },
+      "GenerationReplay": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "replayed": {
+            "const": true,
+            "type": "boolean"
+          },
+          "generation": {
+            "$ref": "#/components/schemas/Generation"
+          }
+        },
+        "required": [
+          "replayed",
+          "generation"
+        ]
+      },
+      "Deletion": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "persona_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "persona_id",
+          "status",
+          "failure_code",
+          "created_at",
+          "finished_at"
+        ]
+      },
+      "DeletionAccepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "deletion_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed"
+            ]
+          }
+        },
+        "required": [
+          "deletion_id",
+          "status"
+        ]
+      },
+      "ServiceStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "generation": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "mock",
+                  "llm"
+                ]
+              },
+              "available": {
+                "type": "boolean"
+              },
+              "reason": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "backend_unavailable",
+                      "maintenance",
+                      "status_unknown"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "mode",
+              "available",
+              "reason"
+            ]
+          },
+          "ingestion": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "reason": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "dependencies_unavailable",
+                      "maintenance",
+                      "status_unknown"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "available",
+              "reason"
+            ]
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "generation",
+          "ingestion",
+          "checked_at"
+        ]
+      },
+      "CreatePersona": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "RevisionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "expected_revision"
+        ]
+      },
+      "CreateDraft": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "base_version_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "base_version_id"
+        ]
+      },
+      "SourceUpsert": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "profile",
+              "events",
+              "relationships",
+              "abilities",
+              "speech_examples"
+            ]
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ]
+      },
+      "DraftPatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "settings": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "profile": {
+                "type": "string",
+                "minLength": 1
+              },
+              "speech_examples": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "minProperties": 1
+          },
+          "upsert_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceUpsert"
+            }
+          },
+          "remove_source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "anyOf": [
+          {
+            "required": [
+              "settings"
+            ]
+          },
+          {
+            "required": [
+              "upsert_sources"
+            ]
+          },
+          {
+            "required": [
+              "remove_source_ids"
+            ]
+          }
+        ]
+      },
+      "ChatRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "이번 질문만 최대 2000 Unicode 코드 포인트. 비공백 검증은 서버에서 별도 수행. 설정·검색·이전 대화는 별도 모델 문맥 예산."
+          }
+        },
+        "required": [
+          "conversation_id",
+          "message"
+        ]
+      },
+      "Upload": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "같은 이름의 multipart part 반복 허용. 빈 part는 무시하며 profile은 텍스트 또는 파일에서 비공백 필수."
+          },
+          "files.profile": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "UTF-8 .txt/.md, 파일당 1 MiB. 전체 항목 합계 파일 20개."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "같은 이름의 multipart part 반복 허용. 빈 part는 무시하며 profile은 텍스트 또는 파일에서 비공백 필수."
+          },
+          "files.events": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "UTF-8 .txt/.md, 파일당 1 MiB. 전체 항목 합계 파일 20개."
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "같은 이름의 multipart part 반복 허용. 빈 part는 무시하며 profile은 텍스트 또는 파일에서 비공백 필수."
+          },
+          "files.relationships": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "UTF-8 .txt/.md, 파일당 1 MiB. 전체 항목 합계 파일 20개."
+          },
+          "abilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "같은 이름의 multipart part 반복 허용. 빈 part는 무시하며 profile은 텍스트 또는 파일에서 비공백 필수."
+          },
+          "files.abilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "UTF-8 .txt/.md, 파일당 1 MiB. 전체 항목 합계 파일 20개."
+          },
+          "speech_examples": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "같은 이름의 multipart part 반복 허용. 빈 part는 무시하며 profile은 텍스트 또는 파일에서 비공백 필수."
+          },
+          "files.speech_examples": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "UTF-8 .txt/.md, 파일당 1 MiB. 전체 항목 합계 파일 20개."
+          }
+        },
+        "required": [],
+        "description": "profile 또는 files.profile 중 비공백 입력 필수(의미 검증). 원문 합계 5 MiB, multipart 전체 6 MiB. 파일명만 신뢰해 인코딩 검증을 생략하지 않는다.",
+        "x-max-total-text-bytes": 5242880,
+        "x-max-http-body-bytes": 6291456,
+        "x-max-file-bytes": 1048576,
+        "x-max-files": 20
+      },
+      "SseMeta": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "generation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "assistant_message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "mock",
+              "llm"
+            ]
+          }
+        },
+        "required": [
+          "generation_id",
+          "conversation_id",
+          "user_message_id",
+          "assistant_message_id",
+          "version_id",
+          "mode"
+        ]
+      },
+      "SseCitations": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "generation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Citation"
+            }
+          }
+        },
+        "required": [
+          "generation_id",
+          "items"
+        ]
+      },
+      "SseDelta": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "generation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "index",
+          "text"
+        ]
+      },
+      "SseDone": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "generation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed"
+            ]
+          },
+          "finish_reason": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "length",
+              "mock"
+            ]
+          }
+        },
+        "required": [
+          "generation_id",
+          "status",
+          "finish_reason"
+        ]
+      },
+      "SseError": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "generation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "failed",
+              "cancelled",
+              "reconciling"
+            ]
+          }
+        },
+        "required": [
+          "generation_id",
+          "code",
+          "message",
+          "status"
+        ]
+      }
+    },
+    "parameters": {
+      "IdempotencyKey": {
+        "in": "header",
+        "name": "Idempotency-Key",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "description": "논리 변경 한 번당 새 UUID. 동작·소유자·target·정규화 본문에 묶음. 응답 유실 재전송은 같은 키. 자세한 replay/보존 규칙은 service-api-v1.md."
+      },
+      "ExpectedRevision": {
+        "in": "query",
+        "name": "expected_revision",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "description": "폐기할 초안의 현재 revision. 불일치 409."
+      },
+      "Limit": {
+        "in": "query",
+        "name": "limit",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 20
+        },
+        "description": "목록/기록 keyset pagination의 기본값 20, 최대값 100."
+      },
+      "Cursor": {
+        "in": "query",
+        "name": "cursor",
+        "schema": {
+          "type": "string"
+        },
+        "description": "소유자·대상·정렬에 묶인 opaque cursor. 잘못된 cursor는 400."
+      }
+    },
+    "responses": {
+      "Error400": {
+        "description": "잘못된 문법·ID·cursor·키",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error401": {
+        "description": "인증 없음/실패",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error404": {
+        "description": "존재하지 않거나 타인 소유",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error409": {
+        "description": "상태·revision·키 충돌",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error413": {
+        "description": "크기 제한 초과",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error415": {
+        "description": "지원하지 않는 Content-Type/파일 형식",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error422": {
+        "description": "의미 검증 실패",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error429": {
+        "description": "요청 제한",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error500": {
+        "description": "내부 오류(상세 비노출)",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error503": {
+        "description": "필수 의존 서비스 사용 불가",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-service-policy": {
+    "max_personas_per_user": 3,
+    "deleting_personas_count_toward_limit": true,
+    "max_source_bytes_per_user": 104857600,
+    "max_question_code_points": 2000,
+    "max_output_tokens": 512,
+    "max_active_generations_per_user": 1,
+    "generation_queue_enabled": false,
+    "first_answer_timeout_seconds": 60,
+    "total_generation_timeout_seconds": 180,
+    "timeout_origin": "generation_admitted_at",
+    "release_slot_only_after_execution_termination": true,
+    "browser_token_storage": "memory_only",
+    "unused_version_retention_days": 7,
+    "completed_deletion_record_retention_days": 7,
+    "retention_details": "service-api-v1.md 11절. 참조 중 자료 정리 금지, 사용자 삭제는 7일 유예가 아님. 확장 필드는 구현 의무를 기술할 뿐 자동 강제하지 않음."
+  },
+  "x-pending-policy-decisions": [
+    "삭제와 백업 사본의 정리 범위·기한",
+    "삭제 이후 멱등 기록의 최종 정리 시점",
+    "설정/검색/대화 문맥 예산, rate limit, ingestion/종료 확인/reconciliation timeout",
+    "토큰 만료·회전 운영값",
+    "원문 quota 공유 참조 집계·예약/해제 및 사용량 응답 계약",
+    "PATCH JSON body 32 MiB 초안 제안"
+  ]
+}
