@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -24,6 +25,7 @@ from persona_minimal_api.repository import (
     IdempotencyConflict,
     Persona,
     PersonaLimitExceeded,
+    configure_pool_logging,
 )
 
 
@@ -127,6 +129,23 @@ def test_healthz_ignores_database_and_readyz_is_safe() -> None:
     assert unavailable.status_code == 503
     assert unavailable.json() == {"status": "not_ready"}
     assert unavailable.headers["cache-control"] == "no-store"
+
+
+def test_pool_log_filter_removes_connection_details(caplog: pytest.LogCaptureFixture) -> None:
+    configure_pool_logging()
+    logger = logging.getLogger("psycopg.pool")
+    caplog.set_level(logging.WARNING, logger="psycopg.pool")
+
+    logger.warning(
+        "error connecting in %r: %s",
+        "pool-with-private-dsn",
+        "connection to host private-db.example.test as secret-user failed",
+    )
+
+    assert "database pool connection unavailable" in caplog.text
+    assert "private-db.example.test" not in caplog.text
+    assert "secret-user" not in caplog.text
+    assert "pool-with-private-dsn" not in caplog.text
 
 
 def test_non_ascii_bearer_token_is_unauthorized() -> None:

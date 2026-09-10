@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
@@ -12,7 +13,11 @@ from fastapi.testclient import TestClient
 
 from persona_minimal_api.config import Settings
 from persona_minimal_api.main import create_app
-from persona_minimal_api.repository import PersonaLimitExceeded, PostgresPersonaStore, create_pool
+from persona_minimal_api.repository import (
+    PersonaLimitExceeded,
+    PostgresPersonaStore,
+    create_pool,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -130,3 +135,25 @@ def test_http_create_and_list_persist_through_new_app(store: PostgresPersonaStor
         replay = restarted_app.post("/v1/personas", headers=headers, json={"name": "DB 캐릭터"})
         assert replay.status_code == 201
         assert replay.json()["id"] == persona_id
+
+
+def test_readyz_times_out_when_schema_check_is_locked(store: PostgresPersonaStore) -> None:
+    settings = Settings(
+        DATABASE_URL="postgresql://unused",
+        PERSONA_STATIC_BEARER_TOKEN="integration-token",
+        PERSONA_STATIC_USER_ID=f"ready-owner-{uuid4()}",
+        PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
+        PERSONA_CURSOR_SIGNING_KEY="integration-cursor-key",
+    )
+    with store.pool.connection() as locking_connection, locking_connection.transaction():
+        locking_connection.execute(
+            "LOCK TABLE persona_minimal.alembic_version IN ACCESS EXCLUSIVE MODE"
+        )
+        started = time.monotonic()
+        with TestClient(create_app(settings, store)) as app:
+            response = app.get("/readyz")
+        elapsed = time.monotonic() - started
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+    assert elapsed < 2.5
