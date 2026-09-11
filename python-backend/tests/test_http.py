@@ -131,21 +131,51 @@ def test_healthz_ignores_database_and_readyz_is_safe() -> None:
     assert unavailable.headers["cache-control"] == "no-store"
 
 
-def test_pool_log_filter_removes_connection_details(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
+def test_pool_log_filter_discards_low_level_connection_details(
+    caplog: pytest.LogCaptureFixture, level: int
+) -> None:
     configure_pool_logging()
     logger = logging.getLogger("psycopg.pool")
-    caplog.set_level(logging.WARNING, logger="psycopg.pool")
+    caplog.set_level(logging.DEBUG, logger="psycopg.pool")
 
-    logger.warning(
+    logger.log(
+        level,
         "error connecting in %r: %s",
         "pool-with-private-dsn",
         "connection to host private-db.example.test as secret-user failed",
+        exc_info=(RuntimeError, RuntimeError("synthetic connection exception"), None),
+    )
+
+    assert caplog.text == ""
+    assert "private-db.example.test" not in caplog.text
+    assert "secret-user" not in caplog.text
+    assert "pool-with-private-dsn" not in caplog.text
+    assert "synthetic connection exception" not in caplog.text
+
+
+@pytest.mark.parametrize("level", [logging.WARNING, logging.ERROR, logging.CRITICAL])
+def test_pool_log_filter_removes_high_level_connection_details(
+    caplog: pytest.LogCaptureFixture,
+    level: int,
+) -> None:
+    configure_pool_logging()
+    logger = logging.getLogger("psycopg.pool")
+    caplog.set_level(logging.DEBUG, logger="psycopg.pool")
+
+    logger.log(
+        level,
+        "error connecting in %r: %s",
+        "pool-with-private-dsn",
+        "connection to host private-db.example.test as secret-user failed",
+        exc_info=(RuntimeError, RuntimeError("synthetic connection exception"), None),
     )
 
     assert "database pool connection unavailable" in caplog.text
     assert "private-db.example.test" not in caplog.text
     assert "secret-user" not in caplog.text
     assert "pool-with-private-dsn" not in caplog.text
+    assert "synthetic connection exception" not in caplog.text
 
 
 def test_non_ascii_bearer_token_is_unauthorized() -> None:
