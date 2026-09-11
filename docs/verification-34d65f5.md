@@ -50,6 +50,17 @@ docker run --rm --entrypoint /app/.venv/bin/alembic --env DATABASE_URL=... <imag
 
 `PERSONA_DB_TIMEOUT_SECONDS=2`, `docker stop --time 30` 기준.
 
+**측정 방법과 해상도** — 잠금 시 readiness 소요 시간은 curl의 `%{time_total}`로 잰다.
+재려는 값이 바로 그 요청의 응답 시간이기 때문이다. 종료 시간은 `/usr/bin/perl -MTime::HiRes`로
+재며 해상도는 1ms다. `date +%s`는 정수 초라 1초 미만이 전부 "0초"로 보인다. 이 스크립트가 도는
+bash 3.2에는 `$EPOCHREALTIME`이 없고 macOS의 `date`는 `%N`을 지원하지 않는다.
+아래 수치는 **한 번의 실행에서 관측된 값**이며 상한 보장이 아니다.
+
+잠금 시 2.016914초는 앱에 준 예산 2초(`PERSONA_DB_TIMEOUT_SECONDS`)의 `statement_timeout`이
+잠금 대기를 끊은 결과다. 검증 상한 6초와는 역할이 다르다 — 상한은 판정 기준이고, 예산은
+검증 대상이다. 요청 자체에는 별도의 안전 상한(연결 3초·전체 10초)이 걸려 있어 서버가 응답하지
+않아도 검증이 멈추지 않는다.
+
 | 시나리오 | 결과 |
 | --- | --- |
 | 정상 기동 | 통과 — `/healthz` 200, `/readyz` 200 |
@@ -58,10 +69,10 @@ docker run --rm --entrypoint /app/.venv/bin/alembic --env DATABASE_URL=... <imag
 | 캐릭터 생성·조회 | 통과 — 201 생성, 목록에 반영 |
 | 같은 키·같은 요청 재전송 | 통과 — 같은 ID 반환, `personas` 행 수 1 유지 |
 | API 컨테이너 재시작 | 통과 — 기존 캐릭터 유지 |
-| DB 테이블 잠금 | 통과 — `alembic_version` 배타 잠금 상태에서 **2초** 만에 503 (상한 6초), 같은 시점 `/healthz`는 200 |
+| DB 테이블 잠금 | 통과 — `alembic_version` 배타 잠금 상태에서 **2.016914초** 만에 503, 같은 시점 `/healthz`는 200 |
 | DB 중단 | 통과 — `/healthz` 200 유지, `/readyz`·`/v1/personas` 503 |
 | DB 복구 | 통과 — readiness·목록 조회 정상 복귀 |
-| SIGTERM | 통과 — **0초** 만에 exit 0 (유예 30초, Uvicorn graceful 25초) |
+| SIGTERM | 통과 — **0.388초** 만에 exit 0 (유예 30초, Uvicorn graceful 25초) |
 
 ### 로그 비노출
 
@@ -90,4 +101,9 @@ scripts/smoke-container.sh persona-minimal-api:34d65f5
 ```
 
 인자를 생략하면 위 태그를 기본값으로 쓴다. 스크립트는 전용 network·Postgres를 새로 만들고
-끝나면 자기가 만든 자원만 제거한다. 다른 태그나 GHCR digest로 다시 검증할 때도 같은 스크립트를 쓴다.
+끝나면 자기가 만든 자원만 제거한다. 임시 컨테이너·network와 함께 **Postgres의 익명 데이터
+볼륨까지** 제거한다(`docker rm --force --volumes`). 다른 작업의 볼륨을 건드리는 `volume prune`은
+쓰지 않는다. 실행 전후 dangling 볼륨 수가 14 → 14로 같음을 확인했다.
+
+다른 태그나 GHCR digest로 다시 검증할 때도 같은 스크립트를 쓴다.
+스크립트는 `docker`·`curl`·`grep`·`awk`·`perl`·`mktemp`가 없으면 검사를 조용히 건너뛰지 않고 멈춘다.
