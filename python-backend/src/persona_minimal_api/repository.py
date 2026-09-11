@@ -25,12 +25,16 @@ class SafePoolLogFilter(logging.Filter):
     """psycopg pool의 원문 연결 오류가 운영 로그에 남지 않게 한다."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno >= logging.WARNING:
-            record.msg = "database pool connection unavailable"
-            record.args = ()
-            record.exc_info = None
-            record.exc_text = None
-            record.stack_info = None
+        # 진단 중 DEBUG/INFO를 켜도 연결 주소·사용자명·예외 원문이 로그에 남지 않게
+        # 저수준 pool 로그는 통째로 버린다. 안전한 별도 진단 이벤트가 필요하면 원문을
+        # 전달하지 않는 전용 메트릭 또는 로그로 추가해야 한다.
+        if record.levelno < logging.WARNING:
+            return False
+        record.msg = "database pool connection unavailable"
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
         return True
 
 
