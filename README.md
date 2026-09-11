@@ -1,58 +1,36 @@
 # persona-gateway
 
-온라인 request path를 담당하는 단일 Go module. workspace 경계 안에서 RAG context를
-만들고 vLLM으로 SSE 요청을 전달하며, 단일 GPU overload를 제어한다.
+사용자 요청을 받는 Python 최소 백엔드와 API 계약을 소유한다. 현재 제공하는 API는
+`GET /v1/me`, `GET /v1/personas`, `POST /v1/personas`, `GET /healthz`, `GET /readyz`다.
+전체 목표 계약은 [읽기용 계약](api/service-api-v1.md)과 [OpenAPI](api/openapi.json)를 따른다.
 
-기획 문서: [`docs/repository-plans/persona-gateway.md`](../docs/repository-plans/persona-gateway.md)
+## Python 최소 backend
 
-## 디렉토리
+`python-backend/`는 FastAPI·psycopg·Alembic 기반의 독립 런타임이다. Alembic만
+`persona_minimal` PostgreSQL 스키마와 그 안의 `alembic_version`을 소유한다.
+앱 시작 시 migration을 자동 실행하지 않는다.
 
-```
-api/                    # OpenAPI 스펙
-cmd/gateway/            # 서버 진입점
-internal/
-├── config/             # 설정 로드/검증
-├── httpapi/            # 라우팅, 요청 검증, 오류 매핑
-├── sse/                # delta | citations | done | error 스트림
-├── retrieval/          # Qdrant filtered retrieval, workspace filter
-├── context/            # tokenizer 기반 context budget, citation ID
-├── vllm/               # upstream client, health/readiness, deadline
-├── admission/          # bounded queue, token credit, DRR
-└── telemetry/          # Prometheus metrics, OTel tracing
-test/fixtures/
-├── sse/                # 합성 SSE 스트림
-└── golden_qa/          # 합성 Q/A citation 기대값
+로컬 실행:
+
+```sh
+cd python-backend
+DATABASE_URL=postgresql://... uv run alembic upgrade head
+uv run uvicorn --factory persona_minimal_api.main:create_app --host 127.0.0.1 --port 8080
 ```
 
-## 하지 않는 것
+컨테이너 build와 실행은 [Python runtime 인수인계](docs/python-runtime-handoff.md)를 따른다.
+실제 토큰·DB 주소는 Git·로그·예제에 넣지 않는다.
 
-- ingestion/parser, Kubernetes manifest, dashboard/alert rule
-- model lifecycle, embedding model serving, multi-model routing
-- 실제 원문을 API로 반환하는 기능
+## 범위와 보안
 
-## API 계약 (요약)
+- Secret으로 `DATABASE_URL`, `PERSONA_STATIC_BEARER_TOKEN`, `PERSONA_STATIC_USER_ID`,
+  `PERSONA_STATIC_DISPLAY_NAME`, `PERSONA_CURSOR_SIGNING_KEY`를 공급한다.
+- `PERSONA_DB_TIMEOUT_SECONDS`는 선택값이며 기본 2초다. DB 연결, pool 대기와 readiness
+  검사에 적용한다.
+- `/healthz`는 DB 장애와 무관한 프로세스 생존 신호다. `/readyz`는 migration된 필수 스키마와
+  DB 연결을 확인하며, 미준비 상태에는 민감한 세부 정보 없이 503을 반환한다.
+- 업로드·ingestion·대화·삭제 등 나머지 API는 아직 구현하지 않았다. 미구현 기능을 동작하는
+  것처럼 표시하지 않는다.
 
-```
-POST /v1/chat/completions   workspace_id, messages, stream, max_output
-SSE  delta | citations | done | error
-GET  /healthz  /readyz  /metrics
-
-400 입력/토큰 예산 위반   403 workspace 경계 위반
-429 queue overload + Retry-After
-503 GPU_BACKEND_UNAVAILABLE   504 upstream deadline
-```
-
-## 관측 원칙
-
-prompt 본문과 retrieved text는 metric label, log, trace attribute에 **넣지 않는다**.
-request-id는 trace 상관관계용으로만 쓴다.
-
-## 구현 루프
-
-1. HTTP/SSE 스켈레톤 (fake retriever/vLLM, `go test -race`, cancellation)
-2. RAG 계약 (workspace filter, top-k dedupe, 실제 tokenizer 예산, citation ID)
-3. vLLM 경계 (health/readiness 구분, upstream deadline, 오류 매핑)
-4. overload 제어 (token credit + bounded DRR vs FIFO baseline)
-5. production observability (queue/reject/cancel/first-byte/E2E metric)
-
-현재 상태: 뼈대만 존재.
+기존 Go Gateway·dispatcher·DDL은 활성 레포에서 제거하고, 검증된 로컬 보관본으로만 유지한다.
+원격 push·PR·홈 클러스터 배포는 이 변경에 포함하지 않는다.

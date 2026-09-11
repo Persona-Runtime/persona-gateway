@@ -11,16 +11,15 @@ quarantine/
 source_manifest.yaml
 !tests/fixtures/**/*.jsonl
 !docs/**/source_manifest.example.yaml
-
 # --- 로컬 환경 ---
 .env
 .env.*
 !.env.example
 .DS_Store
+feedback.md
 
-# --- Go ---
-bin/
-/gateway
-*.test
-*.out
-coverage.txt
+# --- Python ---
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
