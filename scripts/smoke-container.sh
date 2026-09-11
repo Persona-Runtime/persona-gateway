@@ -11,6 +11,16 @@ set -euo pipefail
 # 기존 mafest-postgres, persona-web-e2e-pg 등 다른 작업의 컨테이너는 건드리지 않는다.
 # 실제 사용자 자료는 쓰지 않는다. 아래 값은 모두 이 실행에서만 쓰는 합성 값이다.
 
+# 검사 도구가 없으면 검증이 조용히 건너뛰어지거나 엉뚱한 곳에서 멈춘다. 먼저 확인한다.
+# perl은 종료 시간을 소수 단위로 재는 데 쓴다. 이 스크립트를 실행하는 bash 3.2에는
+# $EPOCHREALTIME이 없고 macOS의 date는 %N을 지원하지 않는다.
+for tool in docker curl grep awk perl mktemp; do
+  if ! command -v "$tool" > /dev/null 2>&1; then
+    echo "필요한 도구가 없습니다: ${tool}" >&2
+    exit 1
+  fi
+done
+
 image="${1:-persona-minimal-api:34d65f5}"
 
 # PID를 붙여 이름이 겹치지 않게 한다. 다른 컨테이너를 실수로 재사용하지 않기 위함이다.
@@ -29,19 +39,33 @@ user_id="smoke-user-0001"
 display_name="스모크 사용자"
 cursor_key="smoke-cursor-signing-key-not-real"
 
-# readiness 예산. config.py 기본값과 같은 2초를 명시적으로 준다.
-db_timeout_seconds="2"
-# readiness가 잠금·장애에서 돌아와야 하는 상한. 예산 2초 + probe 여유.
+# --- 검증 대상 예산 ---
+# readiness 예산. config.py 기본값과 같은 2초를 앱에 명시적으로 준다.
+readiness_budget_seconds="2"
+db_timeout_seconds="$readiness_budget_seconds"
+# readiness가 잠금·장애에서 돌아와야 하는 검증 상한. 예산 2초 + probe 여유.
+# 이 값은 "앱이 제때 503을 주는가"를 판정하는 기준이지, 요청을 끊는 값이 아니다.
 readiness_deadline_seconds="6"
 # Deployment에 넣을 terminationGracePeriodSeconds와 같은 값으로 종료를 확인한다.
 termination_grace_seconds="30"
 
+# --- 외부 요청 안전 상한 (검증 기준이 아님) ---
+# 위 예산과 역할이 다르다. 서버가 응답하지 않을 때 검증 자체가 멈추지 않게 하는 값이며,
+# 검증 상한보다 넉넉히 잡아 정상 지연을 timeout으로 오판하지 않게 한다.
+connect_timeout_seconds="3"
+request_timeout_seconds="10"
+
 workdir="$(mktemp -d)"
+request_meta="$workdir/last-request"
+printf '0 0\n' > "$request_meta"
 failures=0
 
 cleanup() {
   # 이번 실행이 만든 자원만 이름으로 지정해 제거한다.
-  docker rm --force "$api" "$postgres" >/dev/null 2>&1 || true
+  # postgres 이미지에는 /var/lib/postgresql/data 볼륨 선언이 있어 실행마다 익명 볼륨이
+  # 생긴다. --volumes는 그 컨테이너에 달린 익명 볼륨만 지우므로, 다른 작업의 볼륨을
+  # 건드리는 volume prune 없이 이번 실행의 데이터까지 정리된다.
+  docker rm --force --volumes "$api" "$postgres" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   rm -rf "$workdir"
 }
@@ -52,8 +76,46 @@ fail() { printf '  FAIL  %s\n' "$1" >&2; failures=$((failures + 1)); }
 step() { printf '\n[%s]\n' "$1"; }
 
 # 상태 코드만 비교한다. 응답 본문은 민감할 수 있으므로 기본적으로 출력하지 않는다.
+#
+# 요청마다 연결·전체 시간 제한을 건다. 제한이 없으면 서버가 응답하지 않을 때 검증이
+# 끝나지 않고, "제한 시간 안에 503" 같은 판정은 요청이 끝난 뒤에야 비교하므로 의미가 없다.
+# curl이 실패하면 http_code가 000이 되는데, 이를 조용히 넘기지 않도록 종료 코드를 따로 남겨
+# 호출부가 "요청 실패"로 보고할 수 있게 한다. (curl exit 28 = timeout)
+# status_of는 거의 항상 $(...) 안에서 불린다. 서브셸이라 변수 대입이 부모로 전파되지
+# 않으므로, 소요 시간과 curl 종료 코드는 파일로 남겨 호출부가 읽는다. 기록 파일은
+# workdir을 만들 때 함께 초기화한다.
+
 status_of() {
-  curl --silent --output "$workdir/body.json" --write-out '%{http_code}' "$@"
+  local output rc seconds
+  output="$(curl --silent \
+    --connect-timeout "$connect_timeout_seconds" \
+    --max-time "$request_timeout_seconds" \
+    --output "$workdir/body.json" \
+    --write-out '%{http_code} %{time_total}' "$@")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # 실패한 요청의 소요 시간은 알 수 없다. 상한을 기록해 "빨랐다"로 오해되지 않게 한다.
+    printf '%s %s\n' "$rc" "$request_timeout_seconds" > "$request_meta"
+    printf '000'
+    return 0
+  fi
+  seconds="${output#* }"
+  printf '0 %s\n' "$seconds" > "$request_meta"
+  printf '%s' "${output%% *}"
+}
+
+last_curl_exit() { awk '{ print $1 }' "$request_meta"; }
+last_request_seconds() { awk '{ print $2 }' "$request_meta"; }
+
+# 요청 실패를 상태 코드 불일치와 구분해 보고한다.
+request_failure_note() {
+  local rc
+  rc="$(last_curl_exit)"
+  if [ "$rc" -eq 28 ]; then
+    printf '요청 시간 초과(curl exit 28, 상한 %s초)' "$request_timeout_seconds"
+  else
+    printf '요청 실패(curl exit %s)' "$rc"
+  fi
 }
 
 expect_status() {
@@ -63,9 +125,16 @@ expect_status() {
   got="$(status_of "$@")"
   if [ "$got" = "$want" ]; then
     ok "$desc (${got})"
+  elif [ "$(last_curl_exit)" -ne 0 ]; then
+    fail "$desc: $(request_failure_note)"
   else
     fail "$desc: ${want} 기대, ${got} 수신"
   fi
+}
+
+# 소수 비교. bash 3.2는 정수만 다루므로 awk에 맡긴다.
+seconds_within() {
+  awk -v value="$1" -v limit="$2" 'BEGIN { exit !(value <= limit) }'
 }
 
 # psql은 Postgres 컨테이너 안에서만 실행한다. DB 포트를 호스트에 공개하지 않기 위함이다.
@@ -271,11 +340,15 @@ docker exec --detach --env PGPASSWORD="$db_password" "$postgres" \
   psql --username "$db_user" --dbname "$db_name" --command \
   "BEGIN; LOCK TABLE persona_minimal.alembic_version IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(20); COMMIT;"
 sleep 2
-lock_start="$(date +%s)"
+# 소요 시간은 curl의 time_total로 잰다. 재려는 값이 바로 이 요청의 응답 시간이고,
+# date +%s(정수 초)와 달리 소수 단위라 "2초 예산"을 실제로 판정할 수 있다.
 lock_status="$(status_of "${base_url}/readyz")"
-lock_elapsed="$(( $(date +%s) - lock_start ))"
-if [ "$lock_status" = "503" ] && [ "$lock_elapsed" -le "$readiness_deadline_seconds" ]; then
-  ok "테이블 잠금: ${lock_elapsed}초 만에 503 (상한 ${readiness_deadline_seconds}초)"
+lock_curl_exit="$(last_curl_exit)"
+lock_elapsed="$(last_request_seconds)"
+if [ "$lock_curl_exit" -ne 0 ]; then
+  fail "테이블 잠금: $(request_failure_note)"
+elif [ "$lock_status" = "503" ] && seconds_within "$lock_elapsed" "$readiness_deadline_seconds"; then
+  ok "테이블 잠금: ${lock_elapsed}초 만에 503 (예산 ${readiness_budget_seconds}초, 검증 상한 ${readiness_deadline_seconds}초)"
 else
   fail "테이블 잠금: status=${lock_status}, ${lock_elapsed}초 소요"
 fi
@@ -405,12 +478,15 @@ else
 fi
 
 step "6. SIGTERM 종료"
-stop_start="$(date +%s)"
+# bash 3.2에는 $EPOCHREALTIME이 없고 macOS의 date는 %N을 지원하지 않는다. 정수 초로 재면
+# 1초 미만 종료가 전부 "0초"로 보여 즉시 종료처럼 읽히므로 perl로 소수 단위를 쓴다.
+stop_start="$(perl -MTime::HiRes=time -e 'printf "%.3f", time')"
 docker stop --time "$termination_grace_seconds" "$api" >/dev/null
-stop_elapsed="$(( $(date +%s) - stop_start ))"
+stop_end="$(perl -MTime::HiRes=time -e 'printf "%.3f", time')"
+stop_elapsed="$(awk -v a="$stop_start" -v b="$stop_end" 'BEGIN { printf "%.3f", b - a }')"
 exit_code="$(docker inspect "$api" --format '{{.State.ExitCode}}')"
-if [ "$stop_elapsed" -lt "$termination_grace_seconds" ] && [ "$exit_code" = "0" ]; then
-  ok "SIGTERM: ${stop_elapsed}초 만에 정상 종료 (exit ${exit_code}, 유예 ${termination_grace_seconds}초)"
+if seconds_within "$stop_elapsed" "$termination_grace_seconds" && [ "$exit_code" = "0" ]; then
+  ok "SIGTERM: ${stop_elapsed}초 만에 정상 종료 (exit ${exit_code}, 유예 ${termination_grace_seconds}초, 측정 해상도 1ms)"
 else
   fail "SIGTERM: ${stop_elapsed}초 소요, exit ${exit_code}"
 fi
