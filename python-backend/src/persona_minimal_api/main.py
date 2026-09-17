@@ -23,6 +23,7 @@ from .repository import (
     DuplicatePersonaName,
     IdempotencyConflict,
     IndexingInProgress,
+    NoSourcesToIndex,
     Persona,
     PersonaLimitExceeded,
     PersonaNotFound,
@@ -501,6 +502,8 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
             ) from error
         except IndexingInProgress as error:
             raise ApiError(409, "indexing_in_progress", "이미 색인이 진행 중입니다.") from error
+        except NoSourcesToIndex as error:
+            raise ApiError(422, "no_content", "색인할 자료가 없습니다.") from error
         except Exception as error:
             raise draft_error(error) from error
         background_tasks.add_task(run_indexing, handle, request.app.state.settings.embedding_url)

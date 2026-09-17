@@ -560,7 +560,8 @@ def test_replace_chunks_round_trips_embedding_and_heading_path(
     persona_id, source_id, version_id = _persona_source_for(store)
     record = _chunk_record(persona_id, version_id, source_id, 0, 0.5)
 
-    replace_chunks(store.pool, version_id, [record])
+    with store.pool.connection() as connection, connection.transaction():
+        replace_chunks(connection, version_id, [record])
 
     with store.pool.connection() as connection:
         row = connection.execute(
@@ -580,10 +581,12 @@ def test_replace_chunks_removes_previous_chunks_for_the_same_version(
 ) -> None:
     persona_id, source_id, version_id = _persona_source_for(store)
     first = _chunk_record(persona_id, version_id, source_id, 0, 0.1)
-    replace_chunks(store.pool, version_id, [first])
+    with store.pool.connection() as connection, connection.transaction():
+        replace_chunks(connection, version_id, [first])
 
     second = _chunk_record(persona_id, version_id, source_id, 0, 0.2)
-    replace_chunks(store.pool, version_id, [second])
+    with store.pool.connection() as connection, connection.transaction():
+        replace_chunks(connection, version_id, [second])
 
     with store.pool.connection() as connection:
         rows = connection.execute(
@@ -598,14 +601,16 @@ def test_replace_chunks_rolls_back_on_failure_and_keeps_prior_chunks(
 ) -> None:
     persona_id, source_id, version_id = _persona_source_for(store)
     kept = _chunk_record(persona_id, version_id, source_id, 0, 0.3)
-    replace_chunks(store.pool, version_id, [kept])
+    with store.pool.connection() as connection, connection.transaction():
+        replace_chunks(connection, version_id, [kept])
 
     # 같은 (version_id, kind, source_id, ordinal)를 배치 안에서 중복시켜 두 번째
     # INSERT에서 UNIQUE 위반이 나게 한다 — DELETE까지 포함해 전부 롤백돼야 한다.
     duplicate_a = _chunk_record(persona_id, version_id, source_id, 1, 0.4)
     duplicate_b = _chunk_record(persona_id, version_id, source_id, 1, 0.5)
     with pytest.raises(psycopg.Error):
-        replace_chunks(store.pool, version_id, [duplicate_a, duplicate_b])
+        with store.pool.connection() as connection, connection.transaction():
+            replace_chunks(connection, version_id, [duplicate_a, duplicate_b])
 
     with store.pool.connection() as connection:
         rows = connection.execute(
@@ -630,8 +635,10 @@ def _fabricate_ready_index(
     """
     handle = store.start_indexing(owner, persona_id, revision)
     record = _chunk_record(persona_id, handle.version_id, source_id, 0, 0.1)
-    replace_chunks(handle.pool, handle.version_id, [record])
+    # 운영 코드(runner.run_indexing)와 같은 모양으로 조각 교체와 상태 갱신을 한
+    # 트랜잭션에 묶는다.
     with handle.connection.transaction():
+        replace_chunks(handle.connection, handle.version_id, [record])
         with handle.connection.cursor() as cur:
             cur.execute(
                 """
@@ -641,10 +648,12 @@ def _fabricate_ready_index(
                 """,
                 (revision, persona_id),
             )
-    with handle.connection.transaction():
-        with handle.connection.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
-    handle.pool.putconn(handle.connection)
+    try:
+        handle.connection.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
+    except Exception:
+        pass
+    finally:
+        handle.pool.putconn(handle.connection)
 
 
 def test_apply_failure_keeps_previous_ready_chunks_and_indexed_revision(
@@ -696,6 +705,60 @@ def test_apply_failure_keeps_previous_ready_chunks_and_indexed_revision(
             (ready_version_id,),
         ).fetchall()
     assert len(chunk_ids) == 1  # rev 3 조각이 그대로 있다 — 실패한 rev 4 시도가 안 건드림
+
+
+def test_run_indexing_rolls_back_chunk_replacement_when_status_update_fails(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """조각 교체(replace_chunks)와 status='ready' 갱신이 한 트랜잭션에 묶여 있는지
+    확인한다 — 상태 갱신 쪽에서 실패를 주입해도 이미 실행된 조각 교체까지 함께
+    롤백돼 이전 조각이 그대로 남아야 한다. 이 한 지점은 리뷰어가 명시적으로
+    monkeypatch 주입을 지시했다(평소의 "실제 실패로 검증" 원칙의 예외)."""
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    ready = store.patch_draft(
+        owner,
+        persona.id,
+        draft.revision,
+        None,
+        [{"kind": "events", "content": "첫 버전 본문이다."}],
+        [],
+    )
+    _fabricate_ready_index(store, owner, persona.id, ready.revision, ready.sources[0].id)
+    ready_version_id = store.get_draft(owner, persona.id).version_id
+
+    edited = store.patch_draft(
+        owner,
+        persona.id,
+        ready.revision,
+        None,
+        [{"kind": "events", "content": "둘째 버전이다."}],
+        [],
+    )
+
+    def _fake_build_records(handle, embedding_base_url):
+        return [_chunk_record(persona.id, handle.version_id, ready.sources[0].id, 0, 0.9)]
+
+    def _boom(handle):
+        raise RuntimeError("synthetic status update failure")
+
+    monkeypatch.setattr("persona_minimal_api.indexing.runner._build_records", _fake_build_records)
+    monkeypatch.setattr("persona_minimal_api.indexing.runner._mark_ready_in", _boom)
+
+    handle = store.start_indexing(owner, persona.id, edited.revision)
+    run_indexing(handle, _UNREACHABLE_EMBEDDING_URL)
+
+    final = store.get_draft(owner, persona.id)
+    assert final.status == "failed"
+    assert final.indexed_revision == ready.revision
+
+    with store.pool.connection() as connection:
+        rows = connection.execute(
+            "SELECT content FROM persona_minimal.material_chunks WHERE version_id = %s",
+            (ready_version_id,),
+        ).fetchall()
+    # 새 조각(가짜 _build_records가 낸 것)이 커밋되지 않고 이전(rev 3) 조각만 남는다.
+    assert [r[0] for r in rows] == ["조각 내용 0"]
 
 
 def test_start_indexing_blocks_only_while_processing(store: PostgresPersonaStore) -> None:

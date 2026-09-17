@@ -16,6 +16,7 @@ from psycopg_pool import ConnectionPool
 from psycopg_pool import PoolTimeout
 
 from .cursor import PersonaCursor
+from .indexing.chunker import CHUNKABLE_KINDS
 
 MAX_PERSONAS_PER_USER = 3
 CREATE_PERSONA_OPERATION = "create_persona"
@@ -100,6 +101,11 @@ class IndexingInProgress(Exception):
     같은 캐릭터에 색인 요청 두 개가 동시에 material_chunks를 지웠다 쓰면 서로
     덮어써 결과가 뒤섞인다. 먼저 잡은 쪽만 진행하고 나머지는 409로 돌려보낸다.
     """
+
+
+class NoSourcesToIndex(Exception):
+    """청킹 대상 소스가 하나도 없다. run_indexing이 결국 no_content로 실패할 것을
+    미리 안다면 202→failed 왕복 없이 바로 422로 끝낸다."""
 
 
 class DraftValidationError(Exception):
@@ -251,6 +257,10 @@ class PersonaStore(Protocol):
     def discard_draft(
         self, owner_subject: str, persona_id: UUID, idempotency_key: UUID
     ) -> None: ...
+
+    def start_indexing(
+        self, owner_subject: str, persona_id: UUID, expected_revision: int
+    ) -> IndexingHandle: ...
 
 
 @runtime_checkable
@@ -746,6 +756,18 @@ class PostgresPersonaStore:
                         cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
                         raise RevisionConflict
 
+                    # 소스가 하나도 없으면 run_indexing이 결국 no_content로 실패할 게
+                    # 뻔하다 — 202로 받아놓고 비동기로 실패시키는 왕복을 줄이려고 여기서
+                    # 바로 거절한다.
+                    cur.execute(
+                        "SELECT EXISTS (SELECT 1 FROM persona_minimal.material_sources "
+                        "WHERE persona_id = %s AND kind = ANY(%s))",
+                        (persona_id, list(CHUNKABLE_KINDS)),
+                    )
+                    if not cur.fetchone()["exists"]:
+                        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
+                        raise NoSourcesToIndex
+
                     revision = row["revision"]
                     version_id = row["version_id"]
                     cur.execute(
@@ -754,6 +776,15 @@ class PostgresPersonaStore:
                         (persona_id,),
                     )
         except BaseException:
+            # pg_try_advisory_lock 성공 뒤 FOR UPDATE/UPDATE에서 예상 밖 DB 오류가 나면
+            # 잠금을 쥔 채 연결이 pool로 돌아가 이 캐릭터의 apply가 재시작 전까지 전부
+            # 409(processing)에 갇힌다. unlock_all은 잠금이 없어도 무해하니 조건 없이
+            # 부른다. 이 호출 자체가 실패해도 putconn은 반드시 실행한다 — 연결이 끊긴
+            # 경우라면 서버가 세션 종료로 이미 잠금을 풀었고 pool도 그 연결을 버린다.
+            try:
+                connection.execute("SELECT pg_advisory_unlock_all()")
+            except Exception:
+                pass
             self.pool.putconn(connection)
             raise
         # 트랜잭션은 여기서 이미 커밋됐다(with connection.transaction() 블록 종료).

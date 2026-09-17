@@ -39,16 +39,28 @@ def run_indexing(handle: IndexingHandle, embedding_base_url: str) -> None:
     """
     try:
         records = _build_records(handle, embedding_base_url)
-        replace_chunks(handle.pool, handle.version_id, records)
+        # 조각 교체와 상태 갱신을 한 트랜잭션으로 묶는다 — 따로 커밋하면 그 사이에
+        # 프로세스가 죽었을 때 "조각은 새 revision인데 indexed_revision은 이전
+        # 값"이라는, 계약이 금지하는 상태가 남을 수 있다. 이 블록 안에서 실패하면
+        # 트랜잭션이 통째로 롤백돼 이전 조각이 그대로 남고, 아래 except가 status를
+        # failed로 정리한다.
+        with handle.connection.transaction():
+            replace_chunks(handle.connection, handle.version_id, records)
+            _mark_ready_in(handle)
     except Exception as error:  # noqa: BLE001 - 원인을 구분해 error_code로만 남긴다
         _mark_failed(handle, _classify(error))
-    else:
-        _mark_ready(handle)
     finally:
-        with handle.connection.transaction():
-            with handle.connection.cursor() as cur:
-                cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(handle.persona_id),))
-        handle.pool.putconn(handle.connection)
+        try:
+            handle.connection.execute(
+                "SELECT pg_advisory_unlock(hashtext(%s))", (str(handle.persona_id),)
+            )
+        except Exception:
+            # unlock이 실패해도 putconn은 반드시 실행한다 — 여기서 그냥 던지면 아래
+            # putconn이 건너뛰어지고 연결이 pool 밖으로 새어 max_size(8)가 영구히
+            # 줄어든다. 세션이 끊긴 경우면 서버가 이미 잠금을 풀었다.
+            pass
+        finally:
+            handle.pool.putconn(handle.connection)
 
 
 def _build_records(handle: IndexingHandle, embedding_base_url: str) -> list[ChunkRecord]:
@@ -118,17 +130,19 @@ def _classify(error: Exception) -> str:
     return "indexing_failed"
 
 
-def _mark_ready(handle: IndexingHandle) -> None:
-    with handle.connection.transaction():
-        with handle.connection.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE persona_minimal.material_versions
-                SET status = 'ready', indexed_revision = %s, indexed_at = now(), error_code = NULL
-                WHERE persona_id = %s
-                """,
-                (handle.revision, handle.persona_id),
-            )
+def _mark_ready_in(handle: IndexingHandle) -> None:
+    """호출자가 이미 연 트랜잭션 안에서 실행한다(자체 트랜잭션을 열지 않는다) —
+    `replace_chunks`와 한 트랜잭션으로 묶여야 "조각과 indexed_revision은 항상 한
+    쌍"이라는 계약을 지킬 수 있다."""
+    with handle.connection.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE persona_minimal.material_versions
+            SET status = 'ready', indexed_revision = %s, indexed_at = now(), error_code = NULL
+            WHERE persona_id = %s
+            """,
+            (handle.revision, handle.persona_id),
+        )
 
 
 def _mark_failed(handle: IndexingHandle, error_code: str) -> None:

@@ -63,6 +63,12 @@ class MemoryStore:
     def is_ready(self) -> bool:
         return True
 
+    def start_indexing(self, owner: str, persona_id: UUID, expected_revision: int):
+        # 이 fake 저장소로 /draft/apply를 치는 테스트는 없다 — Protocol과 실제 구현이
+        # 어긋나 있다는 사실만 없애려고 스텁만 둔다. 실제로 호출되면 일반 예외
+        # 처리 경로를 타 500이 된다(UnexpectedFailureStore와 같은 결과).
+        raise NotImplementedError
+
 
 class FailingStore(MemoryStore):
     def __init__(self, error: Exception) -> None:
