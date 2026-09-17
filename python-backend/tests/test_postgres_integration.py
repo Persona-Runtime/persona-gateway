@@ -7,12 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
+import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 
 from persona_minimal_api.config import Settings
+from persona_minimal_api.indexing.store import ChunkRecord, replace_chunks
 from persona_minimal_api.main import create_app
 from persona_minimal_api.repository import (
     SUPPORTED_ALEMBIC_REVISIONS,
@@ -503,3 +505,106 @@ def test_migration_0003_upgrade_and_downgrade_round_trip(round_trip_database_url
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = old
+
+
+def _embedding(seed: float) -> list[float]:
+    # 실제 임베딩 모델과 무관한 합성 벡터. pgvector 컬럼이 정확히 384차원을 요구하므로
+    # 길이만 맞춘다.
+    return [seed] * 384
+
+
+def _persona_source_for(store: PostgresPersonaStore) -> tuple:
+    """persona_id·source_id·version_id를 실제 draft 자료로부터 얻는다.
+
+    material_chunks.source_id는 material_sources(id)를 참조하므로, 존재하지 않는
+    UUID로는 FK 위반이 난다 — 진짜 자료를 하나 만들어 그 id를 쓴다.
+    """
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    patched = store.patch_draft(
+        owner,
+        persona.id,
+        draft.revision,
+        None,
+        [{"kind": "events", "content": "청킹 대상 합성 본문이다."}],
+        [],
+    )
+    return persona.id, patched.sources[0].id, draft.version_id
+
+
+def _chunk_record(persona_id, version_id, source_id, ordinal: int, seed: float) -> ChunkRecord:
+    return ChunkRecord(
+        id=uuid4(),
+        persona_id=persona_id,
+        version_id=version_id,
+        source_id=source_id,
+        kind="events",
+        ordinal=ordinal,
+        heading_path=("개요", "세부"),
+        content=f"조각 내용 {ordinal}",
+        char_count=10,
+        sha256="a" * 64,
+        embedding=_embedding(seed),
+        embedding_model="multilingual-e5-small@test",
+    )
+
+
+def test_replace_chunks_round_trips_embedding_and_heading_path(
+    store: PostgresPersonaStore,
+) -> None:
+    persona_id, source_id, version_id = _persona_source_for(store)
+    record = _chunk_record(persona_id, version_id, source_id, 0, 0.5)
+
+    replace_chunks(store.pool, version_id, [record])
+
+    with store.pool.connection() as connection:
+        row = connection.execute(
+            "SELECT heading_path, content, embedding, embedding_model "
+            "FROM persona_minimal.material_chunks WHERE version_id = %s",
+            (version_id,),
+        ).fetchone()
+    assert row[0] == "개요 > 세부"
+    assert row[1] == "조각 내용 0"
+    # pgvector 어댑터가 pool 생성 시 등록돼 있어야 Vector 객체로 그대로 돌아온다.
+    assert row[2].to_list() == _embedding(0.5)
+    assert row[3] == "multilingual-e5-small@test"
+
+
+def test_replace_chunks_removes_previous_chunks_for_the_same_version(
+    store: PostgresPersonaStore,
+) -> None:
+    persona_id, source_id, version_id = _persona_source_for(store)
+    first = _chunk_record(persona_id, version_id, source_id, 0, 0.1)
+    replace_chunks(store.pool, version_id, [first])
+
+    second = _chunk_record(persona_id, version_id, source_id, 0, 0.2)
+    replace_chunks(store.pool, version_id, [second])
+
+    with store.pool.connection() as connection:
+        rows = connection.execute(
+            "SELECT id FROM persona_minimal.material_chunks WHERE version_id = %s",
+            (version_id,),
+        ).fetchall()
+    assert [r[0] for r in rows] == [second.id]
+
+
+def test_replace_chunks_rolls_back_on_failure_and_keeps_prior_chunks(
+    store: PostgresPersonaStore,
+) -> None:
+    persona_id, source_id, version_id = _persona_source_for(store)
+    kept = _chunk_record(persona_id, version_id, source_id, 0, 0.3)
+    replace_chunks(store.pool, version_id, [kept])
+
+    # 같은 (version_id, kind, source_id, ordinal)를 배치 안에서 중복시켜 두 번째
+    # INSERT에서 UNIQUE 위반이 나게 한다 — DELETE까지 포함해 전부 롤백돼야 한다.
+    duplicate_a = _chunk_record(persona_id, version_id, source_id, 1, 0.4)
+    duplicate_b = _chunk_record(persona_id, version_id, source_id, 1, 0.5)
+    with pytest.raises(psycopg.Error):
+        replace_chunks(store.pool, version_id, [duplicate_a, duplicate_b])
+
+    with store.pool.connection() as connection:
+        rows = connection.execute(
+            "SELECT id FROM persona_minimal.material_chunks WHERE version_id = %s",
+            (version_id,),
+        ).fetchall()
+    assert [r[0] for r in rows] == [kept.id]

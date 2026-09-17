@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
+from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 from psycopg import Error as PsycopgError
 from psycopg_pool import ConnectionPool
@@ -840,6 +841,10 @@ def create_pool(database_url: str, timeout_seconds: float) -> ConnectionPool:
         max_size=8,
         timeout=timeout_seconds,
         open=False,
+        # pgvector 타입 어댑터는 연결마다 따로 등록해야 한다(전역이 아니다). 여기서
+        # 등록해 두지 않으면, material_chunks.embedding을 읽는 쪽이 register_vector를
+        # 몰라 vector를 "[0.1,0.2,...]" 문자열로 받는다 — 등록한 쪽만 올바른 값을 본다.
+        configure=register_vector,
     )
     # DB가 꺼져 있어도 healthz를 제공해야 하므로, 기동 중 연결 성공을 기다리지 않는다.
     pool.open(wait=False)
