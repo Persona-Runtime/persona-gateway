@@ -42,7 +42,10 @@ def database_url() -> str:
     try:
         from testcontainers.postgres import PostgresContainer
 
-        with PostgresContainer("postgres:16-alpine") as postgres:
+        # 0003부터 head migration이 pgvector 확장을 요구한다(material_chunks.embedding).
+        # 이 fixture로 head까지 올리는 다른 모든 테스트도 이 이미지가 필요하다 — postgres:16
+        # 기반이라 pgvector가 없는 것 말고는 동작이 같다.
+        with PostgresContainer("pgvector/pgvector:pg16") as postgres:
             yield postgres.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
     except Exception as exc:  # Docker is an optional local integration dependency.
         pytest.skip(f"isolated PostgreSQL is unavailable: {exc}")
@@ -219,8 +222,10 @@ def test_readyz_requires_the_revision_this_release_supports(
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0002_persona_draft",)
+    # 0003은 0002와 함께 허용하는 호환 릴리스다(material_chunks 배포 공백을 없앤다).
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0002_persona_draft", "0003_material_chunks")
     assert _readyz_with_revision(store, "0002_persona_draft") == 200
+    assert _readyz_with_revision(store, "0003_material_chunks") == 200
     # 이 릴리스는 초안 테이블을 쓰므로 0001에서 Ready가 되면 안 된다. 그렇게 되면
     # migration이 누락된 환경에서 트래픽을 받은 뒤 요청이 테이블 부재로 실패한다.
     assert _readyz_with_revision(store, "0001_persona_minimal") == 503
@@ -401,3 +406,100 @@ def test_other_owner_cannot_reach_the_draft(store: PostgresPersonaStore) -> None
     # 타인 소유와 부재를 같은 오류로 올린다. 구분하면 존재 여부가 새어 나간다.
     with pytest.raises(PersonaNotFound):
         store.get_draft(f"owner-{uuid4()}", persona.id)
+
+
+@pytest.fixture(scope="module")
+def round_trip_database_url() -> str:
+    # 0003 upgrade/downgrade 왕복 전용 컨테이너. 위 `store` fixture(모듈 전체가 공유)
+    # 데이터베이스에 downgrade를 걸면 그 뒤에 도는 다른 테스트들이 head 스키마를
+    # 전제로 실패한다 — 그래서 별도 컨테이너로 완전히 분리한다.
+    configured = os.getenv("TEST_ROUND_TRIP_DATABASE_URL")
+    if configured:
+        yield configured
+        return
+    pytest.importorskip("testcontainers.postgres")
+    try:
+        from testcontainers.postgres import PostgresContainer
+
+        with PostgresContainer("pgvector/pgvector:pg16") as postgres:
+            yield postgres.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
+    except Exception as exc:  # Docker is an optional local integration dependency.
+        pytest.skip(f"isolated PostgreSQL is unavailable: {exc}")
+
+
+def _column_exists(connection, schema: str, table: str, column: str) -> bool:
+    count = connection.execute(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+        (schema, table, column),
+    ).fetchone()[0]
+    return bool(count)
+
+
+def _table_exists(connection, schema: str, table: str) -> bool:
+    count = connection.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema = %s AND table_name = %s",
+        (schema, table),
+    ).fetchone()[0]
+    return bool(count)
+
+
+def test_migration_0003_upgrade_and_downgrade_round_trip(round_trip_database_url: str) -> None:
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert _table_exists(connection, "persona_minimal", "material_chunks")
+                assert _column_exists(
+                    connection, "persona_minimal", "material_versions", "error_code"
+                )
+                assert _column_exists(
+                    connection, "persona_minimal", "material_versions", "indexed_revision"
+                )
+                assert _column_exists(
+                    connection, "persona_minimal", "material_versions", "indexed_at"
+                )
+                unique_constraints = connection.execute(
+                    """
+                    SELECT count(*) FROM information_schema.table_constraints
+                    WHERE table_schema = 'persona_minimal'
+                      AND table_name = 'material_chunks'
+                      AND constraint_type = 'UNIQUE'
+                    """
+                ).fetchone()[0]
+                assert unique_constraints == 1
+        finally:
+            pool.close()
+
+        command.downgrade(config, "-1")
+
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert not _table_exists(connection, "persona_minimal", "material_chunks")
+                assert not _column_exists(
+                    connection, "persona_minimal", "material_versions", "error_code"
+                )
+                assert not _column_exists(
+                    connection, "persona_minimal", "material_versions", "indexed_revision"
+                )
+                assert not _column_exists(
+                    connection, "persona_minimal", "material_versions", "indexed_at"
+                )
+        finally:
+            pool.close()
+
+        # 반복 가능성: 같은 head로 다시 올려도 문제없어야 한다.
+        command.upgrade(config, "head")
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old

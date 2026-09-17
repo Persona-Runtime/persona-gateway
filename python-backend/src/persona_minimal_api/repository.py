@@ -35,7 +35,7 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 목록을 넓히는 것은 호환 릴리스의 역할이지 기본값이 아니다. 새 migration을 배포할 때는
 # 구·신 revision을 함께 허용하는 호환 릴리스를 먼저 내보내 공백을 없앤다.
 # 배포 순서와 롤백 규칙은 docs/migrations.md.
-SUPPORTED_ALEMBIC_REVISIONS = ("0002_persona_draft",)
+SUPPORTED_ALEMBIC_REVISIONS = ("0002_persona_draft", "0003_material_chunks")
 
 
 class SafePoolLogFilter(logging.Filter):
