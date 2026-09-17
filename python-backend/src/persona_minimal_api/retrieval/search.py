@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
+from pgvector import Vector
 from psycopg import Connection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -49,6 +50,11 @@ def search(
     version_id를 빠뜨리면 낡은 revision이나(재색인 후에도 이전 조각이 그대로
     있는 경우) 다른 캐릭터의 조각이 섞여 나올 수 있다.
     """
+    # INSERT와 달리(대상 컬럼 타입이 vector라 암시적 assignment cast가 통한다), <=>
+    # 연산자 안의 파라미터는 대상 컬럼 타입 문맥이 없어 그냥 리스트를 넘기면 psycopg가
+    # double precision[]로 바인딩한다 — vector <=> double precision[] 연산자가 없어
+    # UndefinedFunction이 난다. Vector로 명시적으로 감싸야 vector 타입으로 바인딩된다.
+    vector_param = Vector(query_vector)
     with connection.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
@@ -59,7 +65,7 @@ def search(
             ORDER BY embedding <=> %s
             LIMIT %s
             """,
-            (query_vector, persona_id, version_id, list(kinds), query_vector, k),
+            (vector_param, persona_id, version_id, list(kinds), vector_param, k),
         )
         return [RetrievedChunk(**row) for row in cur.fetchall()]
 
