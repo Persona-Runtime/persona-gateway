@@ -707,6 +707,91 @@ def test_apply_failure_keeps_previous_ready_chunks_and_indexed_revision(
     assert len(chunk_ids) == 1  # rev 3 조각이 그대로 있다 — 실패한 rev 4 시도가 안 건드림
 
 
+def test_run_indexing_success_after_concurrent_edit_keeps_the_edit(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """apply가 202를 먼저 돌려주고 색인이 뒤에서 도는 사이 PATCH로 편집하는 건 정상
+    사용이다 — 늦게 끝난 색인이 그 편집(editing)을 status='ready'로 덮으면 안 된다.
+    다만 그 revision의 조각은 여전히 유효하므로 indexed_revision·indexed_at은
+    갱신돼야 한다."""
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    patched = store.patch_draft(
+        owner,
+        persona.id,
+        draft.revision,
+        None,
+        [{"kind": "events", "content": "본문."}],
+        [],
+    )
+
+    # apply(patched.revision) 시작 — 아직 안 끝났다.
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+
+    # 색인이 끝나기 전에 사용자가 편집한다 — revision이 올라가고 status가 editing으로 돌아간다.
+    edited = store.patch_draft(
+        owner,
+        persona.id,
+        patched.revision,
+        None,
+        [{"kind": "events", "content": "편집된 본문."}],
+        [],
+    )
+    assert edited.status == "editing"
+
+    def _fake_build_records(handle, embedding_base_url):
+        return [_chunk_record(persona.id, handle.version_id, patched.sources[0].id, 0, 0.5)]
+
+    monkeypatch.setattr("persona_minimal_api.indexing.runner._build_records", _fake_build_records)
+
+    run_indexing(handle, _UNREACHABLE_EMBEDDING_URL)
+
+    final = store.get_draft(owner, persona.id)
+    assert final.status == "editing"  # 늦게 끝난 색인이 편집을 덮지 않는다
+    assert final.indexed_revision == patched.revision  # 그 revision 조각은 여전히 유효
+    assert final.indexed_at is not None
+
+
+def test_run_indexing_failure_after_concurrent_edit_does_not_touch_editing(
+    store: PostgresPersonaStore,
+) -> None:
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    patched = store.patch_draft(
+        owner,
+        persona.id,
+        draft.revision,
+        None,
+        [{"kind": "events", "content": "본문."}],
+        [],
+    )
+
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+
+    edited = store.patch_draft(
+        owner,
+        persona.id,
+        patched.revision,
+        None,
+        [{"kind": "events", "content": "편집된 본문."}],
+        [],
+    )
+    assert edited.status == "editing"
+
+    # 아무도 안 듣는 주소라 실제 ConnectError가 나고, 재시도 1회 후 실패한다.
+    run_indexing(handle, _UNREACHABLE_EMBEDDING_URL)
+
+    final = store.get_draft(owner, persona.id)
+    assert final.status == "editing"  # 늦게 실패한 색인이 editing을 덮지 않는다
+
+    with store.pool.connection() as connection:
+        error_code = connection.execute(
+            "SELECT error_code FROM persona_minimal.material_versions WHERE persona_id = %s",
+            (persona.id,),
+        ).fetchone()[0]
+    assert error_code is None  # status가 안 바뀌었으니 error_code도 안 남는다
+
+
 def test_run_indexing_rolls_back_chunk_replacement_when_status_update_fails(
     store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -133,26 +133,36 @@ def _classify(error: Exception) -> str:
 def _mark_ready_in(handle: IndexingHandle) -> None:
     """호출자가 이미 연 트랜잭션 안에서 실행한다(자체 트랜잭션을 열지 않는다) —
     `replace_chunks`와 한 트랜잭션으로 묶여야 "조각과 indexed_revision은 항상 한
-    쌍"이라는 계약을 지킬 수 있다."""
+    쌍"이라는 계약을 지킬 수 있다.
+
+    apply는 202를 먼저 돌려주고 색인은 뒤에서 돈다 — 그 사이 PATCH로 revision이
+    올라갔으면(rev 5·editing) status는 건드리지 않는다. 이 색인은 이미 낡은
+    revision을 위한 것이었지만, 그 revision의 조각·표시는 여전히 유효하므로
+    indexed_revision·indexed_at·error_code는 그대로 갱신한다.
+    """
     with handle.connection.cursor() as cur:
         cur.execute(
             """
             UPDATE persona_minimal.material_versions
-            SET status = 'ready', indexed_revision = %s, indexed_at = now(), error_code = NULL
+            SET status = CASE WHEN revision = %s THEN 'ready' ELSE status END,
+                indexed_revision = %s, indexed_at = now(), error_code = NULL
             WHERE persona_id = %s
             """,
-            (handle.revision, handle.persona_id),
+            (handle.revision, handle.revision, handle.persona_id),
         )
 
 
 def _mark_failed(handle: IndexingHandle, error_code: str) -> None:
+    # revision이 일치할 때만 갱신한다 — 그 사이 PATCH로 revision이 올라갔으면
+    # (rev 5·editing) 이 실패는 이미 낡은 시도에 대한 것이라 editing을 failed로
+    # 덮으면 안 된다. WHERE에 revision을 더해 그 경우 조용히 no-op이 되게 한다.
     with handle.connection.transaction():
         with handle.connection.cursor() as cur:
             cur.execute(
                 """
                 UPDATE persona_minimal.material_versions
                 SET status = 'failed', error_code = %s
-                WHERE persona_id = %s
+                WHERE persona_id = %s AND revision = %s
                 """,
-                (error_code, handle.persona_id),
+                (error_code, handle.persona_id, handle.revision),
             )
