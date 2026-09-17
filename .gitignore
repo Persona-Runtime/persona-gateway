@@ -23,3 +23,8 @@ feedback.md
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+
+# --- 로컬 전용 문서(원격에 올리지 않음) ---
+AGENTS.md
+docs/
+runbooks/
