@@ -3,8 +3,12 @@ test_embed_integration.py(marker: integration)에서 1개만 확인한다."""
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
 from fastapi.testclient import TestClient
 
+from persona_embedding_service import main as main_module
 from persona_embedding_service.config import (
     EMBEDDING_DIM,
     MAX_CHARS_PER_TEXT,
@@ -138,3 +142,42 @@ def test_healthz_is_always_ok_regardless_of_model_state() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_load_done_callback_exits_process_on_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncio.create_task로 시작한 로딩 태스크가 예외로 끝나면 그 예외가 태스크
+    안에 갇혀 조용히 사라진다 — /readyz가 로그 한 줄 없이 영원히 503만 내는 걸
+    막으려고 콜백이 프로세스를 종료해야 한다."""
+    exit_codes: list[int] = []
+    monkeypatch.setattr(main_module.os, "_exit", exit_codes.append)
+
+    async def _failing_load() -> None:
+        raise RuntimeError("synthetic model load failure")
+
+    async def _run() -> None:
+        task = asyncio.create_task(_failing_load())
+        with pytest.raises(RuntimeError):
+            await task
+        main_module._on_load_done(task)
+
+    asyncio.run(_run())
+
+    assert exit_codes == [1]
+
+
+def test_load_done_callback_does_nothing_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exit_codes: list[int] = []
+    monkeypatch.setattr(main_module.os, "_exit", exit_codes.append)
+
+    async def _run() -> None:
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        main_module._on_load_done(task)
+
+    asyncio.run(_run())
+
+    assert exit_codes == []

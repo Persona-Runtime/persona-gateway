@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -62,6 +63,19 @@ def _prefix_for(input_type: str) -> str:
     return config.PASSAGE_PREFIX if input_type == "passage" else config.QUERY_PREFIX
 
 
+def _on_load_done(task: asyncio.Task) -> None:
+    """모델 로딩이 백그라운드 태스크에서 실패하면 예외가 태스크 안에 갇혀 조용히
+    사라진다 — `/readyz`는 로그 한 줄 없이 영원히 503만 내고, startupProbe(`/healthz`
+    기준)는 통과해버려 readiness만 계속 실패하는 Pod가 남는다. 로그를 남기고
+    프로세스를 종료해 k8s가 CrashLoopBackOff로 재시작하게 한다 — 스스로 복구할 방법이
+    없으니 이 편이 조용히 죽어 있는 것보다 낫다.
+    """
+    error = task.exception()
+    if error is not None:
+        logger.exception("model load failed", exc_info=error)
+        os._exit(1)
+
+
 def create_app(model: Model | None = None) -> FastAPI:
     """`model`을 주면(테스트) 그 상태를 그대로 쓰고 lifespan이 로딩을 대신 시작하지
     않는다 — 실제 모델 없이 단위 테스트를 빠르게 돌리기 위한 주입 지점이다."""
@@ -72,7 +86,11 @@ def create_app(model: Model | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         if not injected:
             # 블로킹 로딩을 스레드로 돌려 이벤트 루프가 /healthz에 즉시 응답하게 한다.
-            asyncio.create_task(asyncio.to_thread(app_model.load))
+            # 반환값을 안 잡으면 태스크가 참조 없이 떠 있다가 GC 대상이 돼 로딩 도중
+            # 사라질 수 있다(CPython 공식 경고) — app.state에 보관해 막는다.
+            task = asyncio.create_task(asyncio.to_thread(app_model.load))
+            app.state.load_task = task
+            task.add_done_callback(_on_load_done)
         yield
 
     app = FastAPI(lifespan=lifespan)
