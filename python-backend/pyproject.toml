@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.14,<2",
   "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
   "pgvector>=0.3,<1",
   "psycopg[binary,pool]>=3.2,<4",
   "pydantic-settings>=2.6,<3",
@@ -14,7 +15,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "httpx>=0.28,<1",
   "pytest>=8.3,<9",
   "testcontainers[postgres]>=4.9,<5",
 ]
