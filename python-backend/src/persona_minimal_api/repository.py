@@ -108,6 +108,11 @@ class NoSourcesToIndex(Exception):
     미리 안다면 202→failed 왕복 없이 바로 422로 끝낸다."""
 
 
+class NotIndexed(Exception):
+    """캐릭터·초안은 있지만 성공한 색인이 한 번도 없다(indexed_revision IS NULL).
+    검색할 대상 자체가 없다."""
+
+
 class DraftValidationError(Exception):
     """계약이 정한 거절. code가 그대로 응답의 오류 코드가 된다."""
 

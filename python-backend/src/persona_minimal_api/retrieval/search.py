@@ -1,0 +1,131 @@
+"""material_chunks에서 pgvector 코사인 유사도로 조각을 찾는다 — 인수인계 §Phase 4.
+
+`indexing/store.py`가 쓰기 쪽 저수준 모듈이듯, 이 모듈은 읽기 쪽 저수준 모듈이다 —
+`PersonaStore`(repository.py)를 거치지 않고 `Connection`/`ConnectionPool`을 직접 받는다.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from uuid import UUID
+
+from psycopg import Connection
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from ..indexing.embedding_client import embed
+from ..repository import NotIndexed, PersonaNotFound
+from .metrics import RETRIEVAL_SECONDS
+
+# §8 Q5 확정 — 골든셋 전 변경 금지.
+BODY_KINDS = ("events", "relationships", "abilities")
+SPEECH_KINDS = ("speech_examples",)
+BODY_K = 5
+SPEECH_K = 5
+
+
+@dataclass(frozen=True)
+class RetrievedChunk:
+    id: UUID
+    kind: str
+    source_id: UUID
+    ordinal: int
+    heading_path: str
+    content: str
+    char_count: int
+    score: float
+
+
+def search(
+    connection: Connection,
+    *,
+    persona_id: UUID,
+    version_id: UUID,
+    query_vector: list[float],
+    kinds: tuple[str, ...],
+    k: int,
+) -> list[RetrievedChunk]:
+    """persona_id·version_id·kinds는 기본값 없이 항상 명시해야 한다 — 특히
+    version_id를 빠뜨리면 낡은 revision이나(재색인 후에도 이전 조각이 그대로
+    있는 경우) 다른 캐릭터의 조각이 섞여 나올 수 있다.
+    """
+    with connection.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, kind, source_id, ordinal, heading_path, content, char_count,
+                   1 - (embedding <=> %s) AS score
+            FROM persona_minimal.material_chunks
+            WHERE persona_id = %s AND version_id = %s AND kind = ANY(%s)
+            ORDER BY embedding <=> %s
+            LIMIT %s
+            """,
+            (query_vector, persona_id, version_id, list(kinds), query_vector, k),
+        )
+        return [RetrievedChunk(**row) for row in cur.fetchall()]
+
+
+def load_indexed_version(
+    pool: ConnectionPool, owner_subject: str, persona_id: UUID
+) -> tuple[UUID, int]:
+    """소유자 범위로 version_id·indexed_revision만 읽는다(FOR UPDATE 없이) — 검색은
+    쓰기가 아니라 잠글 이유가 없다. `retrieve_context`와 `/retrieve` 디버그 엔드포인트가
+    함께 쓴다(디버그 엔드포인트는 k를 호출자가 고르므로 k가 고정된 `retrieve_context`를
+    그대로 재사용할 수 없다).
+    """
+    with pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT mv.version_id, mv.indexed_revision "
+                "FROM persona_minimal.material_versions AS mv "
+                "JOIN persona_minimal.personas AS p ON p.id = mv.persona_id "
+                "WHERE mv.persona_id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL",
+                (persona_id, owner_subject),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise PersonaNotFound
+    if row["indexed_revision"] is None:
+        raise NotIndexed
+    return row["version_id"], row["indexed_revision"]
+
+
+@dataclass(frozen=True)
+class RetrievedContext:
+    indexed_revision: int
+    body: list[RetrievedChunk]
+    speech: list[RetrievedChunk]
+
+
+def retrieve_context(
+    pool: ConnectionPool,
+    embedding_base_url: str,
+    *,
+    owner_subject: str,
+    persona_id: UUID,
+    question: str,
+) -> RetrievedContext:
+    """질문 임베딩 1회 + 본문/대사 검색 2회를 묶는다. 질문 원문은 로그·예외
+    메시지에 넣지 않는다."""
+    version_id, indexed_revision = load_indexed_version(pool, owner_subject, persona_id)
+    result = embed(embedding_base_url, [question], "query")
+    query_vector = result.vectors[0]
+    with pool.connection() as connection:
+        with RETRIEVAL_SECONDS.labels(kind_group="body").time():
+            body = search(
+                connection,
+                persona_id=persona_id,
+                version_id=version_id,
+                query_vector=query_vector,
+                kinds=BODY_KINDS,
+                k=BODY_K,
+            )
+        with RETRIEVAL_SECONDS.labels(kind_group="speech").time():
+            speech = search(
+                connection,
+                persona_id=persona_id,
+                version_id=version_id,
+                query_vector=query_vector,
+                kinds=SPEECH_KINDS,
+                k=SPEECH_K,
+            )
+    return RetrievedContext(indexed_revision=indexed_revision, body=body, speech=speech)
