@@ -4,7 +4,7 @@ import hmac
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
@@ -13,6 +13,7 @@ from psycopg_pool import PoolTimeout
 
 from .config import Settings
 from .cursor import CursorError, PersonaCursor, decode as decode_cursor, encode as encode_cursor
+from .indexing.runner import run_indexing
 from .repository import (
     Draft,
     DraftAlreadyExists,
@@ -21,6 +22,7 @@ from .repository import (
     DraftValidationError,
     DuplicatePersonaName,
     IdempotencyConflict,
+    IndexingInProgress,
     Persona,
     PersonaLimitExceeded,
     PersonaNotFound,
@@ -78,6 +80,11 @@ class DraftPatchRequest(BaseModel):
     settings: dict[str, str] | None = None
     upsert_sources: list[SourceUpsertRequest] = []
     remove_source_ids: list[UUID] = []
+
+
+class DraftApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int
 
 
 def require_idempotency_key(raw: str | None) -> UUID:
@@ -197,6 +204,17 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # 이전 프로세스가 색인 도중 죽었으면 그 행이 processing에 멈춰 있다 — advisory
+        # lock은 연결이 끊기면 자동으로 풀리지만(세션 범위), status는 그대로 남아 새
+        # apply 요청을 "진행 중"으로 착각해 영원히 막는다. indexed_revision·indexed_at은
+        # 손대지 않는다 — 죽기 전에 성공한 색인이 있었다면 그건 여전히 유효하다.
+        if isinstance(store, PostgresPersonaStore):
+            with store.pool.connection() as connection, connection.transaction():
+                connection.execute(
+                    "UPDATE persona_minimal.material_versions "
+                    "SET status = 'failed', error_code = 'interrupted' "
+                    "WHERE status = 'processing'"
+                )
         yield
         if owned_pool is not None:
             owned_pool.close()
@@ -459,6 +477,37 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
         except Exception as error:
             raise draft_error(error) from error
         return draft_response(draft)
+
+    @app.post("/v1/personas/{persona_id}/draft/apply", status_code=202)
+    def apply_draft(
+        request: Request,
+        persona_id: UUID,
+        body: DraftApplyRequest,
+        background_tasks: BackgroundTasks,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        require_idempotency_key(idempotency_key)
+        # PATCH의 revision_conflict와 문구·코드를 다르게 쓰기로 했으므로(계약), 여기만
+        # draft_error를 거치지 않고 먼저 잡는다. IndexingInProgress도 같은 이유로 먼저 잡는다 —
+        # "진행 중" 자체가 이 엔드포인트에만 있는 개념이라 공용 매퍼에 넣을 이유가 없다.
+        try:
+            handle = request.app.state.store.start_indexing(
+                user[0], persona_id, body.expected_revision
+            )
+        except RevisionConflict as error:
+            raise ApiError(
+                409, "revision_mismatch", "그 사이에 초안이 바뀌었습니다. 다시 읽고 적용해주세요."
+            ) from error
+        except IndexingInProgress as error:
+            raise ApiError(409, "indexing_in_progress", "이미 색인이 진행 중입니다.") from error
+        except Exception as error:
+            raise draft_error(error) from error
+        background_tasks.add_task(run_indexing, handle, request.app.state.settings.embedding_url)
+        return JSONResponse(
+            status_code=202,
+            content={"version_id": str(handle.version_id), "status": "processing"},
+        )
 
     @app.delete("/v1/personas/{persona_id}/draft", status_code=204)
     def discard_draft(

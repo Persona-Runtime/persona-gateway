@@ -46,9 +46,7 @@ def test_embed_splits_into_batches_and_preserves_order(monkeypatch: pytest.Monke
     assert len(calls) == 2
     assert len(calls[0]) == BATCH_SIZE
     assert len(calls[1]) == 40 - BATCH_SIZE
-    assert result == EmbeddingResult(
-        model="m@rev", vectors=[[float(len(t))] for t in texts]
-    )
+    assert result == EmbeddingResult(model="m@rev", vectors=[[float(len(t))] for t in texts])
 
 
 def test_embed_retries_once_on_connect_error_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,9 +142,7 @@ def test_embed_returns_empty_list_without_calling_the_server(
 
     _install(monkeypatch, httpx.MockTransport(handler))
 
-    assert embed("http://embedding.local", [], "passage") == EmbeddingResult(
-        model=None, vectors=[]
-    )
+    assert embed("http://embedding.local", [], "passage") == EmbeddingResult(model=None, vectors=[])
 
 
 def test_embed_rejects_inconsistent_model_across_batches(monkeypatch: pytest.MonkeyPatch) -> None:

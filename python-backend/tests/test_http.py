@@ -81,6 +81,7 @@ class UnexpectedFailureStore(MemoryStore):
 def settings() -> Settings:
     return Settings(
         DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
         PERSONA_STATIC_BEARER_TOKEN="synthetic-token",
         PERSONA_STATIC_USER_ID="synthetic-owner",
         PERSONA_STATIC_DISPLAY_NAME="합성 사용자",

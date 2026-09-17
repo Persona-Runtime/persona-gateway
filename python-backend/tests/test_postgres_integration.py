@@ -14,6 +14,7 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 
 from persona_minimal_api.config import Settings
+from persona_minimal_api.indexing.runner import run_indexing
 from persona_minimal_api.indexing.store import ChunkRecord, replace_chunks
 from persona_minimal_api.main import create_app
 from persona_minimal_api.repository import (
@@ -23,6 +24,7 @@ from persona_minimal_api.repository import (
     DraftSettings,
     DraftValidationError,
     IdempotencyConflict,
+    IndexingInProgress,
     PersonaLimitExceeded,
     PersonaNotFound,
     PostgresPersonaStore,
@@ -127,6 +129,7 @@ def test_atomic_limit_and_idempotency_survive_recreation(store: PostgresPersonaS
 def test_http_create_and_list_persist_through_new_app(store: PostgresPersonaStore) -> None:
     settings = Settings(
         DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
         PERSONA_STATIC_BEARER_TOKEN="integration-token",
         PERSONA_STATIC_USER_ID=f"http-owner-{uuid4()}",
         PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
@@ -154,6 +157,7 @@ def test_http_create_and_list_persist_through_new_app(store: PostgresPersonaStor
 def test_readyz_times_out_when_schema_check_is_locked(store: PostgresPersonaStore) -> None:
     settings = Settings(
         DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
         PERSONA_STATIC_BEARER_TOKEN="integration-token",
         PERSONA_STATIC_USER_ID=f"ready-owner-{uuid4()}",
         PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
@@ -176,6 +180,7 @@ def test_readyz_times_out_when_schema_check_is_locked(store: PostgresPersonaStor
 def _readiness_settings() -> Settings:
     return Settings(
         DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
         PERSONA_STATIC_BEARER_TOKEN="integration-token",
         PERSONA_STATIC_USER_ID=f"revision-owner-{uuid4()}",
         PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
@@ -608,3 +613,169 @@ def test_replace_chunks_rolls_back_on_failure_and_keeps_prior_chunks(
             (version_id,),
         ).fetchall()
     assert [r[0] for r in rows] == [kept.id]
+
+
+_UNREACHABLE_EMBEDDING_URL = "http://127.0.0.1:1"  # 포트 1은 아무 서비스도 안 듣는다
+
+
+def _fabricate_ready_index(
+    store: PostgresPersonaStore, owner: str, persona_id, revision: int, source_id
+) -> None:
+    """ "이전에 성공적으로 색인됐다"를 직접 만든다.
+
+    이 저장소엔 아직 진짜 임베딩 서비스가 없어(다음 라운드) run_indexing을 정상
+    성공시킬 방법이 없다 — 그래서 store.start_indexing으로 실제 잠금·전이는 그대로
+    거치되, 조각 저장과 성공 마무리는 손으로 재현한다. 실패 경로(이 파일의 진짜
+    관심사)는 run_indexing을 그대로 쓴다.
+    """
+    handle = store.start_indexing(owner, persona_id, revision)
+    record = _chunk_record(persona_id, handle.version_id, source_id, 0, 0.1)
+    replace_chunks(handle.pool, handle.version_id, [record])
+    with handle.connection.transaction():
+        with handle.connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE persona_minimal.material_versions
+                SET status = 'ready', indexed_revision = %s, indexed_at = now(), error_code = NULL
+                WHERE persona_id = %s
+                """,
+                (revision, persona_id),
+            )
+    with handle.connection.transaction():
+        with handle.connection.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
+    handle.pool.putconn(handle.connection)
+
+
+def test_apply_failure_keeps_previous_ready_chunks_and_indexed_revision(
+    store: PostgresPersonaStore,
+) -> None:
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    ready = store.patch_draft(
+        owner,
+        persona.id,
+        draft.revision,
+        None,
+        [{"kind": "events", "content": "첫 버전 본문이다."}],
+        [],
+    )
+    _fabricate_ready_index(store, owner, persona.id, ready.revision, ready.sources[0].id)
+    ready_version_id = store.get_draft(owner, persona.id).version_id
+
+    # 편집 → revision이 올라가고 status는 editing으로 돌아간다.
+    edited = store.patch_draft(
+        owner,
+        persona.id,
+        ready.revision,
+        None,
+        [{"kind": "events", "content": "둘째 버전이다."}],
+        [],
+    )
+    assert edited.status == "editing"
+    assert edited.indexed_revision == ready.revision  # 편집해도 이전 색인 표시는 그대로
+
+    # apply — 아무도 안 듣는 주소라 실제 ConnectError가 나고, 재시도 1회 후 실패한다.
+    handle = store.start_indexing(owner, persona.id, edited.revision)
+    run_indexing(handle, _UNREACHABLE_EMBEDDING_URL)
+
+    final = store.get_draft(owner, persona.id)
+    assert final.status == "failed"
+    assert final.indexed_revision == ready.revision  # rev 3 표시가 그대로 남는다
+    assert final.indexed_at is not None
+
+    with store.pool.connection() as connection:
+        error_code = connection.execute(
+            "SELECT error_code FROM persona_minimal.material_versions WHERE persona_id = %s",
+            (persona.id,),
+        ).fetchone()[0]
+        assert error_code is not None
+
+        chunk_ids = connection.execute(
+            "SELECT id FROM persona_minimal.material_chunks WHERE version_id = %s",
+            (ready_version_id,),
+        ).fetchall()
+    assert len(chunk_ids) == 1  # rev 3 조각이 그대로 있다 — 실패한 rev 4 시도가 안 건드림
+
+
+def test_start_indexing_blocks_only_while_processing(store: PostgresPersonaStore) -> None:
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "본문."}], []
+    )
+
+    # editing에서는 통과한다.
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+    assert store.get_draft(owner, persona.id).status == "processing"
+
+    # 지금 processing이므로 새 시도는 막힌다.
+    with pytest.raises(IndexingInProgress):
+        store.start_indexing(owner, persona.id, patched.revision)
+
+    run_indexing(handle, _UNREACHABLE_EMBEDDING_URL)  # failed로 마무리(잠금도 풀림)
+    assert store.get_draft(owner, persona.id).status == "failed"
+
+    # failed에서는 다시 통과한다(재시도).
+    handle2 = store.start_indexing(owner, persona.id, patched.revision)
+    run_indexing(handle2, _UNREACHABLE_EMBEDDING_URL)
+
+
+def test_start_indexing_advisory_lock_admits_only_one_concurrent_caller(
+    store: PostgresPersonaStore,
+) -> None:
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "본문."}], []
+    )
+
+    def attempt():
+        return store.start_indexing(owner, persona.id, patched.revision)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(attempt) for _ in range(2)]
+        outcomes = [future.exception() or future.result() for future in futures]
+
+    successes = [o for o in outcomes if not isinstance(o, Exception)]
+    failures = [o for o in outcomes if isinstance(o, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], IndexingInProgress)
+
+    # 성공한 쪽의 handle을 마무리해야 연결·잠금이 정리된다.
+    run_indexing(successes[0], _UNREACHABLE_EMBEDDING_URL)
+
+
+def test_startup_marks_stale_processing_as_interrupted_and_keeps_indexed_fields(
+    store: PostgresPersonaStore,
+) -> None:
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    ready = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "본문."}], []
+    )
+    _fabricate_ready_index(store, owner, persona.id, ready.revision, ready.sources[0].id)
+
+    edited = store.patch_draft(
+        owner, persona.id, ready.revision, None, [{"kind": "events", "content": "다시 편집."}], []
+    )
+    handle = store.start_indexing(owner, persona.id, edited.revision)
+    assert store.get_draft(owner, persona.id).status == "processing"
+    # run_indexing을 부르지 않고 그대로 둔다 — 프로세스가 죽어 processing에 멈춘 상황을 흉내낸다.
+    # advisory lock은 연결을 반납하면 세션이 끝나 자동으로 풀린다.
+    handle.pool.putconn(handle.connection)
+
+    settings = _readiness_settings()
+    with TestClient(create_app(settings, store)):
+        pass  # lifespan의 기동 훅이 여기서 돈다.
+
+    final = store.get_draft(owner, persona.id)
+    assert final.status == "failed"
+    assert final.indexed_revision == ready.revision  # 기동 훅은 indexed_*를 안 건드린다
+    with store.pool.connection() as connection:
+        error_code = connection.execute(
+            "SELECT error_code FROM persona_minimal.material_versions WHERE persona_id = %s",
+            (persona.id,),
+        ).fetchone()[0]
+    assert error_code == "interrupted"

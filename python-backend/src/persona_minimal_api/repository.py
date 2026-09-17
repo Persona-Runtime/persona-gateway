@@ -9,6 +9,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pgvector.psycopg import register_vector
+from psycopg import Connection
 from psycopg.rows import dict_row
 from psycopg import Error as PsycopgError
 from psycopg_pool import ConnectionPool
@@ -93,6 +94,14 @@ class RevisionConflict(Exception):
     """expected_revision이 현재 초안과 다르다. 다른 사람의 수정을 덮지 않는다."""
 
 
+class IndexingInProgress(Exception):
+    """이미 색인이 진행 중이다(advisory lock을 못 잡았거나 status가 processing).
+
+    같은 캐릭터에 색인 요청 두 개가 동시에 material_chunks를 지웠다 쓰면 서로
+    덮어써 결과가 뒤섞인다. 먼저 잡은 쪽만 진행하고 나머지는 409로 돌려보낸다.
+    """
+
+
 class DraftValidationError(Exception):
     """계약이 정한 거절. code가 그대로 응답의 오류 코드가 된다."""
 
@@ -169,6 +178,11 @@ class Draft:
     settings: DraftSettings
     sources: tuple[DraftSource, ...]
     updated_at: datetime
+    # 실제로 검색에 쓸 수 있는 색인이 어느 revision 것인지. status(마지막 적용 시도
+    # 결과)와 분리해 둔다 — rev 3 색인 성공 후 rev 4 편집·색인 실패에서도 rev 3 조각은
+    # 그대로 쓸 수 있어야 하는데, status만 보면 failed라 그 사실을 알 수 없다.
+    indexed_revision: int | None
+    indexed_at: datetime | None
 
     @property
     def requires_processing(self) -> bool:
@@ -183,6 +197,24 @@ class Draft:
     def can_activate(self) -> bool:
         """적용할 수 있는지. **지금은 항상 거짓이다.** 근거는 위와 같다."""
         return False
+
+
+@dataclass(frozen=True)
+class IndexingHandle:
+    """`start_indexing`이 만들고 `runner.run_indexing`이 소비하는 진행 중 색인 상태.
+
+    `connection`은 advisory lock을 쥔 **바로 그** 연결이다. advisory lock은 세션(연결)
+    범위라, 이 연결을 pool에 반납했다가 다시 꺼내면 다른 요청이 그 물리 연결을 받아
+    영문도 모른 채 잠금을 쥔 것처럼 보일 수 있다 — 그래서 `run_indexing`이 끝날 때까지
+    이 연결은 `pool.getconn()`으로 꺼낸 채 유지하고, 풀의 `with pool.connection()`
+    컨텍스트 매니저(진입 시 획득·종료 시 자동 반납)를 쓰지 않는다.
+    """
+
+    connection: Connection
+    pool: ConnectionPool
+    persona_id: UUID
+    version_id: UUID
+    revision: int
 
 
 class PersonaStore(Protocol):
@@ -435,7 +467,8 @@ class PostgresPersonaStore:
         cur.execute(
             """
             SELECT persona_id, version_id, revision, status, job_id, base_version_id,
-                   settings_name, settings_profile, settings_speech_examples, updated_at
+                   settings_name, settings_profile, settings_speech_examples, updated_at,
+                   indexed_revision, indexed_at
             FROM persona_minimal.material_versions WHERE persona_id = %s
             """,
             (persona_id,),
@@ -476,6 +509,8 @@ class PostgresPersonaStore:
             ),
             sources=sources,
             updated_at=row["updated_at"],
+            indexed_revision=row["indexed_revision"],
+            indexed_at=row["indexed_at"],
         )
 
     def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft:
@@ -662,7 +697,7 @@ class PostgresPersonaStore:
                     cur.execute(
                         """
                         UPDATE persona_minimal.material_versions
-                        SET revision = revision + 1, updated_at = now()
+                        SET revision = revision + 1, status = 'editing', updated_at = now()
                         WHERE persona_id = %s
                         """,
                         (persona_id,),
@@ -670,6 +705,66 @@ class PostgresPersonaStore:
                     updated = self._read_draft(cur, persona_id)
                     self._guard_draft_limits(updated)
                     return updated
+
+    def start_indexing(
+        self, owner_subject: str, persona_id: UUID, expected_revision: int
+    ) -> IndexingHandle:
+        """색인을 시작할 수 있는지 확인하고, 시작한다면 그 연결을 쥔 채로 넘긴다.
+
+        advisory lock은 이 메서드가 반환한 뒤에도 `run_indexing`이 끝낼 때까지
+        유지돼야 하므로, 여기서는 `pool.connection()`(종료 시 자동 반납)이 아니라
+        `pool.getconn()`을 쓴다. 실패하는 모든 경로에서 잠금을 풀고 연결을 반납한
+        뒤 예외를 던진다 — 그래야 실패한 시도가 연결을 새어 나가게 하지 않는다.
+
+        `status == 'processing'`일 때만 막는다(`IndexingInProgress`). ready·failed·
+        editing에서는 재적용을 허용한다 — "이미 진행 중일 때만" 막으라는 계약 그대로다.
+        """
+        connection = self.pool.getconn()
+        try:
+            with connection.transaction():
+                with connection.cursor(row_factory=dict_row) as cur:
+                    self._lock_persona(cur, owner_subject, persona_id)
+
+                    cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (str(persona_id),))
+                    locked = cur.fetchone()["pg_try_advisory_lock"]
+                    if not locked:
+                        raise IndexingInProgress
+
+                    cur.execute(
+                        "SELECT version_id, revision, status FROM persona_minimal.material_versions "
+                        "WHERE persona_id = %s FOR UPDATE",
+                        (persona_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
+                        raise DraftNotFound
+                    if row["status"] == "processing":
+                        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
+                        raise IndexingInProgress
+                    if row["revision"] != expected_revision:
+                        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
+                        raise RevisionConflict
+
+                    revision = row["revision"]
+                    version_id = row["version_id"]
+                    cur.execute(
+                        "UPDATE persona_minimal.material_versions SET status = 'processing' "
+                        "WHERE persona_id = %s",
+                        (persona_id,),
+                    )
+        except BaseException:
+            self.pool.putconn(connection)
+            raise
+        # 트랜잭션은 여기서 이미 커밋됐다(with connection.transaction() 블록 종료).
+        # advisory lock은 세션 범위라 커밋 이후에도, 이 연결이 열려 있는 한 유지된다.
+        return IndexingHandle(
+            connection=connection,
+            pool=self.pool,
+            persona_id=persona_id,
+            version_id=version_id,
+            revision=revision,
+        )
 
     def _apply_settings(
         self,

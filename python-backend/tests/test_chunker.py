@@ -56,9 +56,7 @@ def test_long_paragraph_splits_at_sentence_boundary_near_target_and_under_cap() 
         # 목표(TARGET_CHARS) 근처에서 끊되, 상한(MAX_CHARS)은 절대 넘지 않는다.
         assert TARGET_CHARS <= chunk.char_count <= MAX_CHARS
     # 어느 조각도 문장 중간에서 잘리지 않는다 — 이어 붙이면 원문과 같아야 한다.
-    rejoined = " ".join(
-        chunk.content.split("] ", 1)[1] for chunk in chunks
-    )
+    rejoined = " ".join(chunk.content.split("] ", 1)[1] for chunk in chunks)
     assert rejoined == paragraph
 
 
