@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     database_timeout_seconds: float = Field(
         default=2.0, validation_alias="PERSONA_DB_TIMEOUT_SECONDS"
     )
+    # /retrieve 응답에 원문 조각이 그대로 들어간다 — 기본은 꺼둔다. platform prod
+    # overlay에는 이 env를 넣지 않는다(=off로 유지).
+    retrieve_debug_enabled: bool = Field(
+        default=False, validation_alias="PERSONA_RETRIEVE_DEBUG_ENABLED"
+    )
 
     @field_validator("static_user_id", "static_display_name")
     @classmethod

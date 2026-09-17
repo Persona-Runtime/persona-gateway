@@ -89,6 +89,7 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 | DELETE | `/v1/personas/{persona_id}` | 202 DeletionAccepted | 삭제 잠금·작업 중단·비동기 정리 |
 | GET | `/v1/deletions/{deletion_id}` | 200 Deletion | 삭제 후에도 소유자 조회 가능 |
 | GET | `/v1/service-status` | 200 ServiceStatus | 안내용 snapshot, 처리 시 다시 확인 |
+| GET | `/v1/personas/{persona_id}/retrieve` | 200 RetrieveResult | 디버그 전용 — `PERSONA_RETRIEVE_DEBUG_ENABLED`(기본 false) 꺼지면 404. q 1~2000자, k 1~10(기본 5) |
 
 25 operations / 17 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
 이전 설계에서 추가로 논의하지 않은 대화 삭제·응답 편집·정상 응답 재생성·실행 중 ingestion 사용자 취소 API는 만들지 않는다.

@@ -1589,6 +1589,91 @@
           }
         }
       }
+    },
+    "/v1/personas/{persona_id}/retrieve": {
+      "get": {
+        "operationId": "retrievePersonaContext",
+        "summary": "검색 결과 디버그 조회",
+        "tags": [
+          "Personas"
+        ],
+        "description": "질문으로 본문·대사 조각을 검색해 그대로 보여준다. 디버그 전용 — PERSONA_RETRIEVE_DEBUG_ENABLED(기본 false)가 꺼져 있으면 404. 응답에 원문 조각이 그대로 들어가므로 platform prod overlay에는 이 env를 넣지 않는다.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            },
+            "description": "질문. 접근 로그에는 남기지 않는다."
+          },
+          {
+            "in": "query",
+            "name": "k",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 5
+            },
+            "description": "본문·대사 각각 상위 k개."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "검색 결과 디버그 조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrieveResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3168,6 +3253,68 @@
           "code",
           "message",
           "status"
+        ]
+      },
+      "RetrievedChunk": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "events",
+              "relationships",
+              "abilities",
+              "speech_examples"
+            ]
+          },
+          "heading_path": {
+            "type": "string"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "score": {
+            "type": "number"
+          },
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "heading_path",
+          "ordinal",
+          "score",
+          "content"
+        ]
+      },
+      "RetrieveResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "indexed_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "body": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RetrievedChunk"
+            }
+          },
+          "speech": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RetrievedChunk"
+            }
+          }
+        },
+        "required": [
+          "indexed_revision",
+          "body",
+          "speech"
         ]
       }
     },

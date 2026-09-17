@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import hmac
+import logging
+import time
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 from psycopg import Error as PsycopgError
 from psycopg_pool import PoolTimeout
 
 from .config import Settings
 from .cursor import CursorError, PersonaCursor, decode as decode_cursor, encode as encode_cursor
+from .indexing.embedding_client import EmbeddingError, embed
 from .indexing.runner import run_indexing
 from .repository import (
     Draft,
@@ -24,6 +28,7 @@ from .repository import (
     IdempotencyConflict,
     IndexingInProgress,
     NoSourcesToIndex,
+    NotIndexed,
     Persona,
     PersonaLimitExceeded,
     PersonaNotFound,
@@ -33,6 +38,10 @@ from .repository import (
     PostgresPersonaStore,
     create_pool,
 )
+from .retrieval.metrics import RETRIEVAL_SECONDS
+from .retrieval.search import BODY_KINDS, SPEECH_KINDS, RetrievedChunk, load_indexed_version, search
+
+logger = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
@@ -177,6 +186,17 @@ def draft_response(draft: Draft) -> dict[str, object]:
     }
 
 
+def retrieve_chunk_response(chunk: RetrievedChunk) -> dict[str, object]:
+    # id·source_id·char_count는 내부 식별자·서버 상태라 응답에서 뺀다.
+    return {
+        "kind": chunk.kind,
+        "heading_path": chunk.heading_path,
+        "ordinal": chunk.ordinal,
+        "score": chunk.score,
+        "content": chunk.content,
+    }
+
+
 def error_body(error: ApiError, request_id: str) -> dict[str, object]:
     detail: dict[str, object] = {
         "code": error.code,
@@ -290,6 +310,11 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
             # 연결 문자열·DB 예외를 응답에 넣지 않아 Secret과 내부 구조를 보호한다.
             return JSONResponse(status_code=503, content={"status": "not_ready"})
         return {"status": "ready"}
+
+    @app.get("/metrics")
+    def metrics():
+        # /healthz·/readyz와 같은 운영 엔드포인트 취급 — 인증하지 않는다.
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/v1/me")
     def get_me(user: tuple[str, str] = Depends(authenticated_user)):
@@ -525,5 +550,73 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
         except Exception as error:
             raise draft_error(error) from error
         return Response(status_code=204)
+
+    @app.get("/v1/personas/{persona_id}/retrieve")
+    def retrieve(
+        request: Request,
+        persona_id: UUID,
+        q: str,
+        k: int = 5,
+        user: tuple[str, str] = Depends(authenticated_user),
+    ):
+        # 응답에 원문 조각이 그대로 들어간다 — 디버그 전용, 기본 꺼짐.
+        if not request.app.state.settings.retrieve_debug_enabled:
+            raise ApiError(404, "not_found", "찾을 수 없습니다.")
+        if not (1 <= len(q) <= 2000):
+            raise ApiError(422, "invalid_request", "q는 1~2000자여야 합니다.")
+        if not (1 <= k <= 10):
+            raise ApiError(422, "invalid_request", "k는 1~10 사이여야 합니다.")
+
+        started = time.monotonic()
+        try:
+            version_id, indexed_revision = load_indexed_version(
+                request.app.state.store.pool, user[0], persona_id
+            )
+            result = embed(request.app.state.settings.embedding_url, [q], "query")
+        except PersonaNotFound as error:
+            raise ApiError(404, "persona_not_found", "캐릭터를 찾을 수 없습니다.") from error
+        except NotIndexed as error:
+            raise ApiError(409, "not_indexed", "아직 색인된 자료가 없습니다.") from error
+        except EmbeddingError as error:
+            raise ApiError(
+                503, "embedding_unavailable", "임베딩 서비스에 연결할 수 없습니다."
+            ) from error
+        query_vector = result.vectors[0]
+
+        with request.app.state.store.pool.connection() as connection:
+            with RETRIEVAL_SECONDS.labels(kind_group="body").time():
+                body = search(
+                    connection,
+                    persona_id=persona_id,
+                    version_id=version_id,
+                    query_vector=query_vector,
+                    kinds=BODY_KINDS,
+                    k=k,
+                )
+            with RETRIEVAL_SECONDS.labels(kind_group="speech").time():
+                speech = search(
+                    connection,
+                    persona_id=persona_id,
+                    version_id=version_id,
+                    query_vector=query_vector,
+                    kinds=SPEECH_KINDS,
+                    k=k,
+                )
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+
+        # 접근 로그에 q는 남기지 않는다 — request_id·k·조각 수·지연만.
+        logger.info(
+            "retrieve request_id=%s k=%d body=%d speech=%d elapsed_ms=%s",
+            request.state.request_id,
+            k,
+            len(body),
+            len(speech),
+            elapsed_ms,
+        )
+        return {
+            "indexed_revision": indexed_revision,
+            "body": [retrieve_chunk_response(chunk) for chunk in body],
+            "speech": [retrieve_chunk_response(chunk) for chunk in speech],
+        }
 
     return app

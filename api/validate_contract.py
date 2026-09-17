@@ -35,11 +35,11 @@ def main() -> None:
         for method, op in item.items()
         if method in {"get", "put", "post", "patch", "delete"}
     ]
-    assert len(operations) == 22
+    assert len(operations) == 23
     ids = [op["operationId"] for _, _, op in operations]
     assert len(ids) == len(set(ids)), "operationId duplicates"
     assert spec["security"] == [{"BearerAuth": []}]
-    assert len(spec["paths"]) == 16
+    assert len(spec["paths"]) == 17
     for method, path, op in operations:
         assert "security" not in op, f"unexpected auth override: {path}"
         if method != "get":
