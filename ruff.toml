@@ -1,0 +1,7 @@
+# 루트의 api/ 검증 스크립트용 설정.
+#
+# 실행 코드의 ruff 설정은 python-backend/pyproject.toml에 있고 그 디렉터리만 덮는다.
+# 그래서 api/validate_contract.py는 어떤 설정도 받지 못해 기본 88열로 검사됐고,
+# 100열로 쓰인 기존 코드가 format check에서 계속 실패했다. 같은 줄 길이를 적용해
+# 두 곳의 판정을 맞춘다.
+line-length = 100

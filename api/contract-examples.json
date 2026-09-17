@@ -230,6 +230,57 @@
         },
         "checked_at": "2026-09-10T00:00:00Z"
       }
+    },
+    {
+      "name": "create-draft-from-settings",
+      "schema": "CreateDraft",
+      "valid": true,
+      "value": {
+        "settings": {
+          "name": "합성 모루",
+          "profile": "침착한 도서관 안내자다.",
+          "speech_examples": ""
+        }
+      }
+    },
+    {
+      "name": "create-draft-from-version",
+      "schema": "CreateDraft",
+      "valid": true,
+      "value": {
+        "base_version_id": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "create-draft-rejects-both",
+      "schema": "CreateDraft",
+      "valid": false,
+      "value": {
+        "base_version_id": "00000000-0000-4000-8000-000000000002",
+        "settings": {
+          "name": "합성 모루",
+          "profile": "침착하다.",
+          "speech_examples": ""
+        }
+      }
+    },
+    {
+      "name": "create-draft-rejects-empty",
+      "schema": "CreateDraft",
+      "valid": false,
+      "value": {}
+    },
+    {
+      "name": "create-draft-rejects-blank-profile",
+      "schema": "CreateDraft",
+      "valid": false,
+      "value": {
+        "settings": {
+          "name": "합성 모루",
+          "profile": "",
+          "speech_examples": ""
+        }
+      }
     }
   ]
 }

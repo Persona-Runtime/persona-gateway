@@ -1,21 +1,42 @@
 # 전체 API 계약과 현재 구현의 차이
 
-확인일: 2026-09-10. 읽은 대상은 이 로컬 working tree이며 미커밋·untracked 코드가 포함돼 있다.
+확인일: 2026-09-16(2026-09-10 최초 작성). 읽은 대상은 이 로컬 working tree이며 미커밋·untracked 코드가 포함돼 있다.
 과거 테스트 통과나 Git 원격 배포 완료를 이번 구현 증거로 쓰지 않는다. 이번 작업은 Python 최소 runtime과
 전용 `persona_minimal` 스키마 migration을 추가했으며, 실제 클러스터 배포는 하지 않았다.
 
 ## 확인된 구현
 
 기존 Go Gateway·dispatcher·DDL은 검증된 레포 밖 로컬 보관본으로 전환했고 활성 런타임이 아니다.
-`python-backend/`는 정적 Bearer 인증의 `GET /v1/me`, `GET /v1/personas`, `POST /v1/personas`를
-구현한다. Python 경로는 FastAPI·psycopg·Alembic과 독립 `persona_minimal` schema를 사용한다.
+`python-backend/`는 정적 Bearer 인증의 `GET /v1/me`, `GET /v1/personas`, `POST /v1/personas`,
+`GET /v1/personas/{id}`와 초안 4 operation(`POST`/`GET`/`PATCH`/`DELETE .../draft`)을 구현한다. Python 경로는 FastAPI·psycopg·Alembic과 독립 `persona_minimal` schema를 사용한다.
 새 명세 전체는 22 operations다.
+
+2026-09-16: 표시용 프로필 사진은 **범위에서 제외**했다. 계약·구현·migration을 모두 되돌렸고
+아바타는 이름 기반 이니셜로 표시한다. 결정과 이유는 [tradeoff/14](../../tradeoff/14-upload-contract.md).
+
+**그때 실제 HTTP 회귀 테스트 층도 함께 사라졌다.** 지운 `persona-web/src/lib/api.live.test.ts`는
+사진뿐 아니라 **인증(401/200)·생성과 목록 일치·중복 이름 409·캐릭터 3개 한도 409**를
+실제 Gateway로 확인하던 유일한 자리였다.
+
+Web의 검증은 세 층이고, 사라진 것은 그중 하나다.
+
+| 층 | 무엇을 쓰나 | 무엇을 검증하나 |
+| --- | --- | --- |
+| 화면 테스트 | 합성 `PersonaApi` | 화면 로직. **계약 준수의 증거가 아니다** |
+| API 클라이언트 테스트(`src/lib/api.test.ts`) | **실제 `api.ts`** + 가짜 `fetch` 응답 | 보내는 요청의 형태, 응답 형식 검증, 오류 매핑 |
+| 실제 HTTP 회귀 테스트(`api.live.test.ts`) | **실제 Gateway·PostgreSQL** | 인증·생성·목록·중복 이름·멱등 재전송·3개 한도·재시작 후 유지 |
+
+2026-09-16에 세 번째 층을 **기본 기능만으로 복원했다**(사진 없음).
+`persona-gateway/scripts/local-stack.sh`가 역할이 분리된 DB와 grants 위에 Gateway를 띄우고,
+검사는 대상이 합성 스택인지 **신원으로 대조한 뒤에만** 변경 요청을 보낸다.
 
 | 차이 | 필요한 작업 |
 | --- | --- |
-| 상세·초안·대화·삭제·상태 route 없음 | `/me`, 목록, 생성 외의 19 operations는 아직 미구현이다. |
+| 대화·삭제·처리·상태 route 없음 | 위 8개 외의 14 operations는 아직 미구현이다. |
+| **처리 job이 없다** | 초안은 저장·수정되지만 `processDraft`·`activateDraft`와 그것을 실행할 worker가 없다. 그래서 `draft.status`는 `editing`에 머물고 `requires_processing`은 항상 참, `can_activate`는 항상 거짓이다. 지어낸 값을 돌려주지 않는다. |
+| `POST /uploads` 없음 | multipart 일괄 접수 경로다. 응답이 `job_id`·`queued`라 처리 worker를 전제한다. 그때까지 웹은 `PATCH .../draft`의 `upsert_sources`로 자료를 넣는다(5절이 정한 방식). |
 | 원문 접수는 여러 version 생성 가능 | 캐릭터당 단일 초안·입력 revision·적용 포인터·동시 접수 방지 필요 |
-| 업로드·초안·삭제의 Idempotency-Key 지원이 명세 수준에 없음 | Python 생성은 사용자 행 잠금, DB fingerprint·replay로 구현했다. 나머지 작업의 멱등성과 tombstone 경계는 후속 작업이다. |
+| 원문 업로드·초안·삭제의 Idempotency-Key 미구현 | 캐릭터 생성은 사용자 행 잠금과 DB fingerprint·replay로 구현했다. 나머지 작업의 멱등성과 tombstone 경계는 후속 작업이다. |
 | Job 응답에 draft_revision/persona_id/can_retry 등 없음 | 외부 DTO와 내부 상태를 분리. nullable failure/result, 안전한 summary 검증 |
 | 최소 처리 성공과 index 준비 완료가 다름 | 기존 DB 성공 함수의 비어 있지 않은 문서 검증은 유지. profile-only는 문서 1개 이상, index 0개 허용 |
 | material_versions 상태에 draft/active bundle 개념 없음 | migration 순서·현재 데이터 이행·불변 snapshot/index 참조 설계 |

@@ -25,11 +25,15 @@ def main() -> None:
             format_checker=FormatChecker(),
         )
 
+    # put을 빠뜨리면 PUT operation이 개수 검사에서도, 아래의 Idempotency-Key 검사에서도
+    # 통째로 누락된다. 계약을 추가했는데 검증이 침묵하는 상태가 된다.
+    # put을 집합에 남겨 둔다. 지금은 PUT operation이 없지만, 빠져 있으면 새로 생겼을 때
+    # 그 operation만 조용히 검증을 건너뛴다. 실제로 그렇게 새어 나간 적이 있다.
     operations = [
         (method, path, op)
         for path, item in spec["paths"].items()
         for method, op in item.items()
-        if method in {"get", "post", "patch", "delete"}
+        if method in {"get", "put", "post", "patch", "delete"}
     ]
     assert len(operations) == 22
     ids = [op["operationId"] for _, _, op in operations]
@@ -39,9 +43,9 @@ def main() -> None:
     for method, path, op in operations:
         assert "security" not in op, f"unexpected auth override: {path}"
         if method != "get":
-            assert {"$ref": "#/components/parameters/IdempotencyKey"} in op[
-                "parameters"
-            ], f"missing idempotency contract: {method} {path}"
+            assert {"$ref": "#/components/parameters/IdempotencyKey"} in op["parameters"], (
+                f"missing idempotency contract: {method} {path}"
+            )
 
     examples = json.loads((root / "contract-examples.json").read_text(encoding="utf-8"))
     count = 0
@@ -76,6 +80,7 @@ def main() -> None:
         "browser_token_storage": "memory_only",
         "unused_version_retention_days": 7,
         "completed_deletion_record_retention_days": 7,
+        # 숫자만으로는 어디에 걸리는 한도인지 알 수 없다. 범위와 시간까지 계약에 고정한다.
     }
     for key, expected in expected_policy.items():
         assert policy[key] == expected, f"policy drift: {key}"
@@ -92,16 +97,17 @@ def main() -> None:
         for frame in wire.strip().split("\n\n"):
             lines = frame.splitlines()
             event = next(line[7:] for line in lines if line.startswith("event: "))
-            data = json.loads(
-                "\n".join(line[6:] for line in lines if line.startswith("data: "))
-            )
+            data = json.loads("\n".join(line[6:] for line in lines if line.startswith("data: ")))
             schema = op["x-sse-events"][event]["$ref"].rsplit("/", 1)[-1]
             validator(schema).validate(data)
             events.append(event)
             sse_count += 1
         assert events == ["meta", "citations", "delta", "done"]
 
-    print("OpenAPI 3.1 validation passed: 22 operations / 16 paths")
+    # 숫자를 문구에 직접 적지 않는다. 적어 두면 단언과 어긋나도 출력만 보고 통과로 읽는다.
+    print(
+        f"OpenAPI 3.1 validation passed: {len(operations)} operations / {len(spec['paths'])} paths"
+    )
     print(f"Synthetic schema fixtures passed: {count}; SSE example frames: {sse_count}")
     print(f"Question boundary cases passed: {question_boundaries}; policy values checked")
     print("No runtime, DB, Kubernetes, or business-state E2E validation performed.")

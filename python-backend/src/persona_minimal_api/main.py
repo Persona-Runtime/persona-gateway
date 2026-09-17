@@ -4,7 +4,7 @@ import hmac
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
@@ -14,10 +14,17 @@ from psycopg_pool import PoolTimeout
 from .config import Settings
 from .cursor import CursorError, PersonaCursor, decode as decode_cursor, encode as encode_cursor
 from .repository import (
+    Draft,
+    DraftAlreadyExists,
+    DraftNotFound,
+    DraftSettings,
+    DraftValidationError,
     DuplicatePersonaName,
     IdempotencyConflict,
     Persona,
     PersonaLimitExceeded,
+    PersonaNotFound,
+    RevisionConflict,
     ReadinessStore,
     PersonaStore,
     PostgresPersonaStore,
@@ -40,6 +47,53 @@ class CreatePersonaRequest(BaseModel):
     name: str
 
 
+class SettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    profile: str
+    speech_examples: str
+
+
+class CreateDraftRequest(BaseModel):
+    """계약의 CreateDraft. 두 경로 중 하나만 온다."""
+
+    model_config = ConfigDict(extra="forbid")
+    settings: SettingsRequest | None = None
+    base_version_id: UUID | None = None
+
+
+class SourceUpsertRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: UUID | None = None
+    kind: str
+    filename: str | None = None
+    content: str
+
+
+class DraftPatchRequest(BaseModel):
+    """계약의 DraftPatch. expected_revision은 항상 필요하다."""
+
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int
+    settings: dict[str, str] | None = None
+    upsert_sources: list[SourceUpsertRequest] = []
+    remove_source_ids: list[UUID] = []
+
+
+def require_idempotency_key(raw: str | None) -> UUID:
+    """변경 API가 요구하는 Idempotency-Key를 UUID로 바꾼다.
+
+    4절이 "모든 변경 API는 Idempotency-Key UUID를 요구한다"로 정해 두었다.
+    변경 API가 늘어나도 같은 규칙을 쓰도록 한곳에 둔다.
+    """
+    if not raw:
+        raise ApiError(400, "invalid_idempotency_key", "Idempotency-Key가 필요합니다.")
+    try:
+        return UUID(raw)
+    except ValueError as error:
+        raise ApiError(400, "invalid_idempotency_key", "Idempotency-Key를 확인해주세요.") from error
+
+
 TRANSIENT_DATABASE_SQLSTATES = frozenset({"53300", "57P01", "57P03"})
 
 
@@ -50,15 +104,68 @@ def is_transient_database_error(error: PsycopgError) -> bool:
     )
 
 
+def draft_summary_response(persona: Persona) -> dict[str, object] | None:
+    if persona.draft is None:
+        return None
+    return {
+        "version_id": str(persona.draft.version_id),
+        "revision": persona.draft.revision,
+        "status": persona.draft.status,
+        "job_id": str(persona.draft.job_id) if persona.draft.job_id else None,
+        # 처리기가 없으므로 항상 처리가 필요하다. Draft.requires_processing과 같은 이유다.
+        "requires_processing": True,
+    }
+
+
 def persona_response(persona: Persona) -> dict[str, object]:
     return {
         "id": str(persona.id),
         "name": persona.name,
         "status": persona.status,
         "active_version_id": None,
-        "draft": None,
+        "draft": draft_summary_response(persona),
         "deletion_id": str(persona.deletion_id) if persona.deletion_id else None,
         "created_at": persona.created_at,
+    }
+
+
+def persona_detail_response(persona: Persona) -> dict[str, object]:
+    """계약의 PersonaDetail. 목록 응답에 active_version을 더한 모양이다."""
+    detail = persona_response(persona)
+    # 적용본은 아직 없다. 처리·활성화가 구현되면 그때 채운다.
+    detail["active_version"] = None
+    return detail
+
+
+def draft_response(draft: Draft) -> dict[str, object]:
+    return {
+        "version_id": str(draft.version_id),
+        "revision": draft.revision,
+        "status": draft.status,
+        "job_id": str(draft.job_id) if draft.job_id else None,
+        "requires_processing": draft.requires_processing,
+        "persona_id": str(draft.persona_id),
+        "base_version_id": str(draft.base_version_id) if draft.base_version_id else None,
+        "settings": {
+            "name": draft.settings.name,
+            "profile": draft.settings.profile,
+            "speech_examples": draft.settings.speech_examples,
+        },
+        "sources": [
+            {
+                "id": str(source.id),
+                "kind": source.kind,
+                "filename": source.filename,
+                "content": source.content,
+                "byte_size": source.byte_size,
+                "sha256": source.sha256,
+            }
+            for source in draft.sources
+        ],
+        # 경고는 처리 결과가 만든다. 처리기가 없으므로 지금은 비어 있다.
+        "warnings": [],
+        "can_activate": draft.can_activate,
+        "updated_at": draft.updated_at,
     }
 
 
@@ -105,6 +212,9 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
         request.state.request_id = str(uuid4())
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
+        # 브라우저가 Content-Type을 멋대로 추측하지 못하게 한다. 지금은 JSON만 돌려주지만,
+        # 추측을 허용하면 오류 본문이나 프록시가 끼워 넣은 응답이 다른 형식으로 해석될 수 있다.
+        response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Request-Id"] = request.state.request_id
         return response
 
@@ -205,14 +315,7 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
         user: tuple[str, str] = Depends(authenticated_user),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ):
-        try:
-            parsed_key = UUID(idempotency_key) if idempotency_key else None
-        except ValueError as exc:
-            raise ApiError(
-                400, "invalid_idempotency_key", "Idempotency-Key를 확인해주세요."
-            ) from exc
-        if parsed_key is None:
-            raise ApiError(400, "invalid_idempotency_key", "Idempotency-Key가 필요합니다.")
+        parsed_key = require_idempotency_key(idempotency_key)
         name = body.name.strip()
         if not name:
             raise ApiError(
@@ -241,5 +344,134 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
                 409, "idempotency_conflict", "같은 키에 다른 요청을 사용할 수 없습니다."
             ) from exc
         return persona_response(persona)
+
+    def draft_error(error: Exception) -> ApiError:
+        """저장소 예외를 계약의 오류로 옮긴다.
+
+        소유권 위반과 부재는 같은 404다. 코드를 나누면 남의 캐릭터가 있는지 새어 나간다.
+        """
+        if isinstance(error, PersonaNotFound):
+            return ApiError(404, "persona_not_found", "캐릭터를 찾을 수 없습니다.")
+        if isinstance(error, DraftNotFound):
+            return ApiError(404, "draft_not_found", "초안이 없습니다.")
+        if isinstance(error, DraftAlreadyExists):
+            return ApiError(409, "draft_exists", "이미 초안이 있습니다.")
+        if isinstance(error, RevisionConflict):
+            return ApiError(
+                409,
+                "revision_conflict",
+                "그 사이에 초안이 바뀌었습니다. 다시 읽고 수정해주세요.",
+            )
+        if isinstance(error, IdempotencyConflict):
+            return ApiError(
+                409, "idempotency_conflict", "같은 키에 다른 요청을 사용할 수 없습니다."
+            )
+        if isinstance(error, DraftValidationError):
+            return ApiError(error.status, error.code, "초안 수정을 처리할 수 없습니다.")
+        raise error
+
+    @app.get("/v1/personas/{persona_id}")
+    def get_persona(
+        request: Request,
+        persona_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+    ):
+        try:
+            persona = request.app.state.store.get_persona(user[0], persona_id)
+        except Exception as error:
+            raise draft_error(error) from error
+        return persona_detail_response(persona)
+
+    @app.post("/v1/personas/{persona_id}/draft", status_code=201)
+    def create_draft(
+        request: Request,
+        persona_id: UUID,
+        body: CreateDraftRequest,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        key = require_idempotency_key(idempotency_key)
+        # 계약의 oneOf를 여기서도 강제한다. 스키마만 믿으면 이 서버가 직접 받는 요청은
+        # 아무도 검사하지 않는다.
+        if (body.settings is None) == (body.base_version_id is None):
+            raise ApiError(
+                422,
+                "invalid_request",
+                "settings 또는 base_version_id 중 하나만 보내주세요.",
+            )
+        if body.base_version_id is not None:
+            # 적용본이 아직 없다. 있지도 않은 version에서 파생시키는 대신 분명히 알린다.
+            raise ApiError(404, "version_not_found", "파생할 적용본이 없습니다.")
+
+        settings = body.settings
+        assert settings is not None  # 위 분기가 보장한다
+        if not settings.name.strip() or not settings.profile.strip():
+            raise ApiError(422, "invalid_settings", "이름과 소개는 비어 있을 수 없습니다.")
+        try:
+            draft = request.app.state.store.create_draft(
+                user[0],
+                persona_id,
+                DraftSettings(
+                    name=settings.name,
+                    profile=settings.profile,
+                    speech_examples=settings.speech_examples,
+                ),
+                key,
+            )
+        except Exception as error:
+            raise draft_error(error) from error
+        return draft_response(draft)
+
+    @app.get("/v1/personas/{persona_id}/draft")
+    def get_draft(
+        request: Request,
+        persona_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+    ):
+        try:
+            draft = request.app.state.store.get_draft(user[0], persona_id)
+        except Exception as error:
+            raise draft_error(error) from error
+        return draft_response(draft)
+
+    @app.patch("/v1/personas/{persona_id}/draft")
+    def patch_draft(
+        request: Request,
+        persona_id: UUID,
+        body: DraftPatchRequest,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        require_idempotency_key(idempotency_key)
+        # 계약 5절: 모두 비어 있는 변경은 422다. 아무것도 바꾸지 않으면서 revision만
+        # 올리면 다른 사람의 CAS를 무의미하게 깨뜨린다.
+        if body.settings is None and not body.upsert_sources and not body.remove_source_ids:
+            raise ApiError(422, "empty_patch", "바꿀 내용이 없습니다.")
+        try:
+            draft = request.app.state.store.patch_draft(
+                user[0],
+                persona_id,
+                body.expected_revision,
+                body.settings,
+                [item.model_dump() for item in body.upsert_sources],
+                body.remove_source_ids,
+            )
+        except Exception as error:
+            raise draft_error(error) from error
+        return draft_response(draft)
+
+    @app.delete("/v1/personas/{persona_id}/draft", status_code=204)
+    def discard_draft(
+        request: Request,
+        persona_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        key = require_idempotency_key(idempotency_key)
+        try:
+            request.app.state.store.discard_draft(user[0], persona_id, key)
+        except Exception as error:
+            raise draft_error(error) from error
+        return Response(status_code=204)
 
     return app

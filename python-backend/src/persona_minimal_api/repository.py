@@ -18,7 +18,24 @@ from .cursor import PersonaCursor
 MAX_PERSONAS_PER_USER = 3
 CREATE_PERSONA_OPERATION = "create_persona"
 CREATE_PERSONA_SCOPE = "/v1/personas"
-REQUIRED_ALEMBIC_REVISION = "0001_persona_minimal"
+# 초안 생성과 폐기는 서로 다른 operation이다. 같은 키로 둘을 보내도 서로의 기록을 덮지 않는다.
+CREATE_DRAFT_OPERATION = "create_draft"
+DISCARD_DRAFT_OPERATION = "discard_draft"
+# 계약 5절이 정한 자료 상한. 파일 하나와 초안 전체가 다른 값이다.
+MAX_SOURCE_BYTES = 1_048_576
+MAX_DRAFT_TOTAL_BYTES = 5_242_880
+DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_examples")
+# readiness가 받아들이는 migration revision.
+#
+# 단일값 완전 일치를 요구하면 migration을 적용하는 순간 아직 이전 revision을 기대하는
+# 파드가 스스로 Ready를 잃는다. Deployment가 replicas: 1이라 그 즉시 Service의 ready
+# endpoint가 0이 되고, maxUnavailable: 0은 이 경우를 막지 못한다 — 컨트롤러가 파드를
+# 내려서 생기는 공백이 아니기 때문이다.
+#
+# 목록을 넓히는 것은 호환 릴리스의 역할이지 기본값이 아니다. 새 migration을 배포할 때는
+# 구·신 revision을 함께 허용하는 호환 릴리스를 먼저 내보내 공백을 없앤다.
+# 배포 순서와 롤백 규칙은 docs/migrations.md.
+SUPPORTED_ALEMBIC_REVISIONS = ("0002_persona_draft",)
 
 
 class SafePoolLogFilter(logging.Filter):
@@ -59,6 +76,41 @@ class IdempotencyConflict(Exception):
     pass
 
 
+class PersonaNotFound(Exception):
+    """소유자가 다르거나 없는 캐릭터. 둘을 구분해 알리지 않는다."""
+
+
+class DraftNotFound(Exception):
+    """캐릭터는 있는데 초안이 없다."""
+
+
+class DraftAlreadyExists(Exception):
+    """초안은 캐릭터당 하나다(계약 2절)."""
+
+
+class RevisionConflict(Exception):
+    """expected_revision이 현재 초안과 다르다. 다른 사람의 수정을 덮지 않는다."""
+
+
+class DraftValidationError(Exception):
+    """계약이 정한 거절. code가 그대로 응답의 오류 코드가 된다."""
+
+    def __init__(self, code: str, status: int = 422):
+        self.code = code
+        self.status = status
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class DraftSummary:
+    """목록·상세가 싣는 초안 요약. 본문은 담지 않는다."""
+
+    version_id: UUID
+    revision: int
+    status: str
+    job_id: UUID | None
+
+
 @dataclass(frozen=True)
 class Persona:
     id: UUID
@@ -66,14 +118,70 @@ class Persona:
     created_at: datetime
     deletion_id: UUID | None
     deleted_at: datetime | None
+    draft: DraftSummary | None = None
 
     @property
     def status(self) -> str:
-        return (
-            "deleting"
-            if self.deletion_id is not None and self.deleted_at is None
-            else "needs_material"
-        )
+        """계약 2절이 정한 계산 규칙 그대로다.
+
+        deleting이 우선이고, 적용본이 있으면 ready다(적용본은 아직 없다).
+        적용본이 없으면 초안 없음=needs_material, 실행 중=preparing, 그 외 초안 존재=review_required.
+
+        저장 전용 경로로 만든 초안은 job이 없으므로 preparing이 되지 않는다.
+        """
+        if self.deletion_id is not None and self.deleted_at is None:
+            return "deleting"
+        if self.draft is None:
+            return "needs_material"
+        if self.draft.job_id is not None and self.draft.status == "processing":
+            return "preparing"
+        return "review_required"
+
+
+@dataclass(frozen=True)
+class DraftSettings:
+    """계약의 Settings. profile은 비어 있으면 안 된다(5절)."""
+
+    name: str
+    profile: str
+    speech_examples: str
+
+
+@dataclass(frozen=True)
+class DraftSource:
+    id: UUID
+    kind: str
+    filename: str | None
+    content: str
+    byte_size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class Draft:
+    persona_id: UUID
+    version_id: UUID
+    revision: int
+    status: str
+    job_id: UUID | None
+    base_version_id: UUID | None
+    settings: DraftSettings
+    sources: tuple[DraftSource, ...]
+    updated_at: datetime
+
+    @property
+    def requires_processing(self) -> bool:
+        """처리가 필요한지. **지금은 항상 참이다.**
+
+        이 값을 거짓으로 만들 수 있는 것은 처리 결과를 아는 쪽뿐인데, 그 처리기가 아직 없다.
+        여기서 임의로 거짓을 돌려주면 웹이 "바로 적용할 수 있다"고 표시하게 된다.
+        """
+        return True
+
+    @property
+    def can_activate(self) -> bool:
+        """적용할 수 있는지. **지금은 항상 거짓이다.** 근거는 위와 같다."""
+        return False
 
 
 class PersonaStore(Protocol):
@@ -84,6 +192,32 @@ class PersonaStore(Protocol):
     def create_persona(
         self, owner_subject: str, display_name: str, name: str, idempotency_key: UUID
     ) -> Persona: ...
+
+    def get_persona(self, owner_subject: str, persona_id: UUID) -> Persona: ...
+
+    def create_draft(
+        self,
+        owner_subject: str,
+        persona_id: UUID,
+        settings: DraftSettings,
+        idempotency_key: UUID,
+    ) -> Draft: ...
+
+    def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft: ...
+
+    def patch_draft(
+        self,
+        owner_subject: str,
+        persona_id: UUID,
+        expected_revision: int,
+        settings: dict[str, str] | None,
+        upsert_sources: list[dict[str, object]],
+        remove_source_ids: list[UUID],
+    ) -> Draft: ...
+
+    def discard_draft(
+        self, owner_subject: str, persona_id: UUID, idempotency_key: UUID
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -96,13 +230,39 @@ def fingerprint_name(name: str) -> bytes:
 
 
 def _persona(row: dict[str, object]) -> Persona:
+    version_id = row.get("draft_version_id")
     return Persona(
         id=row["id"],  # type: ignore[arg-type]
         name=row["name"],  # type: ignore[arg-type]
         created_at=row["created_at"],  # type: ignore[arg-type]
         deletion_id=row["deletion_id"],  # type: ignore[arg-type]
         deleted_at=row["deleted_at"],  # type: ignore[arg-type]
+        draft=(
+            DraftSummary(
+                version_id=version_id,  # type: ignore[arg-type]
+                revision=row["draft_revision"],  # type: ignore[arg-type]
+                status=row["draft_status"],  # type: ignore[arg-type]
+                job_id=row["draft_job_id"],  # type: ignore[arg-type]
+            )
+            if version_id is not None
+            else None
+        ),
     )
+
+
+def fingerprint_settings(settings: DraftSettings) -> bytes:
+    """초안 생성 요청의 지문. 같은 키에 다른 설정이 오면 409로 가른다."""
+    joined = "\x00".join((settings.name, settings.profile, settings.speech_examples))
+    return hashlib.sha256(joined.encode("utf-8")).digest()
+
+
+def draft_scope(persona_id: UUID) -> str:
+    """초안 멱등 기록의 target_scope. persona_id를 값으로 넣는다.
+
+    기록의 PK에 persona_id가 없으므로, 고정 문자열로 두면 한 사용자가 같은 키로
+    다른 캐릭터에 초안을 만들 때 두 요청이 같은 행을 두고 부딪친다.
+    """
+    return f"/v1/personas/{persona_id}/draft"
 
 
 class PostgresPersonaStore:
@@ -112,16 +272,21 @@ class PostgresPersonaStore:
     def list_personas(
         self, owner_subject: str, limit: int, cursor: PersonaCursor | None
     ) -> list[Persona]:
+        # 초안 요약만 join한다. 본문(content)은 여기서 절대 읽지 않는다 — 목록 한 번에
+        # 캐릭터 수만큼의 원문을 실어 나르게 되고, 화면은 그중 아무것도 쓰지 않는다.
         query = """
-            SELECT id, name, created_at, deletion_id, deleted_at
-            FROM persona_minimal.personas
-            WHERE owner_subject = %s AND deleted_at IS NULL
+            SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+                   d.version_id AS draft_version_id, d.revision AS draft_revision,
+                   d.status AS draft_status, d.job_id AS draft_job_id
+            FROM persona_minimal.personas AS p
+            LEFT JOIN persona_minimal.material_versions AS d ON d.persona_id = p.id
+            WHERE p.owner_subject = %s AND p.deleted_at IS NULL
         """
         values: list[object] = [owner_subject]
         if cursor is not None:
-            query += " AND (created_at, id) < (%s, %s)"
+            query += " AND (p.created_at, p.id) < (%s, %s)"
             values.extend([cursor.created_at, cursor.persona_id])
-        query += " ORDER BY created_at DESC, id DESC LIMIT %s"
+        query += " ORDER BY p.created_at DESC, p.id DESC LIMIT %s"
         values.append(limit)
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
@@ -224,6 +389,402 @@ class PostgresPersonaStore:
                 )
                 return persona
 
+    # --- 캐릭터 상세와 초안 ------------------------------------------------
+
+    _PERSONA_WITH_DRAFT = """
+        SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+               d.version_id AS draft_version_id, d.revision AS draft_revision,
+               d.status AS draft_status, d.job_id AS draft_job_id
+        FROM persona_minimal.personas AS p
+        LEFT JOIN persona_minimal.material_versions AS d ON d.persona_id = p.id
+        WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
+    """
+
+    def get_persona(self, owner_subject: str, persona_id: UUID) -> Persona:
+        with self.pool.connection() as connection:
+            with connection.cursor(row_factory=dict_row) as cur:
+                cur.execute(self._PERSONA_WITH_DRAFT, (persona_id, owner_subject))
+                row = cur.fetchone()
+                if row is None:
+                    raise PersonaNotFound
+                return _persona(row)
+
+    def _lock_persona(self, cur, owner_subject: str, persona_id: UUID) -> None:
+        """소유자 범위로 캐릭터를 잠근다.
+
+        타인 소유와 부재를 같은 PersonaNotFound로 올린다. 둘을 구분해 알리면
+        남의 캐릭터가 존재하는지가 새어 나간다.
+
+        FOR UPDATE로 잠그는 이유: 초안을 만드는 동안 같은 캐릭터에 다른 요청이 들어오면
+        둘 다 "초안 없음"을 보고 각자 만들려 한다. PK가 막아 주지만 오류가 아니라
+        409로 답해야 하므로 여기서 직렬화한다.
+        """
+        cur.execute(
+            """
+            SELECT id FROM persona_minimal.personas
+            WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL
+            FOR UPDATE
+            """,
+            (persona_id, owner_subject),
+        )
+        if cur.fetchone() is None:
+            raise PersonaNotFound
+
+    def _read_draft(self, cur, persona_id: UUID) -> Draft:
+        cur.execute(
+            """
+            SELECT persona_id, version_id, revision, status, job_id, base_version_id,
+                   settings_name, settings_profile, settings_speech_examples, updated_at
+            FROM persona_minimal.material_versions WHERE persona_id = %s
+            """,
+            (persona_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise DraftNotFound
+        cur.execute(
+            """
+            SELECT id, kind, filename, content, byte_size, sha256
+            FROM persona_minimal.material_sources
+            WHERE persona_id = %s ORDER BY kind, created_at, id
+            """,
+            (persona_id,),
+        )
+        sources = tuple(
+            DraftSource(
+                id=s["id"],
+                kind=s["kind"],
+                filename=s["filename"],
+                content=s["content"],
+                byte_size=s["byte_size"],
+                sha256=s["sha256"],
+            )
+            for s in cur.fetchall()
+        )
+        return Draft(
+            persona_id=row["persona_id"],
+            version_id=row["version_id"],
+            revision=row["revision"],
+            status=row["status"],
+            job_id=row["job_id"],
+            base_version_id=row["base_version_id"],
+            settings=DraftSettings(
+                name=row["settings_name"],
+                profile=row["settings_profile"],
+                speech_examples=row["settings_speech_examples"],
+            ),
+            sources=sources,
+            updated_at=row["updated_at"],
+        )
+
+    def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft:
+        with self.pool.connection() as connection:
+            with connection.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM persona_minimal.personas
+                    WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL
+                    """,
+                    (persona_id, owner_subject),
+                )
+                if cur.fetchone() is None:
+                    raise PersonaNotFound
+                return self._read_draft(cur, persona_id)
+
+    def create_draft(
+        self,
+        owner_subject: str,
+        persona_id: UUID,
+        settings: DraftSettings,
+        idempotency_key: UUID,
+    ) -> Draft:
+        """처리 없이 초안을 시작한다. job을 만들지 않는다(계약 5절).
+
+        멱등 기록은 캐릭터 생성과 같은 테이블·같은 순서를 쓴다 — 캐릭터 행을 잠근 뒤
+        기록을 보고, 같은 키면 그때 만든 초안을 그대로 돌려준다.
+        """
+        fingerprint = fingerprint_settings(settings)
+        with self.pool.connection() as connection:
+            with connection.transaction():
+                with connection.cursor(row_factory=dict_row) as cur:
+                    self._lock_persona(cur, owner_subject, persona_id)
+                    cur.execute(
+                        """
+                        SELECT request_fingerprint
+                        FROM persona_minimal.idempotency_records
+                        WHERE owner_subject = %s AND operation = %s AND target_scope = %s
+                          AND idempotency_key = %s
+                        """,
+                        (
+                            owner_subject,
+                            CREATE_DRAFT_OPERATION,
+                            draft_scope(persona_id),
+                            idempotency_key,
+                        ),
+                    )
+                    record = cur.fetchone()
+                    if record is not None:
+                        # 이미 성공한 같은 키다. 초안이 이미 있다는 이유로 409를 내면
+                        # 응답이 유실된 요청의 재전송이 실패로 보인다.
+                        if bytes(record["request_fingerprint"]) != fingerprint:
+                            raise IdempotencyConflict
+                        return self._read_draft(cur, persona_id)
+
+                    cur.execute(
+                        "SELECT 1 FROM persona_minimal.material_versions WHERE persona_id = %s",
+                        (persona_id,),
+                    )
+                    if cur.fetchone() is not None:
+                        raise DraftAlreadyExists
+
+                    cur.execute(
+                        """
+                        INSERT INTO persona_minimal.material_versions
+                            (persona_id, version_id, revision, status,
+                             settings_name, settings_profile, settings_speech_examples)
+                        VALUES (%s, %s, 1, 'editing', %s, %s, %s)
+                        """,
+                        (
+                            persona_id,
+                            uuid4(),
+                            settings.name,
+                            settings.profile,
+                            settings.speech_examples,
+                        ),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO persona_minimal.idempotency_records(
+                            owner_subject, operation, target_scope, idempotency_key,
+                            request_fingerprint, persona_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            owner_subject,
+                            CREATE_DRAFT_OPERATION,
+                            draft_scope(persona_id),
+                            idempotency_key,
+                            fingerprint,
+                            persona_id,
+                        ),
+                    )
+                    return self._read_draft(cur, persona_id)
+
+    def discard_draft(self, owner_subject: str, persona_id: UUID, idempotency_key: UUID) -> None:
+        """초안과 그 자료를 지운다. 캐릭터는 남는다."""
+        with self.pool.connection() as connection:
+            with connection.transaction():
+                with connection.cursor(row_factory=dict_row) as cur:
+                    self._lock_persona(cur, owner_subject, persona_id)
+                    cur.execute(
+                        """
+                        SELECT 1 FROM persona_minimal.idempotency_records
+                        WHERE owner_subject = %s AND operation = %s AND target_scope = %s
+                          AND idempotency_key = %s
+                        """,
+                        (
+                            owner_subject,
+                            DISCARD_DRAFT_OPERATION,
+                            draft_scope(persona_id),
+                            idempotency_key,
+                        ),
+                    )
+                    if cur.fetchone() is not None:
+                        # 응답이 유실된 폐기 요청의 재전송이다. 이미 없는 초안을 다시 찾아
+                        # 404를 내면 요청자는 실패한 줄 알고 되돌리려 한다.
+                        return
+
+                    # 자료를 먼저 지운다. FK가 초안을 가리키고 있다.
+                    cur.execute(
+                        "DELETE FROM persona_minimal.material_sources WHERE persona_id = %s",
+                        (persona_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM persona_minimal.material_versions WHERE persona_id = %s",
+                        (persona_id,),
+                    )
+                    if cur.rowcount == 0:
+                        # 실패한 요청의 키는 비워 둬야 같은 키로 다시 시도할 수 있다.
+                        raise DraftNotFound
+                    cur.execute(
+                        """
+                        INSERT INTO persona_minimal.idempotency_records(
+                            owner_subject, operation, target_scope, idempotency_key,
+                            request_fingerprint, persona_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            owner_subject,
+                            DISCARD_DRAFT_OPERATION,
+                            draft_scope(persona_id),
+                            idempotency_key,
+                            hashlib.sha256(b"discard_draft").digest(),
+                            persona_id,
+                        ),
+                    )
+
+    def patch_draft(
+        self,
+        owner_subject: str,
+        persona_id: UUID,
+        expected_revision: int,
+        settings: dict[str, str] | None,
+        upsert_sources: list[dict[str, object]],
+        remove_source_ids: list[UUID],
+    ) -> Draft:
+        """초안을 고친다. revision CAS로 남의 수정을 덮지 않는다.
+
+        검사와 반영을 **한 트랜잭션**에서 한다. 나눠 두면 검사를 통과한 두 요청이
+        각각 revision을 올려, 나중에 커밋한 쪽이 앞선 수정을 조용히 지운다.
+        """
+        with self.pool.connection() as connection:
+            with connection.transaction():
+                with connection.cursor(row_factory=dict_row) as cur:
+                    self._lock_persona(cur, owner_subject, persona_id)
+                    # 초안 행까지 잠근다. 위의 캐릭터 잠금만으로는 같은 캐릭터의
+                    # 동시 PATCH가 같은 revision을 읽는 것을 막지 못한다.
+                    cur.execute(
+                        "SELECT revision FROM persona_minimal.material_versions "
+                        "WHERE persona_id = %s FOR UPDATE",
+                        (persona_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise DraftNotFound
+                    if row["revision"] != expected_revision:
+                        raise RevisionConflict
+
+                    current = self._read_draft(cur, persona_id)
+                    self._apply_settings(cur, persona_id, current, settings, upsert_sources)
+                    self._apply_sources(cur, persona_id, current, upsert_sources, remove_source_ids)
+
+                    cur.execute(
+                        """
+                        UPDATE persona_minimal.material_versions
+                        SET revision = revision + 1, updated_at = now()
+                        WHERE persona_id = %s
+                        """,
+                        (persona_id,),
+                    )
+                    updated = self._read_draft(cur, persona_id)
+                    self._guard_draft_limits(updated)
+                    return updated
+
+    def _apply_settings(
+        self,
+        cur,
+        persona_id: UUID,
+        current: Draft,
+        settings: dict[str, str] | None,
+        upsert_sources: list[dict[str, object]],
+    ) -> None:
+        if settings is None:
+            return
+        # 계약 5절: settings.profile과 profile source를 한 요청에서 함께 고치면 거부한다.
+        # 원문과 설정을 서로 다른 두 진실로 만들지 않기 위한 규칙이다.
+        touched = {str(item.get("kind")) for item in upsert_sources}
+        for field in ("profile", "speech_examples"):
+            if field in settings and field in touched:
+                raise DraftValidationError("conflicting_fields")
+
+        profile = settings.get("profile", current.settings.profile)
+        if not profile.strip():
+            # 5절: 최종 초안에서도 비공백 profile은 필수다.
+            raise DraftValidationError("invalid_settings")
+        name = settings.get("name", current.settings.name)
+        if not name.strip():
+            raise DraftValidationError("invalid_settings")
+
+        cur.execute(
+            """
+            UPDATE persona_minimal.material_versions
+            SET settings_name = %s, settings_profile = %s, settings_speech_examples = %s
+            WHERE persona_id = %s
+            """,
+            (
+                name,
+                profile,
+                settings.get("speech_examples", current.settings.speech_examples),
+                persona_id,
+            ),
+        )
+
+    def _apply_sources(
+        self,
+        cur,
+        persona_id: UUID,
+        current: Draft,
+        upsert_sources: list[dict[str, object]],
+        remove_source_ids: list[UUID],
+    ) -> None:
+        known = {source.id for source in current.sources}
+        removing = set(remove_source_ids)
+        # 제거 대상은 현재 초안의 것이어야 한다. 서버나 다른 초안의 id는 거부한다.
+        if not removing <= known:
+            raise DraftValidationError("unknown_source")
+
+        for item in upsert_sources:
+            source_id = item.get("id")
+            if source_id is not None:
+                if source_id not in known:
+                    raise DraftValidationError("unknown_source")
+                # 같은 id를 고치면서 동시에 지우라는 요청은 무엇을 원하는지 알 수 없다.
+                if source_id in removing:
+                    raise DraftValidationError("conflicting_fields")
+
+        for source_id in remove_source_ids:
+            cur.execute(
+                "DELETE FROM persona_minimal.material_sources WHERE persona_id = %s AND id = %s",
+                (persona_id, source_id),
+            )
+
+        for item in upsert_sources:
+            kind = str(item["kind"])
+            if kind not in DRAFT_KINDS:
+                raise DraftValidationError("invalid_source_kind")
+            content = str(item["content"])
+            if not content.strip():
+                raise DraftValidationError("invalid_source")
+            encoded = content.encode("utf-8")
+            if len(encoded) > MAX_SOURCE_BYTES:
+                raise DraftValidationError("source_too_large", status=413)
+            # 파일명은 표시용 basename이다. 경로 성분이 있으면 그대로 저장하지 않는다.
+            filename = item.get("filename")
+            if filename is not None:
+                filename = str(filename).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            digest = hashlib.sha256(encoded).hexdigest()
+            cur.execute(
+                """
+                INSERT INTO persona_minimal.material_sources
+                    (id, persona_id, kind, filename, content, byte_size, sha256)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    filename = EXCLUDED.filename,
+                    content = EXCLUDED.content,
+                    byte_size = EXCLUDED.byte_size,
+                    sha256 = EXCLUDED.sha256
+                """,
+                (
+                    item.get("id") or uuid4(),
+                    persona_id,
+                    kind,
+                    filename,
+                    content,
+                    len(encoded),
+                    digest,
+                ),
+            )
+
+    def _guard_draft_limits(self, draft: Draft) -> None:
+        """초안 전체 원문 상한(5절). 반영 뒤에 실제 저장량으로 확인한다.
+
+        각 자료를 넣기 전에 따로 세면 여러 건을 한 번에 보낸 요청이 합계를 넘길 수 있다.
+        """
+        total = sum(source.byte_size for source in draft.sources)
+        if total > MAX_DRAFT_TOTAL_BYTES:
+            raise DraftValidationError("storage_quota_exceeded", status=413)
+
     def is_ready(self) -> bool:
         """필수 테이블과 migration revision을 짧게 확인한다.
 
@@ -248,10 +809,10 @@ class PostgresPersonaStore:
                             AND EXISTS (
                                 SELECT 1
                                 FROM persona_minimal.alembic_version
-                                WHERE version_num = %s
+                                WHERE version_num = ANY(%s)
                             )
                         """,
-                        (REQUIRED_ALEMBIC_REVISION,),
+                        (list(SUPPORTED_ALEMBIC_REVISIONS),),
                     )
                     row = cur.fetchone()
                     return row is not None and bool(row[0])

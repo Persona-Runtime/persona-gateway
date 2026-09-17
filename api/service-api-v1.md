@@ -1,6 +1,9 @@
 # Persona Runtime — 전체 사용자 API 계약 v1
 
-작성일: 2026-09-10. 상태: **합의한 사용자 흐름·초기 제한의 계약 초안 `1.0.0-draft.2`**.
+작성일: 2026-09-10. 상태: **합의한 사용자 흐름·초기 제한의 계약 초안 `1.0.0-draft.3`**.
+2026-09-16: 표시용 프로필 사진을 범위에서 **제외했다**(tradeoff/14). 아바타는 이름 기반 이니셜로 표시한다.
+2026-09-16: `CreateDraft`에 `settings` 경로를 더해 **처리 없이 초안을 시작**할 수 있게 했다(5절).
+operation과 path 수는 그대로다.
 기계 판독 명세는 [openapi.json](openapi.json), 구현과의 차이는 [implementation-gap-v1.md](implementation-gap-v1.md).
 실제 서버가 이 명세를 전부 지원한다는 뜻이 아니다. 기존 업로드 계약은 현재 구현 참고용으로 남긴다.
 요청/응답 구조는 OpenAPI, 상태·경쟁·재시도·SSE 동작은 이 문서가 함께 정의한다. 충돌하면 구현을 진행하기 전에 두 문서를 같이 수정한다.
@@ -87,7 +90,7 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 | GET | `/v1/deletions/{deletion_id}` | 200 Deletion | 삭제 후에도 소유자 조회 가능 |
 | GET | `/v1/service-status` | 200 ServiceStatus | 안내용 snapshot, 처리 시 다시 확인 |
 
-22 operations / 16 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
+25 operations / 17 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
 이전 설계에서 추가로 논의하지 않은 대화 삭제·응답 편집·정상 응답 재생성·실행 중 ingestion 사용자 취소 API는 만들지 않는다.
 
 ## 4. 접수와 중복 방지
@@ -132,8 +135,20 @@ speech_examples = 길을 묻는 사람에게: 차근차근 같이 찾아볼까�
 {"job_id":"00000000-0000-4000-8000-000000000010","version_id":"00000000-0000-4000-8000-000000000002","draft_revision":1,"status":"queued"}
 ```
 
-기존 적용본 수정은 `POST draft(base_version_id)` → PATCH → 필요한 경우 process → activate다.
+초안을 만드는 경로는 둘이다. `POST draft`의 본문이 어느 쪽인지로 갈린다.
+
+| 본문 | 뜻 | 쓰는 때 |
+| --- | --- | --- |
+| `{settings}` | **처리 없이 새 초안을 시작한다.** job을 만들지 않는다 | 적용본이 없는 캐릭터에 설정부터 저장할 때 |
+| `{base_version_id}` | 적용본에서 파생한다 | 이미 적용된 캐릭터를 고칠 때 |
+
+둘을 함께 보내면 거부한다. `{settings}` 경로가 `profile`을 요구하는 이유는
+최종 초안에서도 비공백 profile이 필수이기 때문이다 — 빈 초안을 만들어 두고 나중에 채우게 하면
+그 사이의 초안이 계약을 어긴다. job이 없으므로 이때 캐릭터 상태는 2절대로 `review_required`다.
+
+`/uploads`는 여러 자료를 한 번에 접수하며 **처리 job을 함께 큐에 넣는** 경로다.
 초안이 이미 있으면 `/uploads`를 재호출하지 않는다. 현재 초안 입력을 바꾸고 process를 호출한다.
+기존 적용본 수정은 `POST draft(base_version_id)` → PATCH → 필요한 경우 process → activate다.
 
 PATCH는 JSON이다. `expected_revision`과 선택적인 `settings`, `upsert_sources`, `remove_source_ids`를 받는다.
 기존 문서는 id로 갱신하고, 신규 문서는 id 없이 보내 서버가 ID를 발급한다. 제거 ID는 현재 초안의 것이어야 한다.
@@ -155,6 +170,7 @@ JSON HTTP body의 제안 상한은 32 MiB이며 최종 확정 전까지 배포�
 원문과 설정을 서로 다른 두 진실로 관리하지 않도록, 설정 수정 시 해당 종류의 현재 초안 텍스트도 함께 갱신한다.
 동일 요청에서 `settings.profile`과 profile source, 또는 `settings.speech_examples`와 speech source를 동시에 수정하면 422 `conflicting_fields`다.
 웹은 모든 본문을 텍스트로 표시하며 업로드 HTML/스크립트를 실행하지 않는다.
+
 
 검색 대상은 events/relationships/abilities다. profile/speech_examples는 설정·말투 입력이며 index 필수 대상이 아니다.
 profile만 있는 작업도 유효하다. 처리 문서는 비어 있지 않되 `indexed_chunk_count=0`일 수 있다.
@@ -243,6 +259,7 @@ mock backend의 `chunk`는 Gateway에서 delta로 변환하고, 원본 mock done
 ingestion 전용 역할/함수도 삭제 중 입력 읽기·늦은 결과 쓰기를 거부해야 한다.
 
 삭제 대상은 서비스가 보유한 업로드·초안/버전·처리 산출물·벡터·질문/답변·재시도 입력 snapshot이다.
+캐릭터 삭제는 논리 삭제(`deleted_at`)라 DB의 참조 연쇄로 지워지지 않는다. 삭제 worker가 명시적으로 지운다.
 처리 도중 실패하면 deletion failed와 persona deleting을 유지한다. 반쯤 지워진 캐릭터를 다시 ready로 표시하지 않는다.
 v1 복구는 운영자 런북으로 수행하며 사용자 복구 API/휴지통 UI는 없다. 삭제 worker 실행 방식·권한은 platform/gateway에서 별도 구현 설계한다.
 성공 후 persona GET은 404, 삭제 상태는 최소 owner-scoped record로 계속 조회 가능하다. 이름·본문을 tombstone에 남기지 않는다.
@@ -331,7 +348,7 @@ OpenAPI는 [3.1.0 명세](https://spec.openapis.org/oas/v3.1.0.html)를 사용�
 uv run --no-project --with openapi-spec-validator==0.9.0 --with jsonschema==4.26.0 python api/validate_contract.py
 ```
 
-OpenAPI 구조·참조, operation 수/ID·인증·멱등 키 계약, `contract-examples.json`의 정상/오류 19개,
+OpenAPI 구조·참조, operation 수/ID·인증·멱등 키 계약, `contract-examples.json`의 정상/오류 28개,
 SSE data JSON 예시 8개, 영문·한글·이모지 질문 2000/2001자 경계 6개와 확정 정책값을 검증한다.
 DB 상태 전이·소유권 경쟁·실제 스트리밍 타이밍·byte 상한·토큰 제한의 런타임 강제는 이 검사로 검증되지 않는다.
 그 항목들은 10절의 HTTP/DB/E2E 테스트에서 별도로 확인한다.
