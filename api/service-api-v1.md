@@ -1,6 +1,9 @@
 # Persona Runtime — 전체 사용자 API 계약 v1
 
-작성일: 2026-09-10. 상태: **합의한 사용자 흐름·초기 제한의 계약 초안 `1.0.0-draft.2`**.
+작성일: 2026-09-10. 상태: **합의한 사용자 흐름·초기 제한의 계약 초안 `1.0.0-draft.3`**.
+2026-09-16: 표시용 프로필 사진을 범위에서 **제외했다**(tradeoff/14). 아바타는 이름 기반 이니셜로 표시한다.
+2026-09-16: `CreateDraft`에 `settings` 경로를 더해 **처리 없이 초안을 시작**할 수 있게 했다(5절).
+operation과 path 수는 그대로다.
 기계 판독 명세는 [openapi.json](openapi.json), 구현과의 차이는 [implementation-gap-v1.md](implementation-gap-v1.md).
 실제 서버가 이 명세를 전부 지원한다는 뜻이 아니다. 기존 업로드 계약은 현재 구현 참고용으로 남긴다.
 요청/응답 구조는 OpenAPI, 상태·경쟁·재시도·SSE 동작은 이 문서가 함께 정의한다. 충돌하면 구현을 진행하기 전에 두 문서를 같이 수정한다.
@@ -10,6 +13,12 @@
 
 - 외부 API는 `/v1`, 사용자 화면은 같은 origin을 사용한다. 실제 토큰 전송 경로는 HTTPS/Tailnet이다.
 - 단일 계정의 사전 발급 정적 Bearer 토큰을 검증한다. `GET /v1/me`는 검증/사용자 조회이지 토큰 발급 API가 아니다.
+- (Gate 4, `PERSONA_FORWARD_AUTH_ENABLED`로 게이팅, 기본 꺼짐) 켜져 있으면 정적 토큰 대신 Traefik의
+  ForwardAuth Middleware가 세팅하는 `X-Auth-Request-User`(GitHub 로그인)를 신원으로 받아들인다.
+  이 경로는 인터넷 진입(`app.personaruntime.xyz`)에서 GitHub OAuth(oauth2-proxy)를 거친 요청 전용이며,
+  subject는 `github:<login>`(소문자)이다. 두 경로는 공존한다 — 정적 토큰 경로는 이 기능과 무관하게
+  계속 동작하며, 플랫폼 쪽 NetworkPolicy·Middleware 선언(least-privilege-boundary.md §2)이 헤더 위조를
+  막는 전제다. 클러스터 미적용 상태에서는 이 경로가 실제로 켜지지 않는다.
 - 회원가입·비밀번호 찾기·토큰 발급·OIDC 전환은 이번 범위 밖이다. 사용자 ID는 서버의 토큰 매핑으로 결정한다.
 - 토큰은 브라우저 메모리에만 보관한다. 새로고침·탭 종료 후 다시 입력한다. localStorage/sessionStorage/IndexedDB·영구 쿠키에 저장하거나 빌드에 삽입하지 않는다. URL·로그·분석 이벤트에도 넣지 않는다.
 - UI 로그아웃은 메모리의 토큰·사용자 자료를 지우는 동작이며 서버 토큰 폐기는 아니다. 메모리 보관도 실행 중 XSS에 대한 방어를 대체하지 않는다. 만료·회전 절차는 별도 미결이다.
@@ -60,6 +69,12 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 설정만 수정하고 기존 검색 결과를 안전하게 재사용할 수 있으면 바로 `ready`가 될 수 있다. `can_activate`는 서버 판정값이다.
 처리 요청은 `expected_revision`을 고정해 job에 기록한다. 자동 상태 변화 자체는 사용자의 내용 revision을 증가시키지 않는다.
 
+`status`/`error_code`는 **지금 draft의 마지막 적용 시도** 결과이고, `indexed_revision`/`indexed_at`은
+**실제로 검색에 쓸 수 있는, 마지막으로 색인에 성공한** revision·시각이다. 이 둘은 다를 수 있다 —
+rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `failed`가 되지만 `indexed_revision`은
+여전히 3을 가리키고 rev3 조각은 그대로 검색된다. `error_code`는 `status`가 `failed`일 때만 값이
+있고, 다음 색인이 성공하면 다시 null로 돌아간다(2026-09-18 구현, 2절 갱신).
+
 ## 3. API 목록
 
 | Method | 경로 | 성공 | 핵심 제약 |
@@ -75,8 +90,9 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 | GET | `/v1/personas/{persona_id}/draft` | 200 Draft | 설정·원문·주의사항과 revision 조회 |
 | PATCH | `/v1/personas/{persona_id}/draft` | 200 Draft | expected_revision, 실행 중 수정 금지 |
 | DELETE | `/v1/personas/{persona_id}/draft` | 204 | query expected_revision, 실행 종료 확인 |
-| POST | `/v1/personas/{persona_id}/draft/process` | 202 JobAccepted | 변경 자료 처리, 실행 중 중복 금지 |
-| POST | `/v1/personas/{persona_id}/draft/activate` | 200 Activated | 최신 검증 revision만 원자 전환 |
+| POST | `/v1/personas/{persona_id}/draft/process` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
+| POST | `/v1/personas/{persona_id}/draft/activate` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
+| POST | `/v1/personas/{persona_id}/draft/apply` | 202 `{version_id, status}` | expected_revision 불일치 409 `revision_mismatch`, 진행 중 409 `indexing_in_progress`, 자료 없음 422 `no_content` |
 | POST | `/v1/personas/{persona_id}/conversations` | 201 Conversation | 적용본 필요, GPU 가용성은 생성 조건 아님 |
 | GET | `/v1/personas/{persona_id}/conversations` | 200 ConversationPage | 캐릭터별 소유자 목록 |
 | GET | `/v1/conversations/{conversation_id}/messages` | 200 MessagePage | 질문별 생성 시도·저장된 부분 답변 |
@@ -86,8 +102,9 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 | DELETE | `/v1/personas/{persona_id}` | 202 DeletionAccepted | 삭제 잠금·작업 중단·비동기 정리 |
 | GET | `/v1/deletions/{deletion_id}` | 200 Deletion | 삭제 후에도 소유자 조회 가능 |
 | GET | `/v1/service-status` | 200 ServiceStatus | 안내용 snapshot, 처리 시 다시 확인 |
+| GET | `/v1/personas/{persona_id}/retrieve` | 200 RetrieveResult | 디버그 전용 — `PERSONA_RETRIEVE_DEBUG_ENABLED`(기본 false) 꺼지면 404. q 1~2000자, k 1~10(기본 5) |
 
-22 operations / 16 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
+24 operations / 18 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
 이전 설계에서 추가로 논의하지 않은 대화 삭제·응답 편집·정상 응답 재생성·실행 중 ingestion 사용자 취소 API는 만들지 않는다.
 
 ## 4. 접수와 중복 방지
@@ -115,8 +132,10 @@ API 의미에 영향 없는 JSON key 순서는 제외하고, 반복 파일·텍�
 
 최초 `/uploads`는 기존 multipart 규칙을 유지한다. 텍스트 part는 profile/events/relationships/abilities/speech_examples,
 파일 part는 반복 가능한 `files.<kind>`다. 범용 files, URL 수집, PDF/HWP/자막 입력은 지원하지 않는다.
-UTF-8, 비공백 필수 profile, 파일당 1 MiB, 전체 원문 5 MiB, 파일 총 20개, multipart 6 MiB 상한을 사용한다.
-20개/6 MiB는 기존 구현값을 계약 초안에 보존한 것이다. 파일 MIME만으로 본문·확장자 검증을 생략하지 않는다.
+UTF-8, 비공백 필수 profile(1,500자 상한 — 프롬프트 블록 2 예산 안에 항상 전문이 들어가게 함, 초과 시 422 `settings_too_large`)을 사용한다.
+자료 상한은 §4-6과 같다(코드포인트 기준): events/relationships/abilities 각 200,000자, speech_examples 100,000자·줄당 500자, 소스 합계 500,000자(profile 제외).
+초과 시 422 `settings_too_large`, 어느 kind·어느 상한인지는 `fields`에 담는다(원문은 담지 않는다). 파일 총 20개, multipart 6 MiB 상한은 유지한다.
+20개/6 MiB는 기존 구현값을 계약 초안에 보존한 것이다(전송 계층 상한이라 §4-6과 별개). 파일 MIME만으로 본문·확장자 검증을 생략하지 않는다.
 NUL·잘못된 UTF-8·알 수 없는 필드·동일 ID의 상충 수정은 거부한다. 파일명은 표시용 basename이며 경로나 명령으로 사용하지 않는다.
 최종 초안에서도 비공백 profile은 필수다. 삭제/편집으로 이를 없애면 422이며 이름 중복은 편집 검증과 실제 적용 시점 모두 확인한다.
 
@@ -132,13 +151,25 @@ speech_examples = 길을 묻는 사람에게: 차근차근 같이 찾아볼까�
 {"job_id":"00000000-0000-4000-8000-000000000010","version_id":"00000000-0000-4000-8000-000000000002","draft_revision":1,"status":"queued"}
 ```
 
-기존 적용본 수정은 `POST draft(base_version_id)` → PATCH → 필요한 경우 process → activate다.
+초안을 만드는 경로는 둘이다. `POST draft`의 본문이 어느 쪽인지로 갈린다.
+
+| 본문 | 뜻 | 쓰는 때 |
+| --- | --- | --- |
+| `{settings}` | **처리 없이 새 초안을 시작한다.** job을 만들지 않는다 | 적용본이 없는 캐릭터에 설정부터 저장할 때 |
+| `{base_version_id}` | 적용본에서 파생한다 | 이미 적용된 캐릭터를 고칠 때 |
+
+둘을 함께 보내면 거부한다. `{settings}` 경로가 `profile`을 요구하는 이유는
+최종 초안에서도 비공백 profile이 필수이기 때문이다 — 빈 초안을 만들어 두고 나중에 채우게 하면
+그 사이의 초안이 계약을 어긴다. job이 없으므로 이때 캐릭터 상태는 2절대로 `review_required`다.
+
+`/uploads`는 여러 자료를 한 번에 접수하며 **처리 job을 함께 큐에 넣는** 경로다.
 초안이 이미 있으면 `/uploads`를 재호출하지 않는다. 현재 초안 입력을 바꾸고 process를 호출한다.
+기존 적용본 수정은 `POST draft(base_version_id)` → PATCH → 필요한 경우 process → activate다.
 
 PATCH는 JSON이다. `expected_revision`과 선택적인 `settings`, `upsert_sources`, `remove_source_ids`를 받는다.
 기존 문서는 id로 갱신하고, 신규 문서는 id 없이 보내 서버가 ID를 발급한다. 제거 ID는 현재 초안의 것이어야 한다.
 모두 비어 있는 변경은 422다. 수정과 제거가 같은 ID를 가리키거나 서버/다른 초안 ID를 입력하면 거부한다.
-파일 추가 시 웹이 UTF-8 텍스트로 읽어 kind/filename/content를 전송한다. 서버는 파일 출처 자료의 1 MiB 상한과 초안 전체 5 MiB 상한을 다시 검사한다.
+파일 추가 시 웹이 UTF-8 텍스트로 읽어 kind/filename/content를 전송한다. 서버는 반영 뒤 실제 저장량으로 §4-6의 kind별·합계 글자 상한을 다시 검사한다(반영 전에 개별 항목만 보면 여러 건을 한 번에 보낸 요청이 합계를 넘길 수 있다).
 PATCH의 JSON 포장은 제어문 escape로 늘 수 있으므로 multipart의 6 MiB를 그대로 적용하지 않는다.
 JSON HTTP body의 제안 상한은 32 MiB이며 최종 확정 전까지 배포하지 않는다. 서버는 파싱 후 원문 상한도 별도로 적용한다.
 
@@ -155,6 +186,7 @@ JSON HTTP body의 제안 상한은 32 MiB이며 최종 확정 전까지 배포�
 원문과 설정을 서로 다른 두 진실로 관리하지 않도록, 설정 수정 시 해당 종류의 현재 초안 텍스트도 함께 갱신한다.
 동일 요청에서 `settings.profile`과 profile source, 또는 `settings.speech_examples`와 speech source를 동시에 수정하면 422 `conflicting_fields`다.
 웹은 모든 본문을 텍스트로 표시하며 업로드 HTML/스크립트를 실행하지 않는다.
+
 
 검색 대상은 events/relationships/abilities다. profile/speech_examples는 설정·말투 입력이며 index 필수 대상이 아니다.
 profile만 있는 작업도 유효하다. 처리 문서는 비어 있지 않되 `indexed_chunk_count=0`일 수 있다.
@@ -243,6 +275,7 @@ mock backend의 `chunk`는 Gateway에서 delta로 변환하고, 원본 mock done
 ingestion 전용 역할/함수도 삭제 중 입력 읽기·늦은 결과 쓰기를 거부해야 한다.
 
 삭제 대상은 서비스가 보유한 업로드·초안/버전·처리 산출물·벡터·질문/답변·재시도 입력 snapshot이다.
+캐릭터 삭제는 논리 삭제(`deleted_at`)라 DB의 참조 연쇄로 지워지지 않는다. 삭제 worker가 명시적으로 지운다.
 처리 도중 실패하면 deletion failed와 persona deleting을 유지한다. 반쯤 지워진 캐릭터를 다시 ready로 표시하지 않는다.
 v1 복구는 운영자 런북으로 수행하며 사용자 복구 API/휴지통 UI는 없다. 삭제 worker 실행 방식·권한은 platform/gateway에서 별도 구현 설계한다.
 성공 후 persona GET은 404, 삭제 상태는 최소 owner-scoped record로 계속 조회 가능하다. 이름·본문을 tombstone에 남기지 않는다.
@@ -269,8 +302,8 @@ ingestion 대기열에 작업이 있다는 것과 접수 불가능한 것은 다
 | 항목 | 확정값·처리 |
 | --- | --- |
 | 캐릭터 수 | 사용자당 최대 3개. 삭제 중도 포함하고 삭제 완료 후에만 슬롯 반환 |
-| 원문 합계 | 사용자당 100 MiB(104857600 bytes). 적용본·초안·보관 중인 구버전의 원문 포함 |
-| 제출 입력 | 파일당 1 MiB, 합계 5 MiB, 파일 20개, multipart body 6 MiB 유지 |
+| 원문 합계 | 사용자당 100 MiB(104857600 bytes). 적용본·초안·보관 중인 구버전의 원문 포함. **미구현** |
+| 제출 입력 | §4-6과 같다(코드포인트): events/relationships/abilities 각 200,000자, speech_examples 100,000자·줄당 500자, 소스 합계 500,000자(profile 제외 1,500자). 파일 20개, multipart body 6 MiB 유지(2026-09-18 구현, 옛 파일당 1 MiB·합계 5 MiB 바이트 상한 대체) |
 | 이번 질문 | 최대 2,000 Unicode 코드 포인트. 비공백 필수, 초과 시 422 `message_too_long`; 무음 잘라내기 없음 |
 | 생성 답변 | 최대 512 모델 토큰. 글자 수가 아니며 엔진 토크나이저 기준 |
 | 동시 생성 | 사용자당 1개, 대기열 없음. 종료 확인 전에는 취소·시간 초과도 슬롯 유지 |
@@ -280,7 +313,10 @@ ingestion 대기열에 작업이 있다는 것과 접수 불가능한 것은 다
 
 한도와 오류 코드는 구현 계약으로 서버에서 강제한다. 문자 수는 클라이언트 UTF-16 length와 서버의
 Unicode 문자 수·byte length를 구분하며 한글·이모지 경계 테스트를 둔다.
-캐릭터 한도 초과는 409 `persona_limit_exceeded`, 원문 한도 초과는 413 `storage_quota_exceeded`로 거절한다.
+캐릭터 한도 초과는 409 `persona_limit_exceeded`로 거절한다. 제출 입력(§4-6) 한도 초과는 422
+`settings_too_large`다(2026-09-18부터 — 이전엔 413 `storage_quota_exceeded`였다). 원문 합계
+100 MiB 한도(사용자당, 아직 미구현)는 구현되면 413 `storage_quota_exceeded`를 쓴다 — 서로 다른
+한도이니 코드를 혼동하지 않는다.
 한도는 신규 증가 작업만 차단한다. 기존 조회·채팅·삭제를 막거나 보존 중인 데이터를 몰래 지우지 않는다.
 동시 생성/업로드가 각각 검사만 통과해 한도를 넘지 않게 사용자 범위에서 검사와 반영을 원자 처리한다.
 원문 사용량/남은 용량을 UI에 안내한다. 공유 원문 참조의 중복 계수·예약/해제 원자성·사용량 응답 필드는 업로드 구현 전 계약 보강 대상이다.
@@ -331,7 +367,7 @@ OpenAPI는 [3.1.0 명세](https://spec.openapis.org/oas/v3.1.0.html)를 사용�
 uv run --no-project --with openapi-spec-validator==0.9.0 --with jsonschema==4.26.0 python api/validate_contract.py
 ```
 
-OpenAPI 구조·참조, operation 수/ID·인증·멱등 키 계약, `contract-examples.json`의 정상/오류 19개,
+OpenAPI 구조·참조, operation 수/ID·인증·멱등 키 계약, `contract-examples.json`의 정상/오류 28개,
 SSE data JSON 예시 8개, 영문·한글·이모지 질문 2000/2001자 경계 6개와 확정 정책값을 검증한다.
 DB 상태 전이·소유권 경쟁·실제 스트리밍 타이밍·byte 상한·토큰 제한의 런타임 강제는 이 검사로 검증되지 않는다.
 그 항목들은 10절의 HTTP/DB/E2E 테스트에서 별도로 확인한다.

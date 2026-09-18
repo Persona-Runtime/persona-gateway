@@ -63,6 +63,12 @@ class MemoryStore:
     def is_ready(self) -> bool:
         return True
 
+    def start_indexing(self, owner: str, persona_id: UUID, expected_revision: int):
+        # 이 fake 저장소로 /draft/apply를 치는 테스트는 없다 — Protocol과 실제 구현이
+        # 어긋나 있다는 사실만 없애려고 스텁만 둔다. 실제로 호출되면 일반 예외
+        # 처리 경로를 타 500이 된다(UnexpectedFailureStore와 같은 결과).
+        raise NotImplementedError
+
 
 class FailingStore(MemoryStore):
     def __init__(self, error: Exception) -> None:
@@ -78,18 +84,22 @@ class UnexpectedFailureStore(MemoryStore):
         raise RuntimeError("synthetic unexpected failure")
 
 
-def settings() -> Settings:
+def settings(*, forward_auth_enabled: bool = False) -> Settings:
     return Settings(
         DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
         PERSONA_STATIC_BEARER_TOKEN="synthetic-token",
         PERSONA_STATIC_USER_ID="synthetic-owner",
         PERSONA_STATIC_DISPLAY_NAME="합성 사용자",
         PERSONA_CURSOR_SIGNING_KEY="synthetic-cursor-key",
+        PERSONA_FORWARD_AUTH_ENABLED=forward_auth_enabled,
     )
 
 
-def client(store: MemoryStore | None = None) -> TestClient:
-    return TestClient(create_app(settings(), store or MemoryStore()))
+def client(store: MemoryStore | None = None, *, forward_auth_enabled: bool = False) -> TestClient:
+    return TestClient(
+        create_app(settings(forward_auth_enabled=forward_auth_enabled), store or MemoryStore())
+    )
 
 
 def headers(key: UUID | None = None) -> dict[str, str]:
@@ -109,6 +119,53 @@ def test_me_requires_static_bearer_token() -> None:
     response = api.get("/v1/me", headers=headers())
     assert response.status_code == 200
     assert response.json() == {"id": "synthetic-owner", "display_name": "합성 사용자"}
+
+
+def test_forward_auth_header_ignored_when_flag_off() -> None:
+    # 플래그가 꺼져 있으면 X-Auth-Request-User가 와도 무시하고 기존 정적 토큰 경로로
+    # 간다 — 헤더만으로는 신원을 바꿀 수 없다.
+    api = client(forward_auth_enabled=False)
+    forwarded_headers = {**headers(), "X-Auth-Request-User": "octocat"}
+    response = api.get("/v1/me", headers=forwarded_headers)
+    assert response.status_code == 200
+    assert response.json() == {"id": "synthetic-owner", "display_name": "합성 사용자"}
+
+    # 정적 토큰 없이 헤더만 보내면(플래그 off) 여전히 401이다.
+    header_only = api.get("/v1/me", headers={"X-Auth-Request-User": "octocat"})
+    assert header_only.status_code == 401
+
+
+def test_forward_auth_header_accepted_when_flag_on_and_valid() -> None:
+    # 플래그가 켜져 있고 헤더가 GitHub login 형식이면 정적 토큰 없이도 인증된다 —
+    # subject는 "github:" 접두사 + 소문자화된 login이다.
+    api = client(forward_auth_enabled=True)
+    response = api.get("/v1/me", headers={"X-Auth-Request-User": "Octocat-42"})
+    assert response.status_code == 200
+    assert response.json() == {"id": "github:octocat-42", "display_name": "octocat-42"}
+
+
+@pytest.mark.parametrize(
+    "forwarded_user",
+    [
+        "",
+        " ",
+        "user with space",
+        "user\nwith-newline",
+        "-leading-hyphen",
+        "trailing-hyphen-",
+        "a" * 40,
+    ],
+)
+def test_forward_auth_header_rejected_when_flag_on_and_invalid_format(
+    forwarded_user: str,
+) -> None:
+    # 플래그가 켜져 있어도 GitHub login 형식(1~39자, 영숫자+하이픈, 앞뒤 하이픈 불가) 밖의
+    # 값은 401이다 — 정적 토큰 경로로 넘어가지 않고 바로 거부한다(위조 시도를 조용히
+    # 통과시키지 않는다).
+    api = client(forward_auth_enabled=True)
+    response = api.get("/v1/me", headers={"X-Auth-Request-User": forwarded_user})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
 
 
 def test_healthz_ignores_database_and_readyz_is_safe() -> None:

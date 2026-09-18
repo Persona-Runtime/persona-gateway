@@ -1,0 +1,46 @@
+[project]
+name = "persona-embedding-service"
+version = "0.1.0"
+description = "Persona Runtime 임베딩 서비스: 인수인계 §4-4 계약"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "sentence-transformers>=3.3,<4",
+  # sentence-transformers가 끌어오는 간접 의존성이지만, [tool.uv.sources]로 인덱스를
+  # 바꿔치기하려면 uv가 직접 선언된 요구사항으로 봐야 한다 — 간접 의존성인 채로 두면
+  # 아래 pytorch-cpu 라우팅이 조용히 무시되고 기본 PyPI의 CUDA 포함 휠이 깔린다.
+  "torch>=2.5,<3",
+  "uvicorn>=0.32,<1",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+]
+
+# torch는 sentence-transformers가 끌어오는 간접 의존성이지만, CUDA 휠이 딸려오면
+# 이미지가 수 GB 불어나고(§7 "임베딩 모델을 Gateway 프로세스 안에 로딩" 금지와 같은
+# 맥락에서 이 서비스는 CPU 전용이 계약이다) 런타임에 GPU가 없으니 쓸 일도 없다.
+# Linux(도커 빌드·배포 대상)에서만 PyPI 대신 PyTorch의 CPU 전용 인덱스를 쓰고,
+# macOS(로컬 개발)는 애초에 CUDA 휠이 없어 기본 인덱스로 충분하다.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+markers = ["integration: 실제 sentence-transformers 모델을 로딩한다"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

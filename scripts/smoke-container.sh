@@ -55,6 +55,7 @@ termination_grace_seconds="30"
 connect_timeout_seconds="3"
 request_timeout_seconds="10"
 
+repo_dir="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 workdir="$(mktemp -d)"
 request_meta="$workdir/last-request"
 printf '0 0\n' > "$request_meta"
@@ -199,11 +200,18 @@ docker run --rm --network "$network" --platform linux/amd64 \
   }
 ok "alembic upgrade head 완료"
 
+# 기대 revision을 여기에 적지 않고 소스에서 읽는다. 상수로 박아 두면 새 migration이
+# 들어올 때마다 이 스크립트가 "예상과 다름"으로 실패한다 — 실제로 0002에서 그렇게 됐다.
+#
+# 마지막 migration 파일의 revision을 alembic이 적용한 head로 본다. upgrade head가
+# 성공한 직후이므로 둘이 같아야 하고, 다르면 이미지 안의 코드가 소스와 다르다는 뜻이다.
+expected_revision="$(ls "$repo_dir/python-backend/migrations/versions"/*.py \
+  | sort | tail -1 | xargs basename | sed 's/\.py$//')"
 applied_revision="$(psql_exec --command 'SELECT version_num FROM persona_minimal.alembic_version' | tr -d '[:space:]')"
-if [ "$applied_revision" = "0001_persona_minimal" ]; then
+if [ "$applied_revision" = "$expected_revision" ]; then
   ok "alembic revision 확인: ${applied_revision}"
 else
-  fail "alembic revision이 예상과 다름: ${applied_revision}"
+  fail "alembic revision이 소스의 head와 다름: ${applied_revision} (소스 head ${expected_revision})"
 fi
 
 step "3. API 컨테이너 기동 (비루트 · read-only · 권한 최소화)"

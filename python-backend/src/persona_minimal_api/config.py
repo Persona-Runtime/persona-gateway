@@ -8,12 +8,29 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
 
     database_url: str = Field(validation_alias="DATABASE_URL")
+    # database_url과 같은 성격 — 반드시 외부에서 줘야 하는 연결 대상이라 기본값을
+    # 두지 않는다(빈 문자열이라도 호출 시점에야 실패가 드러나는 게, 조용한 기본값보다
+    # 낫다는 판단도 database_url과 같다).
+    embedding_url: str = Field(validation_alias="PERSONA_EMBEDDING_URL")
     static_bearer_token: SecretStr = Field(validation_alias="PERSONA_STATIC_BEARER_TOKEN")
     static_user_id: str = Field(validation_alias="PERSONA_STATIC_USER_ID")
     static_display_name: str = Field(validation_alias="PERSONA_STATIC_DISPLAY_NAME")
     cursor_signing_key: SecretStr = Field(validation_alias="PERSONA_CURSOR_SIGNING_KEY")
     database_timeout_seconds: float = Field(
         default=2.0, validation_alias="PERSONA_DB_TIMEOUT_SECONDS"
+    )
+    # /retrieve 응답에 원문 조각이 그대로 들어간다 — 기본은 꺼둔다. platform prod
+    # overlay에는 이 env를 넣지 않는다(=off로 유지).
+    retrieve_debug_enabled: bool = Field(
+        default=False, validation_alias="PERSONA_RETRIEVE_DEBUG_ENABLED"
+    )
+    # Traefik의 oauth-forward Middleware가 세팅하는 X-Auth-Request-User를 신원으로
+    # 받아들일지 여부 — 기본은 꺼둔다. 이 값이 켜져도 신뢰 근거(NetworkPolicy·
+    # ForwardAuth authResponseHeaders 덮어쓰기·strip-auth-header)가 전제다.
+    # authenticated_user 문서화 참고. platform prod overlay엔 Gate 4가 아직
+    # 클러스터 미적용이라 이번에도 넣지 않는다(=off로 유지).
+    forward_auth_enabled: bool = Field(
+        default=False, validation_alias="PERSONA_FORWARD_AUTH_ENABLED"
     )
 
     @field_validator("static_user_id", "static_display_name")
