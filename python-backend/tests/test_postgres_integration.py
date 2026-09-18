@@ -1000,9 +1000,7 @@ def _assert_never_in_trusted_prefix(
     content: str, system_and_settings_chars: int, injected: str
 ) -> None:
     """블록 1+2(시스템 지시+설정)는 항상 신뢰하는 고정 문자열이다 — 인젝션이 여기
-    안에 들어가면(=시스템 지시 자체를 오염시키면) 그 자체로 실패다. 블록 3(말투)은
-    §4-5가 <data>로 감싸지 않는다고 정했으므로(SYSTEM_INSTRUCTION의 문구로만
-    "데이터다"를 선언), 이 경계(블록 1+2 끝)가 실제로 의미 있는 구조적 방어선이다."""
+    안에 들어가면(=시스템 지시 자체를 오염시키면) 그 자체로 실패다."""
     trusted_prefix = content[:system_and_settings_chars]
     assert injected not in trusted_prefix
 
@@ -1019,10 +1017,10 @@ def _assert_contained_in_references_block(
 def _assert_contained_in_speech_block(
     content: str, system_and_settings_chars: int, injected: str
 ) -> None:
-    """블록 3(말투)에서 온 인젝션은 <data>로 안 감싸이지만(§4-5), 블록 1+2 밖에
-    있어야 한다는 요구는 참고자료와 같다."""
+    """블록 3(말투)에서 온 인젝션은 <speech>…</speech> 안에 있어야 한다."""
     _assert_never_in_trusted_prefix(content, system_and_settings_chars, injected)
     assert injected in content
+    assert injected in content[content.index("<speech>") :]
 
 
 def test_retrieve_context_and_build_messages_keep_injections_in_data_blocks_and_do_not_leak_across_characters(

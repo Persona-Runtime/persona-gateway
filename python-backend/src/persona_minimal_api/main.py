@@ -613,6 +613,11 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
             len(speech),
             elapsed_ms,
         )
+        # indexed_revision은 마지막으로 "성공한" 색인의 revision이고, body/speech
+        # 조각도 그 revision 기준이다. 사용자가 그 뒤 PATCH로 자료를 편집했다면
+        # (아직 재색인 전이라면) 지금 초안의 revision은 이 값보다 클 수 있고, 조각은
+        # 편집 전 내용을 반영한다. 이 엔드포인트는 그 차이를 감지·경고하지 않는다 —
+        # 디버그 전용이라 호출자가 indexed_revision을 보고 스스로 판단한다.
         return {
             "indexed_revision": indexed_revision,
             "body": [retrieve_chunk_response(chunk) for chunk in body],
