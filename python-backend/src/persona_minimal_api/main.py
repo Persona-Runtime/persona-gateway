@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
@@ -42,6 +43,11 @@ from .retrieval.metrics import RETRIEVAL_SECONDS
 from .retrieval.search import BODY_KINDS, SPEECH_KINDS, RetrievedChunk, load_indexed_version, search
 
 logger = logging.getLogger(__name__)
+
+# GitHub login 형식(1~39자, 영숫자+하이픈, 앞뒤 하이픈 불가). authenticated_user가
+# Traefik의 X-Auth-Request-User를 신원으로 받아들이기 전에 이 형식만 통과시킨다 —
+# 개행·공백·40자 이상 값은 애초에 이 문자 클래스에 없어 걸러진다.
+_GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 
 
 class ApiError(Exception):
@@ -286,7 +292,34 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
     async def unexpected_error(request: Request, _: Exception):
         return error_response(request, ApiError(500, "internal_error", "서버 오류가 발생했습니다."))
 
-    def authenticated_user(authorization: str | None = Header(default=None)) -> tuple[str, str]:
+    def authenticated_user(
+        authorization: str | None = Header(default=None),
+        forwarded_user: str | None = Header(default=None, alias="X-Auth-Request-User"),
+    ) -> tuple[str, str]:
+        """인증된 사용자의 (subject, 표시 이름)을 반환한다.
+
+        forward_auth_enabled가 켜져 있고 forwarded_user가 오면 그 값을 GitHub 로그인으로
+        신뢰한다. 이 신뢰는 아래 세 조건이 모두 지켜질 때만 안전하다 — 셋 중 하나라도
+        빠지면 클라이언트가 이 헤더를 직접 채워 위조할 수 있다.
+
+        1. NetworkPolicy로 이 Gateway는 traefik 네임스페이스에서만 도달 가능하다
+           (Gate 4 §3) — 클라이언트가 Gateway에 직접 헤더를 보낼 경로가 없다.
+        2. Traefik의 oauth-forward Middleware가 authResponseHeaders로 이 헤더를 실제
+           GitHub 인증 결과 위에 항상 덮어쓴다 — 클라이언트가 보낸 원래 값은 버려진다
+           (인터넷 진입 경로, httproute-public.yaml).
+        3. 내부/Serve 경로(httproute.yaml)는 oauth-forward를 거치지 않으므로, 대신
+           strip-auth-header Middleware가 이 헤더를 항상 지운다 — 그 경로로는 헤더
+           자체가 Gateway에 전달되지 않는다.
+
+        플래그가 꺼져 있거나 헤더가 없으면 기존 정적 토큰 경로로 넘어간다 — 정적 토큰
+        인증은 이 기능과 무관하게 계속 동작한다.
+        """
+        if settings.forward_auth_enabled and forwarded_user is not None:
+            login = forwarded_user.strip().lower()
+            if not _GITHUB_LOGIN_RE.fullmatch(login):
+                raise ApiError(401, "unauthorized", "인증이 필요합니다.")
+            return f"github:{login}", login
+
         expected = settings.static_bearer_token.get_secret_value()
         parts = authorization.split() if authorization else []
         if (

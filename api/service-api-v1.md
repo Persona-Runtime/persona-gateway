@@ -13,6 +13,12 @@ operation과 path 수는 그대로다.
 
 - 외부 API는 `/v1`, 사용자 화면은 같은 origin을 사용한다. 실제 토큰 전송 경로는 HTTPS/Tailnet이다.
 - 단일 계정의 사전 발급 정적 Bearer 토큰을 검증한다. `GET /v1/me`는 검증/사용자 조회이지 토큰 발급 API가 아니다.
+- (Gate 4, `PERSONA_FORWARD_AUTH_ENABLED`로 게이팅, 기본 꺼짐) 켜져 있으면 정적 토큰 대신 Traefik의
+  ForwardAuth Middleware가 세팅하는 `X-Auth-Request-User`(GitHub 로그인)를 신원으로 받아들인다.
+  이 경로는 인터넷 진입(`app.personaruntime.xyz`)에서 GitHub OAuth(oauth2-proxy)를 거친 요청 전용이며,
+  subject는 `github:<login>`(소문자)이다. 두 경로는 공존한다 — 정적 토큰 경로는 이 기능과 무관하게
+  계속 동작하며, 플랫폼 쪽 NetworkPolicy·Middleware 선언(least-privilege-boundary.md §2)이 헤더 위조를
+  막는 전제다. 클러스터 미적용 상태에서는 이 경로가 실제로 켜지지 않는다.
 - 회원가입·비밀번호 찾기·토큰 발급·OIDC 전환은 이번 범위 밖이다. 사용자 ID는 서버의 토큰 매핑으로 결정한다.
 - 토큰은 브라우저 메모리에만 보관한다. 새로고침·탭 종료 후 다시 입력한다. localStorage/sessionStorage/IndexedDB·영구 쿠키에 저장하거나 빌드에 삽입하지 않는다. URL·로그·분석 이벤트에도 넣지 않는다.
 - UI 로그아웃은 메모리의 토큰·사용자 자료를 지우는 동작이며 서버 토큰 폐기는 아니다. 메모리 보관도 실행 중 XSS에 대한 방어를 대체하지 않는다. 만료·회전 절차는 별도 미결이다.

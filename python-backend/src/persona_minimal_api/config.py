@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     retrieve_debug_enabled: bool = Field(
         default=False, validation_alias="PERSONA_RETRIEVE_DEBUG_ENABLED"
     )
+    # Traefik의 oauth-forward Middleware가 세팅하는 X-Auth-Request-User를 신원으로
+    # 받아들일지 여부 — 기본은 꺼둔다. 이 값이 켜져도 신뢰 근거(NetworkPolicy·
+    # ForwardAuth authResponseHeaders 덮어쓰기·strip-auth-header)가 전제다.
+    # authenticated_user 문서화 참고. platform prod overlay엔 Gate 4가 아직
+    # 클러스터 미적용이라 이번에도 넣지 않는다(=off로 유지).
+    forward_auth_enabled: bool = Field(
+        default=False, validation_alias="PERSONA_FORWARD_AUTH_ENABLED"
+    )
 
     @field_validator("static_user_id", "static_display_name")
     @classmethod
