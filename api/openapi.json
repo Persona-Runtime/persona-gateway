@@ -2255,6 +2255,38 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "indexed_revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "indexed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -2269,7 +2301,10 @@
           "sources",
           "warnings",
           "can_activate",
-          "updated_at"
+          "updated_at",
+          "indexed_revision",
+          "indexed_at",
+          "error_code"
         ]
       },
       "JobResult": {

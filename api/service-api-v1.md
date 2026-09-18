@@ -69,6 +69,12 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 설정만 수정하고 기존 검색 결과를 안전하게 재사용할 수 있으면 바로 `ready`가 될 수 있다. `can_activate`는 서버 판정값이다.
 처리 요청은 `expected_revision`을 고정해 job에 기록한다. 자동 상태 변화 자체는 사용자의 내용 revision을 증가시키지 않는다.
 
+`status`/`error_code`는 **지금 draft의 마지막 적용 시도** 결과이고, `indexed_revision`/`indexed_at`은
+**실제로 검색에 쓸 수 있는, 마지막으로 색인에 성공한** revision·시각이다. 이 둘은 다를 수 있다 —
+rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `failed`가 되지만 `indexed_revision`은
+여전히 3을 가리키고 rev3 조각은 그대로 검색된다. `error_code`는 `status`가 `failed`일 때만 값이
+있고, 다음 색인이 성공하면 다시 null로 돌아간다(2026-09-18 구현, 2절 갱신).
+
 ## 3. API 목록
 
 | Method | 경로 | 성공 | 핵심 제약 |

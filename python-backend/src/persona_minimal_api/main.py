@@ -189,6 +189,11 @@ def draft_response(draft: Draft) -> dict[str, object]:
         "warnings": [],
         "can_activate": draft.can_activate,
         "updated_at": draft.updated_at,
+        # 마지막으로 색인에 성공한 revision·시각. status·error_code(마지막 적용 시도
+        # 결과)와 분리돼 있다 — rev4 편집·색인 실패에도 rev3 색인은 그대로 유효할 수 있다.
+        "indexed_revision": draft.indexed_revision,
+        "indexed_at": draft.indexed_at,
+        "error_code": draft.error_code,
     }
 
 

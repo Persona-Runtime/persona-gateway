@@ -719,19 +719,34 @@ def test_apply_failure_keeps_previous_ready_chunks_and_indexed_revision(
     assert final.status == "failed"
     assert final.indexed_revision == ready.revision  # rev 3 표시가 그대로 남는다
     assert final.indexed_at is not None
+    assert final.error_code is not None
 
     with store.pool.connection() as connection:
-        error_code = connection.execute(
-            "SELECT error_code FROM persona_minimal.material_versions WHERE persona_id = %s",
-            (persona.id,),
-        ).fetchone()[0]
-        assert error_code is not None
-
         chunk_ids = connection.execute(
             "SELECT id FROM persona_minimal.material_chunks WHERE version_id = %s",
             (ready_version_id,),
         ).fetchall()
     assert len(chunk_ids) == 1  # rev 3 조각이 그대로 있다 — 실패한 rev 4 시도가 안 건드림
+
+    # 실제 GET /draft 응답(레포지토리 계층이 아니라 HTTP 계층)도 세 필드를 그대로 낸다.
+    settings = Settings(
+        DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
+        PERSONA_STATIC_BEARER_TOKEN="integration-token",
+        PERSONA_STATIC_USER_ID=owner,
+        PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
+        PERSONA_CURSOR_SIGNING_KEY="integration-cursor-key",
+    )
+    with TestClient(create_app(settings, store)) as api:
+        response = api.get(
+            f"/v1/personas/{persona.id}/draft",
+            headers={"Authorization": "Bearer integration-token"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["indexed_revision"] == ready.revision
+    assert body["indexed_at"] is not None
+    assert body["error_code"] is not None
 
 
 def test_run_indexing_success_after_concurrent_edit_keeps_the_edit(

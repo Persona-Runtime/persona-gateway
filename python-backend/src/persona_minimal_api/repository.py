@@ -198,6 +198,9 @@ class Draft:
     # 그대로 쓸 수 있어야 하는데, status만 보면 failed라 그 사실을 알 수 없다.
     indexed_revision: int | None
     indexed_at: datetime | None
+    # status='failed'일 때만 의미가 있다. 그 외에는 NULL(다음 색인 성공 시에도 NULL로
+    # 되돌아간다) — migration 0003의 컬럼 주석과 같은 규칙이다.
+    error_code: str | None
 
     @property
     def requires_processing(self) -> bool:
@@ -487,7 +490,7 @@ class PostgresPersonaStore:
             """
             SELECT persona_id, version_id, revision, status, job_id, base_version_id,
                    settings_name, settings_profile, settings_speech_examples, updated_at,
-                   indexed_revision, indexed_at
+                   indexed_revision, indexed_at, error_code
             FROM persona_minimal.material_versions WHERE persona_id = %s
             """,
             (persona_id,),
@@ -530,6 +533,7 @@ class PostgresPersonaStore:
             updated_at=row["updated_at"],
             indexed_revision=row["indexed_revision"],
             indexed_at=row["indexed_at"],
+            error_code=row["error_code"],
         )
 
     def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft:
