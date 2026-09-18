@@ -449,7 +449,12 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
                 409, "idempotency_conflict", "같은 키에 다른 요청을 사용할 수 없습니다."
             )
         if isinstance(error, DraftValidationError):
-            return ApiError(error.status, error.code, "초안 수정을 처리할 수 없습니다.")
+            return ApiError(
+                error.status,
+                error.code,
+                "초안 수정을 처리할 수 없습니다.",
+                fields=error.fields,
+            )
         raise error
 
     @app.get("/v1/personas/{persona_id}")

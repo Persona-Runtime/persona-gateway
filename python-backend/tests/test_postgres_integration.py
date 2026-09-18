@@ -261,6 +261,22 @@ def _persona_for(store: PostgresPersonaStore):
     return owner, persona
 
 
+def _speech_content(total_len: int) -> str:
+    """줄당 500자 이하로 나눠 정확히 total_len자(개행 포함)를 만든다.
+
+    500자짜리 줄을 이어 붙일 때마다 그 줄(500자)과 다음 줄을 잇는 개행(1자)까지
+    합쳐 501자씩 소비한다. 남은 만큼은 마지막 한 줄로 채운다.
+    """
+    lines: list[str] = []
+    remaining = total_len
+    while remaining > 500:
+        lines.append("가" * 500)
+        remaining -= 501
+    if remaining > 0:
+        lines.append("가" * remaining)
+    return "\n".join(lines)
+
+
 def test_draft_starts_without_a_job_and_persona_becomes_review_required(
     store: PostgresPersonaStore,
 ) -> None:
@@ -379,10 +395,12 @@ def test_patch_rejects_contract_violations(store: PostgresPersonaStore) -> None:
         patch(remove=[uuid4()])
     assert unknown.value.code == "unknown_source"
 
-    # 파일 출처 자료 1 MiB 상한(계약 5절).
+    # 본문 kind 200,000자 상한(§4-6, 2026-09-18 구현 — 옛 1 MiB 바이트 상한을 대체).
     with pytest.raises(DraftValidationError) as too_large:
-        patch(upsert=[{"kind": "events", "content": "가" * 400_000}])
-    assert too_large.value.status == 413
+        patch(upsert=[{"kind": "events", "content": "가" * 200_001}])
+    assert too_large.value.code == "settings_too_large"
+    assert too_large.value.status == 422
+    assert too_large.value.fields == [{"field": "events", "code": "max_length_exceeded"}]
 
     # profile 1,500자 상한(§4-6, 2026-09-18 갱신) — 경계값 양쪽.
     # patch()는 revision을 클로저로 참조하므로, 성공한 patch 뒤에는 새 revision을
@@ -406,6 +424,101 @@ def test_create_draft_rejects_profile_over_max_chars(store: PostgresPersonaStore
     # 정확히 상한은 통과한다 — 초안이 실제로 만들어지는지까지 확인.
     created = store.create_draft(owner, persona.id, _settings(profile="가" * 1500), uuid4())
     assert created.settings.profile == "가" * 1500
+
+
+def test_patch_rejects_content_over_char_limits(store: PostgresPersonaStore) -> None:
+    """§4-6(2026-09-18 구현) kind별·합계 글자 상한. 경계값 양쪽을 확인한다.
+
+    같은 kind로 소스를 여러 개 보내면(id 없이 upsert) 합으로 검사돼야 한다 — 쪼개서
+    상한을 우회할 수 없어야 한다.
+    """
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    revision = draft.revision
+
+    def patch(**kwargs):
+        return store.patch_draft(
+            owner,
+            persona.id,
+            kwargs.pop("revision", revision),
+            kwargs.pop("settings", None),
+            kwargs.pop("upsert", []),
+            kwargs.pop("remove", []),
+        )
+
+    for kind in ("relationships", "abilities"):
+        with pytest.raises(DraftValidationError) as too_large:
+            patch(upsert=[{"kind": kind, "content": "가" * 200_001}])
+        assert too_large.value.code == "settings_too_large"
+        assert too_large.value.fields == [{"field": kind, "code": "max_length_exceeded"}]
+
+    # speech_examples: 소스 두 개(id 없이 upsert, 합으로 검사돼야 한다)를 정확히
+    # 합계 100,000자가 되도록 나눠 보낸다 — 통과해야 한다.
+    first_half = _speech_content(60_000)
+    updated = patch(upsert=[{"kind": "speech_examples", "content": first_half}])
+    revision = updated.revision
+    second_half_ok = _speech_content(40_000)
+    updated = patch(upsert=[{"kind": "speech_examples", "content": second_half_ok}])
+    revision = updated.revision
+    assert sum(len(s.content) for s in updated.sources if s.kind == "speech_examples") == 100_000
+
+    # 세 번째 소스를 더하면(1자라도) 누적 100,000자를 넘겨 실패해야 한다.
+    with pytest.raises(DraftValidationError) as speech_total:
+        patch(upsert=[{"kind": "speech_examples", "content": "가"}])
+    assert speech_total.value.code == "settings_too_large"
+    assert speech_total.value.fields == [
+        {"field": "speech_examples", "code": "max_length_exceeded"}
+    ]
+
+    # speech_examples 한 줄 501자 — 총량이 상한 이내여도 실패해야 한다.
+    owner2, persona2 = _persona_for(store)
+    draft2 = store.create_draft(owner2, persona2.id, _settings(), uuid4())
+    with pytest.raises(DraftValidationError) as speech_line:
+        store.patch_draft(
+            owner2,
+            persona2.id,
+            draft2.revision,
+            None,
+            [{"kind": "speech_examples", "content": "가" * 501}],
+            [],
+        )
+    assert speech_line.value.code == "settings_too_large"
+    assert speech_line.value.fields == [{"field": "speech_examples", "code": "line_too_long"}]
+
+    # 전체 합 500,000자 경계 — kind별 상한 안쪽인 조합으로 확인한다.
+    owner3, persona3 = _persona_for(store)
+    draft3 = store.create_draft(owner3, persona3.id, _settings(), uuid4())
+    ok_total = store.patch_draft(
+        owner3,
+        persona3.id,
+        draft3.revision,
+        None,
+        [
+            {"kind": "events", "content": "가" * 200_000},
+            {"kind": "relationships", "content": "가" * 200_000},
+            {"kind": "abilities", "content": "가" * 100_000},
+        ],
+        [],
+    )
+    assert sum(len(s.content) for s in ok_total.sources) == 500_000
+
+    owner4, persona4 = _persona_for(store)
+    draft4 = store.create_draft(owner4, persona4.id, _settings(), uuid4())
+    with pytest.raises(DraftValidationError) as total_over:
+        store.patch_draft(
+            owner4,
+            persona4.id,
+            draft4.revision,
+            None,
+            [
+                {"kind": "events", "content": "가" * 200_000},
+                {"kind": "relationships", "content": "가" * 200_000},
+                {"kind": "abilities", "content": "가" * 100_001},
+            ],
+            [],
+        )
+    assert total_over.value.code == "settings_too_large"
+    assert total_over.value.fields == [{"field": "sources", "code": "max_total_length_exceeded"}]
 
 
 def test_discard_removes_draft_and_sources(store: PostgresPersonaStore) -> None:

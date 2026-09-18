@@ -24,12 +24,16 @@ CREATE_PERSONA_SCOPE = "/v1/personas"
 # 초안 생성과 폐기는 서로 다른 operation이다. 같은 키로 둘을 보내도 서로의 기록을 덮지 않는다.
 CREATE_DRAFT_OPERATION = "create_draft"
 DISCARD_DRAFT_OPERATION = "discard_draft"
-# 계약 5절이 정한 자료 상한. 파일 하나와 초안 전체가 다른 값이다.
-MAX_SOURCE_BYTES = 1_048_576
-MAX_DRAFT_TOTAL_BYTES = 5_242_880
-# §4-6 갱신(2026-09-18). profile은 항상 프롬프트 블록 2에 전문이 들어가고 그 블록의
-# 예산이 2,000자(시스템 지시 포함)라, 상한을 그 예산 안에 여유 있게 들어가는 값으로
-# 낮춰 잘림 없이 항상 전문이 프롬프트에 들어가게 한다.
+# §4-6 구현(2026-09-18). 옛 14번 상한(파일 1 MiB·전체 5 MiB, 바이트 기준)을 대체한다.
+# 코드포인트(len()) 기준 — UTF-8 바이트가 아니다. MAX_PROFILE_CHARS와 같은 이유로,
+# 한글은 바이트 상한에서 훨씬 적은 글자 수만 허용돼 나무위키 긴 문서를 못 받는다.
+MAX_BODY_KIND_CHARS = 200_000  # events/relationships/abilities 각각
+MAX_SPEECH_CHARS = 100_000  # speech_examples 소스 전체
+MAX_SPEECH_LINE_CHARS = 500  # speech_examples 한 줄
+MAX_DRAFT_TOTAL_CHARS = 500_000  # 소스 전체 합(profile 제외)
+# profile은 항상 프롬프트 블록 2에 전문이 들어가고 그 블록의 예산이 2,000자(시스템 지시
+# 포함)라, 상한을 그 예산 안에 여유 있게 들어가는 값으로 낮춰 잘림 없이 항상 전문이
+# 프롬프트에 들어가게 한다.
 MAX_PROFILE_CHARS = 1500
 DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_examples")
 # readiness가 받아들이는 migration revision.
@@ -118,11 +122,16 @@ class NotIndexed(Exception):
 
 
 class DraftValidationError(Exception):
-    """계약이 정한 거절. code가 그대로 응답의 오류 코드가 된다."""
+    """계약이 정한 거절. code가 그대로 응답의 오류 코드가 된다.
 
-    def __init__(self, code: str, status: int = 422):
+    fields는 openapi.json Error.fields 스키마({field, code} 둘 다 필수)를 그대로 따른다.
+    원문은 절대 담지 않는다 — field가 어느 kind인지, code가 어느 상한을 어겼는지만 담는다.
+    """
+
+    def __init__(self, code: str, status: int = 422, fields: list[dict[str, str]] | None = None):
         self.code = code
         self.status = status
+        self.fields = fields
         super().__init__(code)
 
 
@@ -596,8 +605,7 @@ class PostgresPersonaStore:
                     if cur.fetchone() is not None:
                         raise DraftAlreadyExists
 
-                    if len(settings.profile) > MAX_PROFILE_CHARS:
-                        raise DraftValidationError("settings_too_large")
+                    self._guard_draft_limits(settings, ())
 
                     cur.execute(
                         """
@@ -729,7 +737,7 @@ class PostgresPersonaStore:
                         (persona_id,),
                     )
                     updated = self._read_draft(cur, persona_id)
-                    self._guard_draft_limits(updated)
+                    self._guard_draft_limits(updated.settings, updated.sources)
                     return updated
 
     def start_indexing(
@@ -834,8 +842,8 @@ class PostgresPersonaStore:
         if not profile.strip():
             # 5절: 최종 초안에서도 비공백 profile은 필수다.
             raise DraftValidationError("invalid_settings")
-        if len(profile) > MAX_PROFILE_CHARS:
-            raise DraftValidationError("settings_too_large")
+        # profile 길이는 여기서 확인하지 않는다 — patch_draft가 반영 뒤
+        # _guard_draft_limits(updated.settings, updated.sources)로 한 번에 확인한다.
         name = settings.get("name", current.settings.name)
         if not name.strip():
             raise DraftValidationError("invalid_settings")
@@ -890,9 +898,9 @@ class PostgresPersonaStore:
             content = str(item["content"])
             if not content.strip():
                 raise DraftValidationError("invalid_source")
+            # 길이 상한은 여기서 확인하지 않는다 — patch_draft가 반영 뒤
+            # _guard_draft_limits로 kind별·합계 상한을 한 번에 확인한다.
             encoded = content.encode("utf-8")
-            if len(encoded) > MAX_SOURCE_BYTES:
-                raise DraftValidationError("source_too_large", status=413)
             # 파일명은 표시용 basename이다. 경로 성분이 있으면 그대로 저장하지 않는다.
             filename = item.get("filename")
             if filename is not None:
@@ -921,14 +929,60 @@ class PostgresPersonaStore:
                 ),
             )
 
-    def _guard_draft_limits(self, draft: Draft) -> None:
-        """초안 전체 원문 상한(5절). 반영 뒤에 실제 저장량으로 확인한다.
+    def _guard_draft_limits(
+        self, settings: DraftSettings, sources: tuple[DraftSource, ...]
+    ) -> None:
+        """§4-6 글자 상한. create_draft(반영 전)·patch_draft(반영 후 재조회) 양쪽이 쓴다.
 
-        각 자료를 넣기 전에 따로 세면 여러 건을 한 번에 보낸 요청이 합계를 넘길 수 있다.
+        각 자료를 넣기 전에 따로 세면 여러 건을 한 번에 보낸 요청이 합계를 넘길 수 있다 —
+        patch_draft는 그래서 반영(INSERT/UPDATE) 뒤 실제 저장량으로 이 함수를 부른다.
+        코드포인트(len()) 기준이다 — MAX_PROFILE_CHARS와 같은 이유로 UTF-8 바이트가 아니다.
+
+        같은 kind로 소스가 여러 개일 수 있다(id 없이 upsert하면 새 소스가 생긴다 —
+        여러 파일을 같은 kind로 나눠 넣는 경우). kind별 상한은 그 kind의 소스 **합**에
+        적용한다 — 소스 하나씩 따로 보면 여러 개로 쪼개서 상한을 우회할 수 있다.
         """
-        total = sum(source.byte_size for source in draft.sources)
-        if total > MAX_DRAFT_TOTAL_BYTES:
-            raise DraftValidationError("storage_quota_exceeded", status=413)
+        if len(settings.profile) > MAX_PROFILE_CHARS:
+            raise DraftValidationError(
+                "settings_too_large", fields=[{"field": "profile", "code": "max_length_exceeded"}]
+            )
+
+        by_kind: dict[str, list[DraftSource]] = {}
+        for source in sources:
+            by_kind.setdefault(source.kind, []).append(source)
+
+        for kind in ("events", "relationships", "abilities"):
+            kind_total = sum(len(source.content) for source in by_kind.get(kind, ()))
+            if kind_total > MAX_BODY_KIND_CHARS:
+                raise DraftValidationError(
+                    "settings_too_large",
+                    fields=[{"field": kind, "code": "max_length_exceeded"}],
+                )
+
+        speech_sources = by_kind.get("speech_examples", ())
+        for source in speech_sources:
+            for line in source.content.split("\n"):
+                if len(line) > MAX_SPEECH_LINE_CHARS:
+                    raise DraftValidationError(
+                        "settings_too_large",
+                        fields=[{"field": "speech_examples", "code": "line_too_long"}],
+                    )
+        speech_total = sum(len(source.content) for source in speech_sources)
+        if speech_total > MAX_SPEECH_CHARS:
+            raise DraftValidationError(
+                "settings_too_large",
+                fields=[{"field": "speech_examples", "code": "max_length_exceeded"}],
+            )
+
+        # kind="profile" 소스는 드물고(웹 클라이언트는 보내지 않는다) kind별 상한이
+        # 정해져 있지 않다 — 옛 바이트 검사도 이 kind를 예외 취급하지 않았던 것과 같은
+        # 이유로, 아래 합계 검사에만 포함시킨다.
+        total = sum(len(source.content) for source in sources)
+        if total > MAX_DRAFT_TOTAL_CHARS:
+            raise DraftValidationError(
+                "settings_too_large",
+                fields=[{"field": "sources", "code": "max_total_length_exceeded"}],
+            )
 
     def is_ready(self) -> bool:
         """필수 테이블과 migration revision을 짧게 확인한다.
