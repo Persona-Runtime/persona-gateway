@@ -27,6 +27,10 @@ DISCARD_DRAFT_OPERATION = "discard_draft"
 # 계약 5절이 정한 자료 상한. 파일 하나와 초안 전체가 다른 값이다.
 MAX_SOURCE_BYTES = 1_048_576
 MAX_DRAFT_TOTAL_BYTES = 5_242_880
+# §4-6 갱신(2026-09-18). profile은 항상 프롬프트 블록 2에 전문이 들어가고 그 블록의
+# 예산이 2,000자(시스템 지시 포함)라, 상한을 그 예산 안에 여유 있게 들어가는 값으로
+# 낮춰 잘림 없이 항상 전문이 프롬프트에 들어가게 한다.
+MAX_PROFILE_CHARS = 1500
 DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_examples")
 # readiness가 받아들이는 migration revision.
 #
@@ -588,6 +592,9 @@ class PostgresPersonaStore:
                     if cur.fetchone() is not None:
                         raise DraftAlreadyExists
 
+                    if len(settings.profile) > MAX_PROFILE_CHARS:
+                        raise DraftValidationError("settings_too_large")
+
                     cur.execute(
                         """
                         INSERT INTO persona_minimal.material_versions
@@ -823,6 +830,8 @@ class PostgresPersonaStore:
         if not profile.strip():
             # 5절: 최종 초안에서도 비공백 profile은 필수다.
             raise DraftValidationError("invalid_settings")
+        if len(profile) > MAX_PROFILE_CHARS:
+            raise DraftValidationError("settings_too_large")
         name = settings.get("name", current.settings.name)
         if not name.strip():
             raise DraftValidationError("invalid_settings")

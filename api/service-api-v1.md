@@ -78,8 +78,9 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 | GET | `/v1/personas/{persona_id}/draft` | 200 Draft | 설정·원문·주의사항과 revision 조회 |
 | PATCH | `/v1/personas/{persona_id}/draft` | 200 Draft | expected_revision, 실행 중 수정 금지 |
 | DELETE | `/v1/personas/{persona_id}/draft` | 204 | query expected_revision, 실행 종료 확인 |
-| POST | `/v1/personas/{persona_id}/draft/process` | 202 JobAccepted | 변경 자료 처리, 실행 중 중복 금지 |
-| POST | `/v1/personas/{persona_id}/draft/activate` | 200 Activated | 최신 검증 revision만 원자 전환 |
+| POST | `/v1/personas/{persona_id}/draft/process` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
+| POST | `/v1/personas/{persona_id}/draft/activate` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
+| POST | `/v1/personas/{persona_id}/draft/apply` | 202 `{version_id, status}` | expected_revision 불일치 409 `revision_mismatch`, 진행 중 409 `indexing_in_progress`, 자료 없음 422 `no_content` |
 | POST | `/v1/personas/{persona_id}/conversations` | 201 Conversation | 적용본 필요, GPU 가용성은 생성 조건 아님 |
 | GET | `/v1/personas/{persona_id}/conversations` | 200 ConversationPage | 캐릭터별 소유자 목록 |
 | GET | `/v1/conversations/{conversation_id}/messages` | 200 MessagePage | 질문별 생성 시도·저장된 부분 답변 |
@@ -91,7 +92,7 @@ draft는 `editing / processing / ready / failed`다. 수정 시 revision이 증�
 | GET | `/v1/service-status` | 200 ServiceStatus | 안내용 snapshot, 처리 시 다시 확인 |
 | GET | `/v1/personas/{persona_id}/retrieve` | 200 RetrieveResult | 디버그 전용 — `PERSONA_RETRIEVE_DEBUG_ENABLED`(기본 false) 꺼지면 404. q 1~2000자, k 1~10(기본 5) |
 
-25 operations / 17 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
+24 operations / 18 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
 이전 설계에서 추가로 논의하지 않은 대화 삭제·응답 편집·정상 응답 재생성·실행 중 ingestion 사용자 취소 API는 만들지 않는다.
 
 ## 4. 접수와 중복 방지
@@ -119,7 +120,7 @@ API 의미에 영향 없는 JSON key 순서는 제외하고, 반복 파일·텍�
 
 최초 `/uploads`는 기존 multipart 규칙을 유지한다. 텍스트 part는 profile/events/relationships/abilities/speech_examples,
 파일 part는 반복 가능한 `files.<kind>`다. 범용 files, URL 수집, PDF/HWP/자막 입력은 지원하지 않는다.
-UTF-8, 비공백 필수 profile, 파일당 1 MiB, 전체 원문 5 MiB, 파일 총 20개, multipart 6 MiB 상한을 사용한다.
+UTF-8, 비공백 필수 profile(1,500자 상한 — 프롬프트 블록 2 예산 안에 항상 전문이 들어가게 함, 초과 시 422 `settings_too_large`), 파일당 1 MiB, 전체 원문 5 MiB, 파일 총 20개, multipart 6 MiB 상한을 사용한다.
 20개/6 MiB는 기존 구현값을 계약 초안에 보존한 것이다. 파일 MIME만으로 본문·확장자 검증을 생략하지 않는다.
 NUL·잘못된 UTF-8·알 수 없는 필드·동일 ID의 상충 수정은 거부한다. 파일명은 표시용 basename이며 경로나 명령으로 사용하지 않는다.
 최종 초안에서도 비공백 profile은 필수다. 삭제/편집으로 이를 없애면 422이며 이름 중복은 편집 검증과 실제 적용 시점 모두 확인한다.

@@ -882,7 +882,7 @@
         "tags": [
           "Drafts"
         ],
-        "description": "수정된 검색 자료의 새 처리 접수",
+        "description": "수정된 검색 자료의 새 처리 접수. 미구현·대체됨 — draft/apply가 처리+적용을 한 번에 한다.",
         "parameters": [
           {
             "in": "path",
@@ -948,7 +948,8 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/v1/personas/{persona_id}/draft/activate": {
@@ -958,7 +959,7 @@
         "tags": [
           "Drafts"
         ],
-        "description": "검증한 최신 초안 활성화",
+        "description": "검증한 최신 초안 활성화. 미구현·대체됨 — draft/apply가 처리+적용을 한 번에 한다.",
         "parameters": [
           {
             "in": "path",
@@ -1024,7 +1025,8 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/v1/personas/{persona_id}/conversations": {
@@ -1674,6 +1676,82 @@
           }
         }
       }
+    },
+    "/v1/personas/{persona_id}/draft/apply": {
+      "post": {
+        "operationId": "applyDraft",
+        "summary": "초안 검색 자료를 색인하고 백그라운드에서 적용",
+        "tags": [
+          "Drafts"
+        ],
+        "description": "초안 자료를 청킹·임베딩해 검색 색인을 갱신한다. 처리는 응답 뒤 백그라운드에서 계속되고, 202는 접수만 뜻한다. expected_revision이 지금 초안과 다르면 409 revision_mismatch, 이미 진행 중이면 409 indexing_in_progress, 색인할 자료가 없으면 422 no_content.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "persona_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "초안 검색 자료를 색인하고 백그라운드에서 적용",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftApplyAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1760,7 +1838,8 @@
           },
           "profile": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 1500
           },
           "speech_examples": {
             "type": "string"
@@ -2961,7 +3040,8 @@
               },
               "profile": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 1500
               },
               "speech_examples": {
                 "type": "string"
@@ -3315,6 +3395,26 @@
           "indexed_revision",
           "body",
           "speech"
+        ]
+      },
+      "DraftApplyAccepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "processing"
+            ]
+          }
+        },
+        "required": [
+          "version_id",
+          "status"
         ]
       }
     },

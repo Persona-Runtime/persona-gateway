@@ -384,6 +384,29 @@ def test_patch_rejects_contract_violations(store: PostgresPersonaStore) -> None:
         patch(upsert=[{"kind": "events", "content": "가" * 400_000}])
     assert too_large.value.status == 413
 
+    # profile 1,500자 상한(§4-6, 2026-09-18 갱신) — 경계값 양쪽.
+    # patch()는 revision을 클로저로 참조하므로, 성공한 patch 뒤에는 새 revision을
+    # 반영해야 다음 호출이 RevisionConflict가 아니라 원하는 예외로 실패한다.
+    updated = patch(settings={"profile": "가" * 1500})  # 정확히 상한은 통과한다.
+    revision = updated.revision
+    with pytest.raises(DraftValidationError) as profile_too_large:
+        patch(settings={"profile": "가" * 1501})
+    assert profile_too_large.value.code == "settings_too_large"
+    assert profile_too_large.value.status == 422
+
+
+def test_create_draft_rejects_profile_over_max_chars(store: PostgresPersonaStore) -> None:
+    owner, persona = _persona_for(store)
+
+    with pytest.raises(DraftValidationError) as too_large:
+        store.create_draft(owner, persona.id, _settings(profile="가" * 1501), uuid4())
+    assert too_large.value.code == "settings_too_large"
+    assert too_large.value.status == 422
+
+    # 정확히 상한은 통과한다 — 초안이 실제로 만들어지는지까지 확인.
+    created = store.create_draft(owner, persona.id, _settings(profile="가" * 1500), uuid4())
+    assert created.settings.profile == "가" * 1500
+
 
 def test_discard_removes_draft_and_sources(store: PostgresPersonaStore) -> None:
     owner, persona = _persona_for(store)
