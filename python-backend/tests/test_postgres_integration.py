@@ -233,13 +233,18 @@ def test_readyz_requires_the_revision_this_release_supports(
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    # 0003은 0002와 함께 허용하는 호환 릴리스다(material_chunks 배포 공백을 없앤다).
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0002_persona_draft", "0003_material_chunks")
+    # 2026-09-19 호환 릴리스: 0003·0002에 0001까지 함께 허용한다(migration이 아직
+    # 적용되지 않은 환경에서도 이 이미지가 Ready가 되게 하려는 목적). 0001에서
+    # readyz가 여전히 통과해야 하는 이유·초안 엔드포인트가 별도로 막히는 이유는
+    # test_compat_release_allows_readyz_and_personas_but_blocks_draft_at_0001.
+    assert SUPPORTED_ALEMBIC_REVISIONS == (
+        "0001_persona_minimal",
+        "0002_persona_draft",
+        "0003_material_chunks",
+    )
+    assert _readyz_with_revision(store, "0001_persona_minimal") == 200
     assert _readyz_with_revision(store, "0002_persona_draft") == 200
     assert _readyz_with_revision(store, "0003_material_chunks") == 200
-    # 이 릴리스는 초안 테이블을 쓰므로 0001에서 Ready가 되면 안 된다. 그렇게 되면
-    # migration이 누락된 환경에서 트래픽을 받은 뒤 요청이 테이블 부재로 실패한다.
-    assert _readyz_with_revision(store, "0001_persona_minimal") == 503
 
 
 def test_readyz_rejects_unknown_revision(store: PostgresPersonaStore) -> None:
@@ -249,6 +254,56 @@ def test_readyz_rejects_unknown_revision(store: PostgresPersonaStore) -> None:
     목록에 없는 revision이 DB에 있으면 그 파드는 트래픽을 받지 못한다.
     """
     assert _readyz_with_revision(store, "9999_not_a_real_revision") == 503
+
+
+def test_compat_release_allows_readyz_and_personas_but_blocks_draft_at_0001(
+    store: PostgresPersonaStore,
+) -> None:
+    """호환 릴리스(0001 허용) 동안 readyz·캐릭터 조회는 통과하고 초안만 409로 막힌다.
+
+    0001을 SUPPORTED_ALEMBIC_REVISIONS에 넣은 목적 자체가 migration이 늦게 도착해도
+    이 이미지가 Ready이게 하는 것이라, 캐릭터 목록 조회도 함께 통과해야 롤아웃이
+    막히지 않는다. 초안(material_versions 등)은 0002 이전엔 테이블이 없어 500 대신
+    409 schema_not_ready로 답해야 한다.
+
+    _set_revision은 alembic_version 마커만 바꾸고 물리 스키마는 head 그대로 둔다 —
+    여기서 `/v1/personas` 200이 진짜 0001 물리 스키마(테이블이 실제로 없는 상태)에서도
+    통과함을 증명하지는 않는다. list_personas·get_persona도 material_versions를
+    LEFT JOIN하므로, 실제로 테이블이 없는 환경에서는 이 응답이 다르게 실패할 수
+    있다 — 이 테스트 기법의 한계로 완료 보고에 명시한다.
+    """
+    settings = _readiness_settings()
+    persona = store.create_persona(settings.static_user_id, "통합 사용자", "0001 테스트", uuid4())
+
+    with store.pool.connection() as connection:
+        original = connection.execute(
+            "SELECT version_num FROM persona_minimal.alembic_version"
+        ).fetchone()[0]
+    _set_revision(store, "0001_persona_minimal")
+    try:
+        with TestClient(create_app(settings, store)) as app:
+            headers = {
+                "Authorization": "Bearer integration-token",
+                "Idempotency-Key": str(uuid4()),
+            }
+            assert app.get("/readyz").status_code == 200
+            assert app.get("/v1/personas", headers=headers).status_code == 200
+
+            response = app.post(
+                f"/v1/personas/{persona.id}/draft",
+                headers=headers,
+                json={
+                    "settings": {
+                        "name": "이름",
+                        "profile": "소개",
+                        "speech_examples": "",
+                    }
+                },
+            )
+            assert response.status_code == 409
+            assert response.json()["error"]["code"] == "schema_not_ready"
+    finally:
+        _set_revision(store, original)
 
 
 def _settings(profile: str = "침착한 도서관 안내자다.") -> DraftSettings:

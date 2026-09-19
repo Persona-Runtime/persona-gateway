@@ -34,6 +34,7 @@ from .repository import (
     PersonaLimitExceeded,
     PersonaNotFound,
     RevisionConflict,
+    SchemaNotReady,
     ReadinessStore,
     PersonaStore,
     PostgresPersonaStore,
@@ -455,6 +456,14 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
                 "초안 수정을 처리할 수 없습니다.",
                 fields=error.fields,
             )
+        if isinstance(error, SchemaNotReady):
+            # 2026-09-19 호환 릴리스: migration이 아직 초안 스키마를 만들지 않은
+            # revision(0001)이다. 500이 아니라 재시도 가능함을 알리는 409로 답한다.
+            return ApiError(
+                409,
+                "schema_not_ready",
+                "아직 이 기능을 쓸 수 없습니다. 잠시 후 다시 시도해주세요.",
+            )
         raise error
 
     @app.get("/v1/personas/{persona_id}")
@@ -618,6 +627,12 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
             result = embed(request.app.state.settings.embedding_url, [q], "query")
         except PersonaNotFound as error:
             raise ApiError(404, "persona_not_found", "캐릭터를 찾을 수 없습니다.") from error
+        except SchemaNotReady as error:
+            raise ApiError(
+                409,
+                "schema_not_ready",
+                "아직 이 기능을 쓸 수 없습니다. 잠시 후 다시 시도해주세요.",
+            ) from error
         except NotIndexed as error:
             raise ApiError(409, "not_indexed", "아직 색인된 자료가 없습니다.") from error
         except EmbeddingError as error:
