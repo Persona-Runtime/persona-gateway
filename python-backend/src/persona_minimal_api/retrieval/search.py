@@ -15,7 +15,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from ..indexing.embedding_client import embed
-from ..repository import NotIndexed, PersonaNotFound
+from ..repository import NotIndexed, PersonaNotFound, require_draft_schema
 from .metrics import RETRIEVAL_SECONDS
 
 # §8 Q5 확정 — 골든셋 전 변경 금지.
@@ -80,6 +80,7 @@ def load_indexed_version(
     """
     with pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cur:
+            require_draft_schema(cur)
             cur.execute(
                 "SELECT mv.version_id, mv.indexed_revision "
                 "FROM persona_minimal.material_versions AS mv "

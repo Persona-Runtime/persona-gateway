@@ -46,7 +46,35 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 목록을 넓히는 것은 호환 릴리스의 역할이지 기본값이 아니다. 새 migration을 배포할 때는
 # 구·신 revision을 함께 허용하는 호환 릴리스를 먼저 내보내 공백을 없앤다.
 # 배포 순서와 롤백 규칙은 docs/migrations.md.
-SUPPORTED_ALEMBIC_REVISIONS = ("0002_persona_draft", "0003_material_chunks")
+#
+# 2026-09-19 호환 릴리스: "0001_persona_minimal"을 추가한다. 이 이미지는 기능 코드가
+# 이미 head라 0001에서도 뜰 수 있어야 migration이 아직 안 끝난 환경에서도 롤아웃이
+# 막히지 않는다. migration이 실제로 끝난 뒤에는 이 목록을 (0002, 0003)으로 좁히는
+# 후속 커밋이 필요하다(docs/migrations.md).
+SUPPORTED_ALEMBIC_REVISIONS = (
+    "0001_persona_minimal",
+    "0002_persona_draft",
+    "0003_material_chunks",
+)
+# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 위 목록은
+# readyz 호환용으로 0001까지 넓혔지만, 초안 관련 엔드포인트는 0001에 그 테이블 자체가
+# 없어 이 완화를 그대로 쓸 수 없다 — 별도로 좁혀 둔다.
+DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks")
+
+
+def require_draft_schema(cur) -> None:
+    """alembic_version 마커만 읽어 초안 스키마 존재 여부를 가볍게 판정한다.
+
+    is_ready()의 to_regclass 방식(테이블 실재를 직접 확인)과 다르게 마커만 본다 —
+    호출자가 뒤이어 material_versions 등을 어차피 SELECT/INSERT할 것이므로, 여기서는
+    "0001인데 초안 API를 불렀다"는 사용자 친화적인 409를 먼저 내는 것이 목적이다.
+    호출자는 dict_row cursor를 넘겨야 한다.
+    """
+    cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
+    row = cur.fetchone()
+    version = row["version_num"] if row else None
+    if version not in DRAFT_SCHEMA_REVISIONS:
+        raise SchemaNotReady
 
 
 class SafePoolLogFilter(logging.Filter):
@@ -119,6 +147,16 @@ class NoSourcesToIndex(Exception):
 class NotIndexed(Exception):
     """캐릭터·초안은 있지만 성공한 색인이 한 번도 없다(indexed_revision IS NULL).
     검색할 대상 자체가 없다."""
+
+
+class SchemaNotReady(Exception):
+    """migration이 아직 초안 스키마(material_versions 등)를 만들지 않았다(0001).
+
+    2026-09-19 호환 릴리스 동안 SUPPORTED_ALEMBIC_REVISIONS는 0001도 허용해 readyz는
+    통과하지만, 초안 관련 엔드포인트는 실제 테이블이 없어 500 대신 이 예외로 먼저
+    끊는다. list_personas·get_persona는 이 검사를 받지 않는다 — 두 조회는 0001에서도
+    정상 응답해야 한다(docs/migrations.md 배포 순서 참고).
+    """
 
 
 class DraftValidationError(Exception):
@@ -548,6 +586,7 @@ class PostgresPersonaStore:
     def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft:
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
+                require_draft_schema(cur)
                 cur.execute(
                     """
                     SELECT 1 FROM persona_minimal.personas
@@ -575,6 +614,7 @@ class PostgresPersonaStore:
         with self.pool.connection() as connection:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
+                    require_draft_schema(cur)
                     self._lock_persona(cur, owner_subject, persona_id)
                     cur.execute(
                         """
@@ -710,6 +750,7 @@ class PostgresPersonaStore:
         with self.pool.connection() as connection:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
+                    require_draft_schema(cur)
                     self._lock_persona(cur, owner_subject, persona_id)
                     # 초안 행까지 잠근다. 위의 캐릭터 잠금만으로는 같은 캐릭터의
                     # 동시 PATCH가 같은 revision을 읽는 것을 막지 못한다.
@@ -757,6 +798,9 @@ class PostgresPersonaStore:
         try:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
+                    # advisory lock을 잡기 전에 확인한다 — 여기서 실패하면 아직 아무
+                    # 잠금도 없어 뒤따르는 unlock 없이 바로 예외를 던져도 된다.
+                    require_draft_schema(cur)
                     self._lock_persona(cur, owner_subject, persona_id)
 
                     cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (str(persona_id),))
