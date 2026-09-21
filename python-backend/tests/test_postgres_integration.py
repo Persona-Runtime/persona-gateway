@@ -233,18 +233,16 @@ def test_readyz_requires_the_revision_this_release_supports(
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    # 2026-09-19 호환 릴리스: 0003·0002에 0001까지 함께 허용한다(migration이 아직
-    # 적용되지 않은 환경에서도 이 이미지가 Ready가 되게 하려는 목적). 0001에서
-    # readyz가 여전히 통과해야 하는 이유·초안 엔드포인트가 별도로 막히는 이유는
-    # test_compat_release_allows_readyz_and_personas_but_blocks_draft_at_0001.
-    assert SUPPORTED_ALEMBIC_REVISIONS == (
-        "0001_persona_minimal",
-        "0002_persona_draft",
-        "0003_material_chunks",
-    )
-    assert _readyz_with_revision(store, "0001_persona_minimal") == 200
-    assert _readyz_with_revision(store, "0002_persona_draft") == 200
+    # 호환 창을 닫았다(2026-09-21) — 2026-09-19 호환 릴리스가 잠깐 0001까지
+    # 허용했던 것은 migration 0002·0003이 실제로 운영에 적용되고 복원 리허설까지
+    # 통과한 뒤 원래대로 좁혔다. 그 창이 열려 있던 동안의 동작(0001에서도 readyz
+    # 통과, 초안만 별도로 막힘)은
+    # test_list_personas_and_get_persona_still_work_when_revision_unsupported에서
+    # "호환 창 도구"가 계속 정확히 동작하는지로 형태를 바꿔 검증한다.
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0003_material_chunks",)
     assert _readyz_with_revision(store, "0003_material_chunks") == 200
+    assert _readyz_with_revision(store, "0002_persona_draft") == 503
+    assert _readyz_with_revision(store, "0001_persona_minimal") == 503
 
 
 def test_readyz_rejects_unknown_revision(store: PostgresPersonaStore) -> None:
@@ -256,21 +254,28 @@ def test_readyz_rejects_unknown_revision(store: PostgresPersonaStore) -> None:
     assert _readyz_with_revision(store, "9999_not_a_real_revision") == 503
 
 
-def test_compat_release_allows_readyz_and_personas_but_blocks_draft_at_0001(
+def test_list_personas_and_get_persona_still_work_when_revision_unsupported(
     store: PostgresPersonaStore,
 ) -> None:
-    """호환 릴리스(0001 허용) 동안 readyz·캐릭터 조회는 통과하고 초안만 409로 막힌다.
+    """호환 창이 닫힌 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0003 하나)에도, 그 밖의
+    revision에서 readyz는 정확히 503을 내면서 캐릭터 조회는 계속 통과하고 초안만
+    409로 막히는지 확인한다.
 
-    0001을 SUPPORTED_ALEMBIC_REVISIONS에 넣은 목적 자체가 migration이 늦게 도착해도
-    이 이미지가 Ready이게 하는 것이라, 캐릭터 목록 조회도 함께 통과해야 롤아웃이
-    막히지 않는다. 초안(material_versions 등)은 0002 이전엔 테이블이 없어 500 대신
-    409 schema_not_ready로 답해야 한다.
+    2026-09-19 호환 릴리스 때는 0001도 SUPPORTED_ALEMBIC_REVISIONS에 있어 readyz가
+    200이었다(migration이 늦게 도착해도 롤아웃이 막히지 않게 하려는 목적). 호환
+    창을 닫은 지금은 0001·0002가 더 이상 지원 revision이 아니므로 readyz는 503이
+    맞다 — 하지만 list_personas·get_persona는 SUPPORTED_ALEMBIC_REVISIONS가 아니라
+    draft_schema_ready(DRAFT_SCHEMA_REVISIONS 기준, 더 넓다)로만 분기하므로 이번
+    좁히기의 영향을 받지 않는다. 이 "호환 창 도구"들이 창이 닫힌 뒤에도 여전히
+    정확하게 동작하는지가 이 테스트의 요점이다 — 다음 호환 릴리스(0004)에서 같은
+    코드를 다시 쓸 것이므로.
 
     _set_revision은 alembic_version 마커만 바꾸고 물리 스키마는 head 그대로 둔다 —
     여기서 `/v1/personas` 200이 진짜 0001 물리 스키마(테이블이 실제로 없는 상태)에서도
     통과함을 증명하지는 않는다. list_personas·get_persona도 material_versions를
     LEFT JOIN하므로, 실제로 테이블이 없는 환경에서는 이 응답이 다르게 실패할 수
-    있다 — 이 테스트 기법의 한계로 완료 보고에 명시한다.
+    있다 — 물리적으로 재현하는 버전은
+    test_list_personas_and_get_persona_still_work_on_physically_downgraded_0001.
     """
     settings = _readiness_settings()
     persona = store.create_persona(settings.static_user_id, "통합 사용자", "0001 테스트", uuid4())
@@ -286,7 +291,7 @@ def test_compat_release_allows_readyz_and_personas_but_blocks_draft_at_0001(
                 "Authorization": "Bearer integration-token",
                 "Idempotency-Key": str(uuid4()),
             }
-            assert app.get("/readyz").status_code == 200
+            assert app.get("/readyz").status_code == 503
             assert app.get("/v1/personas", headers=headers).status_code == 200
 
             response = app.post(
@@ -714,13 +719,14 @@ def test_migration_0003_upgrade_and_downgrade_round_trip(round_trip_database_url
             os.environ["DATABASE_URL"] = old
 
 
-def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
+def test_list_personas_and_get_persona_still_work_on_physically_downgraded_0001(
     round_trip_database_url: str,
 ) -> None:
     """0001까지만 물리적으로 내려간 DB(마커가 아니라 테이블 자체가 없는 상태)에서도
-    list_personas·get_persona가 500이 아니라 200을 내는지 확인한다.
+    list_personas·get_persona가 500이 아니라 200을 내는지 확인한다. 호환 창을
+    닫은 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0003 하나)에는 이 상태에서 readyz가
+    200이 아니라 503이어야 정확하다 — 0001은 더 이상 지원 revision이 아니다.
 
-    docs/migrations.md "2026-09-19 호환 릴리스" 절의 미검증 caveat을 닫는 테스트다.
     다른 테스트들이 쓰는 `_set_revision`은 alembic_version 마커만 바꾸고 물리 스키마는
     head로 둔다 — LEFT JOIN이 참조하는 테이블이 실제로 없으면 PostgreSQL은 조인 종류와
     무관하게 예외를 던지므로, 그 기법으로는 이 위험을 재현하지 못한다. 실제로
@@ -732,6 +738,12 @@ def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
     같은 사고(create_pool의 register_vector가 확장 없이 실패 → PoolTimeout →
     CrashLoop)를 못 잡았다. 그래서 DROP EXTENSION까지 직접 실행해 진짜 운영 상태를
     재현한다(persona-platform/runbooks/gate3-4-apply-record-2026-09-19.md §2-14).
+
+    이 테스트가 검증하는 대상(lifespan의 UndefinedTable 처리, list_personas·
+    get_persona의 무-조인 분기)은 "호환 창 도구"다 — 호환 창이 닫혀 평시엔 이
+    코드 경로에 닿지 않지만(readyz가 항상 0003이어야 통과하므로), 다음 호환
+    릴리스(0004)에서 실제로 다시 실행된다. 그래서 창을 닫은 뒤에도 이 테스트를
+    지우지 않고 readyz 기대값만 고쳐 계속 돌린다.
 
     `round_trip_database_url`(위 round-trip 테스트와 공유하는 별도 컨테이너)을 쓴다 —
     `store` fixture(모듈 전체가 head 스키마를 전제로 공유)에 downgrade를 걸면 그 뒤에
@@ -769,9 +781,11 @@ def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
 
             with TestClient(create_app(settings, store)) as app:
                 # 이 with 진입 자체가 lifespan(시작 훅)을 태운다 — 원래 버그(시작 훅이
-                # 0001에서 예외를 던져 앱이 안 뜨던 것)가 바로 여기서 잡혔다. readyz를
-                # 명시적으로 확인해 "시작 훅을 통과했다"는 사실을 눈에 보이게 남긴다.
-                assert app.get("/readyz").status_code == 200
+                # 0001에서 예외를 던져 앱이 안 뜨던 것)가 바로 여기서 잡혔다. 호환
+                # 창을 닫은 뒤에는 0001이 지원 revision이 아니므로 503이 맞다 —
+                # 그래도 시작 훅 자체는 죽지 않고 통과해야 한다(503을 "정상 응답"으로
+                # 낼 수 있어야 하고, 그러려면 애초에 앱이 뜰 수 있어야 한다).
+                assert app.get("/readyz").status_code == 503
 
                 headers = {
                     "Authorization": "Bearer integration-token",
