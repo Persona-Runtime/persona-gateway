@@ -18,6 +18,8 @@ from psycopg_pool import PoolTimeout
 from .cursor import PersonaCursor
 from .indexing.chunker import CHUNKABLE_KINDS
 
+logger = logging.getLogger(__name__)
+
 MAX_PERSONAS_PER_USER = 3
 CREATE_PERSONA_OPERATION = "create_persona"
 CREATE_PERSONA_SCOPE = "/v1/personas"
@@ -1112,6 +1114,40 @@ def _statement_timeout_value(deadline: float) -> str:
     return f"{max(1, int(_remaining_seconds(deadline) * 1000))}ms"
 
 
+def _configure_connection(conn: Connection) -> None:
+    """pgvector 타입 어댑터를 조건부로 등록한다.
+
+    pgvector 타입 어댑터는 연결마다 따로 등록해야 한다(전역이 아니다). 등록해 두지
+    않으면, material_chunks.embedding을 읽는 쪽이 register_vector를 몰라 vector를
+    "[0.1,0.2,...]" 문자열로 받는다 — 등록한 쪽만 올바른 값을 본다.
+
+    register_vector는 그 DB에 CREATE EXTENSION vector가 돼 있어야 성공한다. 확장은
+    migration 0003에서만 만들어지므로, 0001 호환 릴리스가 허용하는 DB에는 없을 수
+    있다 — 없는데 무조건 부르면 그 연결 자체가 실패해 pool이 새 연결을 계속 못 얻고
+    PoolTimeout으로 번진다(실측 2026-09-21: 운영 CrashLoop, persona-platform/
+    runbooks/gate3-4-apply-record-2026-09-19.md §2-14). try/except로 실패를 삼키지
+    않는다 — 권한 부족 등 다른 이유의 실패는 그대로 드러나야 한다. 대신 존재 여부를
+    직접 조회해 판정한다.
+
+    0002·0003에서 이 어댑터가 필요한 코드(retrieval/search.py의 search(),
+    indexing/store.py의 replace_chunks())는 전부 require_draft_schema 가드
+    뒤에서만 실행된다 — 0001에서 이 어댑터를 건너뛰어도 그 경로에는 닿지 않는다.
+
+    조회 뒤 반드시 commit한다 — psycopg_pool은 configure 함수가 끝난 뒤 연결이
+    IDLE 상태가 아니면 그 연결을 그 자리에서 버린다(ProgrammingError). autocommit이
+    아닌 연결에서 SELECT 하나만 해도 트랜잭션이 열린 채로 남아, 이 commit이 없으면
+    매 연결마다 이 조회 자체가 원인이 되어 버려지고 pool이 새 연결을 못 얻어
+    PoolTimeout으로 번진다(실측 — register_vector를 건너뛰도록 처음 고쳤을 때
+    이 commit을 빠뜨려 같은 증상이 그대로 재현됐다).
+    """
+    exists = conn.execute("SELECT 1 FROM pg_type WHERE typname = 'vector'").fetchone()
+    conn.commit()
+    if exists is None:
+        logger.warning("pgvector adapter skipped: vector type not installed")
+        return
+    register_vector(conn)
+
+
 def create_pool(database_url: str, timeout_seconds: float) -> ConnectionPool:
     configure_pool_logging()
     pool = ConnectionPool(
@@ -1124,10 +1160,7 @@ def create_pool(database_url: str, timeout_seconds: float) -> ConnectionPool:
         max_size=8,
         timeout=timeout_seconds,
         open=False,
-        # pgvector 타입 어댑터는 연결마다 따로 등록해야 한다(전역이 아니다). 여기서
-        # 등록해 두지 않으면, material_chunks.embedding을 읽는 쪽이 register_vector를
-        # 몰라 vector를 "[0.1,0.2,...]" 문자열로 받는다 — 등록한 쪽만 올바른 값을 본다.
-        configure=register_vector,
+        configure=_configure_connection,
     )
     # DB가 꺼져 있어도 healthz를 제공해야 하므로, 기동 중 연결 성공을 기다리지 않는다.
     pool.open(wait=False)
