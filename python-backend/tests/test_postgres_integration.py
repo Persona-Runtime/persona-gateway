@@ -647,6 +647,13 @@ def _table_exists(connection, schema: str, table: str) -> bool:
     return bool(count)
 
 
+def _extension_exists(connection, name: str) -> bool:
+    count = connection.execute(
+        "SELECT count(*) FROM pg_extension WHERE extname = %s", (name,)
+    ).fetchone()[0]
+    return bool(count)
+
+
 def test_migration_0003_upgrade_and_downgrade_round_trip(round_trip_database_url: str) -> None:
     root = Path(__file__).resolve().parents[1]
     old = os.environ.get("DATABASE_URL")
@@ -719,6 +726,13 @@ def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
     무관하게 예외를 던지므로, 그 기법으로는 이 위험을 재현하지 못한다. 실제로
     downgrade해야만 진짜 위험을 재현할 수 있다.
 
+    downgrade만으로는 부족하다는 게 2026-09-21 운영 사고로 드러났다 — downgrade는
+    테이블만 지우고 CREATE EXTENSION vector는 그대로 남긴다. 운영 0001 DB는 애초에
+    그 확장을 만든 적이 없어서 없었는데, 이 테스트는 확장이 남아 있는 채로 통과해
+    같은 사고(create_pool의 register_vector가 확장 없이 실패 → PoolTimeout →
+    CrashLoop)를 못 잡았다. 그래서 DROP EXTENSION까지 직접 실행해 진짜 운영 상태를
+    재현한다(persona-platform/runbooks/gate3-4-apply-record-2026-09-19.md §2-14).
+
     `round_trip_database_url`(위 round-trip 테스트와 공유하는 별도 컨테이너)을 쓴다 —
     `store` fixture(모듈 전체가 head 스키마를 전제로 공유)에 downgrade를 걸면 그 뒤에
     도는 다른 테스트가 깨진다.
@@ -730,6 +744,16 @@ def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
         config = Config(str(root / "alembic.ini"))
         command.upgrade(config, "head")
         command.downgrade(config, "0001_persona_minimal")
+
+        # downgrade는 테이블만 지우고 확장은 남긴다 — 운영 0001 DB는 애초에
+        # CREATE EXTENSION 자체를 한 적이 없어 확장이 없다(2026-09-21 CrashLoop
+        # 원인, persona-platform/runbooks/gate3-4-apply-record-2026-09-19.md
+        # §2-14). 여기서 직접 지워야 그 상태를 진짜로 재현한다 — 이 DROP은
+        # create_pool보다 먼저, register_vector를 아직 안 건 일반 연결로 한다
+        # (create_pool로 만든 풀은 그 자체가 지금 재현하려는 문제를 겪는다).
+        with psycopg.connect(round_trip_database_url, autocommit=True) as raw_connection:
+            raw_connection.execute("DROP EXTENSION IF EXISTS vector")
+            assert not _extension_exists(raw_connection, "vector")
 
         pool = create_pool(round_trip_database_url, 2)
         try:
@@ -846,6 +870,23 @@ def test_replace_chunks_round_trips_embedding_and_heading_path(
     # pgvector 어댑터가 pool 생성 시 등록돼 있어야 Vector 객체로 그대로 돌아온다.
     assert row[2].to_list() == _embedding(0.5)
     assert row[3] == "multilingual-e5-small@test"
+
+
+def test_create_pool_registers_vector_adapter_when_extension_present(
+    store: PostgresPersonaStore,
+) -> None:
+    """확장이 있는 DB(store fixture, head 스키마)에서 create_pool의 _configure_
+    connection이 register_vector를 실제로 등록하는지 직접 확인한다.
+
+    위 test_replace_chunks_round_trips_embedding_and_heading_path가 replace_chunks
+    경로를 통해 간접적으로 같은 사실을 확인하지만, 이 테스트는 풀 자체의 배선만
+    떼어서 본다 — SELECT로 만든 리터럴 vector 값이 문자열이 아니라 pgvector Vector
+    객체로 돌아오는지가 기준이다(등록 안 됐으면 "[1,2,3]" 문자열로 온다).
+    """
+    with store.pool.connection() as connection:
+        value = connection.execute("SELECT '[1,2,3]'::vector").fetchone()[0]
+    assert not isinstance(value, str)
+    assert value.to_list() == [1.0, 2.0, 3.0]
 
 
 def test_replace_chunks_removes_previous_chunks_for_the_same_version(
