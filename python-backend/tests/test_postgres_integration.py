@@ -707,6 +707,78 @@ def test_migration_0003_upgrade_and_downgrade_round_trip(round_trip_database_url
             os.environ["DATABASE_URL"] = old
 
 
+def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
+    round_trip_database_url: str,
+) -> None:
+    """0001까지만 물리적으로 내려간 DB(마커가 아니라 테이블 자체가 없는 상태)에서도
+    list_personas·get_persona가 500이 아니라 200을 내는지 확인한다.
+
+    docs/migrations.md "2026-09-19 호환 릴리스" 절의 미검증 caveat을 닫는 테스트다.
+    다른 테스트들이 쓰는 `_set_revision`은 alembic_version 마커만 바꾸고 물리 스키마는
+    head로 둔다 — LEFT JOIN이 참조하는 테이블이 실제로 없으면 PostgreSQL은 조인 종류와
+    무관하게 예외를 던지므로, 그 기법으로는 이 위험을 재현하지 못한다. 실제로
+    downgrade해야만 진짜 위험을 재현할 수 있다.
+
+    `round_trip_database_url`(위 round-trip 테스트와 공유하는 별도 컨테이너)을 쓴다 —
+    `store` fixture(모듈 전체가 head 스키마를 전제로 공유)에 downgrade를 걸면 그 뒤에
+    도는 다른 테스트가 깨진다.
+    """
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+        command.downgrade(config, "0001_persona_minimal")
+
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert not _table_exists(connection, "persona_minimal", "material_versions")
+                assert not _table_exists(connection, "persona_minimal", "material_sources")
+
+            store = PostgresPersonaStore(pool)
+            settings = _readiness_settings()
+            persona = store.create_persona(
+                settings.static_user_id, "통합 사용자", "0001 물리 테스트", uuid4()
+            )
+
+            with TestClient(create_app(settings, store)) as app:
+                headers = {
+                    "Authorization": "Bearer integration-token",
+                    "Idempotency-Key": str(uuid4()),
+                }
+                list_response = app.get("/v1/personas", headers=headers)
+                assert list_response.status_code == 200, list_response.text
+
+                detail_response = app.get(f"/v1/personas/{persona.id}", headers=headers)
+                assert detail_response.status_code == 200, detail_response.text
+
+                draft_response = app.post(
+                    f"/v1/personas/{persona.id}/draft",
+                    headers=headers,
+                    json={
+                        "settings": {
+                            "name": "이름",
+                            "profile": "소개",
+                            "speech_examples": "",
+                        }
+                    },
+                )
+                assert draft_response.status_code == 409
+                assert draft_response.json()["error"]["code"] == "schema_not_ready"
+        finally:
+            pool.close()
+
+        # 반복 가능성: 같은 head로 다시 올려도 문제없어야 한다.
+        command.upgrade(config, "head")
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+
+
 def _embedding(seed: float) -> list[float]:
     # 실제 임베딩 모델과 무관한 합성 벡터. pgvector 컬럼이 정확히 384차원을 요구하므로
     # 길이만 맞춘다.
