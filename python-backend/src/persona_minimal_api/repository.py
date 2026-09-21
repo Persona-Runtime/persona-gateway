@@ -49,18 +49,19 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 구·신 revision을 함께 허용하는 호환 릴리스를 먼저 내보내 공백을 없앤다.
 # 배포 순서와 롤백 규칙은 docs/migrations.md.
 #
-# 2026-09-19 호환 릴리스: "0001_persona_minimal"을 추가한다. 이 이미지는 기능 코드가
-# 이미 head라 0001에서도 뜰 수 있어야 migration이 아직 안 끝난 환경에서도 롤아웃이
-# 막히지 않는다. migration이 실제로 끝난 뒤에는 이 목록을 (0002, 0003)으로 좁히는
-# 후속 커밋이 필요하다(docs/migrations.md).
-SUPPORTED_ALEMBIC_REVISIONS = (
-    "0001_persona_minimal",
-    "0002_persona_draft",
-    "0003_material_chunks",
-)
-# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 위 목록은
-# readyz 호환용으로 0001까지 넓혔지만, 초안 관련 엔드포인트는 0001에 그 테이블 자체가
-# 없어 이 완화를 그대로 쓸 수 없다 — 별도로 좁혀 둔다.
+# 호환 창을 닫았다(2026-09-21) — migration 0002·0003이 운영에 실제로 적용되고
+# 복원 리허설까지 통과해(persona-platform/runbooks/gate3-4-apply-record-
+# 2026-09-19.md §2-15) 0001·0002는 더 이상 지원하지 않는다. 2026-09-19 호환
+# 릴리스가 잠깐 0001까지 넓혔던 것을 원래대로 되돌린 것 — 다음 migration(0004)을
+# 낼 때 같은 패턴(호환 릴리스로 구·신 둘 다 잠깐 허용했다가, 적용 확인 후 새
+# revision 하나로 좁히기)을 또 쓴다.
+SUPPORTED_ALEMBIC_REVISIONS = ("0003_material_chunks",)
+# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 지금은
+# SUPPORTED_ALEMBIC_REVISIONS가 0003 하나뿐이라 이 목록의 "0002_persona_draft"
+# 쪽은 실제로 도달하지 않는 죽은 분기다(readyz가 통과하려면 이미 0003이어야
+# 하므로) — 지우지 않고 남겨 둔다. 다음 호환 창(0004)이 열리면 SUPPORTED_
+# ALEMBIC_REVISIONS가 다시 여러 값을 허용하게 되고, 그 순간 이 목록도 함께
+# 넓혀야 이 아래 draft_schema_ready 분기가 다시 의미를 갖는다.
 DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks")
 
 
@@ -70,8 +71,14 @@ def draft_schema_ready(cur) -> bool:
     is_ready()의 to_regclass 방식(테이블 실재를 직접 확인)과 다르게 마커만 본다 — 가볍다.
     이 함수 자체는 판정만 하고 무엇을 할지는 정하지 않는다: require_draft_schema는 이
     결과가 False면 거절하고, list_personas·get_persona·lifespan 시작 훅은 대신 초안
-    관련 조회·정리를 건너뛴다(0001에서도 계속 200으로 응답해야 하는 엔드포인트라 거절할
-    수 없다). 호출자는 dict_row cursor를 넘겨야 한다.
+    관련 조회·정리를 건너뛴다.
+
+    이건 "호환 창 도구"다 — SUPPORTED_ALEMBIC_REVISIONS가 여러 revision을 허용하는
+    호환 릴리스 기간에만 이 판정이 실제로 갈린다(그중 일부는 초안 스키마가 없을 수
+    있으므로). 지금(2026-09-21, 호환 창을 닫은 뒤)은 SUPPORTED_ALEMBIC_REVISIONS가
+    "0003_material_chunks" 하나뿐이라 이 함수가 항상 True를 돌려주는 죽은 분기지만,
+    지우지 않는다 — 다음 호환 릴리스(예: 0004)에서 그대로 재사용한다. 호출자는
+    dict_row cursor를 넘겨야 한다.
     """
     cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
     row = cur.fetchone()
@@ -83,8 +90,10 @@ def require_draft_schema(cur) -> None:
     """draft_schema_ready가 False면 SchemaNotReady를 던진다.
 
     호출자가 뒤이어 material_versions 등을 어차피 SELECT/INSERT할 것이므로, 여기서는
-    "0001인데 초안 API를 불렀다"는 사용자 친화적인 409를 먼저 내는 것이 목적이다.
-    호출자는 dict_row cursor를 넘겨야 한다.
+    "구 revision인데 초안 API를 불렀다"는 사용자 친화적인 409를 먼저 내는 것이 목적이다.
+    draft_schema_ready와 같은 이유로 "호환 창 도구"다 — 지금은 호출돼도 항상 통과만
+    하지만 다음 호환 릴리스에서 다시 실제로 거절하게 된다. 호출자는 dict_row cursor를
+    넘겨야 한다.
     """
     if not draft_schema_ready(cur):
         raise SchemaNotReady
@@ -402,12 +411,15 @@ class PostgresPersonaStore:
                         WHERE p.owner_subject = %s AND p.deleted_at IS NULL
                     """
                 else:
-                    # 0001 호환 릴리스: material_versions가 물리적으로 없다. LEFT JOIN도
-                    # 참조 테이블이 없으면 PostgreSQL이 그 자리에서 예외를 던진다(join
-                    # 종류와 무관 — null 처리로 넘어가는 문제가 아니다) — 조인 자체를
-                    # 빼고 캐릭터만 돌려준다. list_personas·get_persona는 0001에서도
-                    # 200이어야 한다는 요구가 있어 거절할 수 없다(require_draft_schema와
-                    # 다른 이유로 draft_schema_ready를 쓴다).
+                    # 호환 창 도구 — 구 revision(호환 릴리스가 허용하는 동안)에는
+                    # material_versions가 물리적으로 없다. LEFT JOIN도 참조 테이블이
+                    # 없으면 PostgreSQL이 그 자리에서 예외를 던진다(join 종류와 무관 —
+                    # null 처리로 넘어가는 문제가 아니다) — 조인 자체를 빼고 캐릭터만
+                    # 돌려준다. list_personas·get_persona는 구 revision에서도 200이어야
+                    # 한다는 요구가 있어 거절할 수 없다(require_draft_schema와 다른
+                    # 이유로 draft_schema_ready를 쓴다). 지금은 SUPPORTED_ALEMBIC_
+                    # REVISIONS가 단일값이라 draft_schema_ready가 항상 True를 돌려줘
+                    # 이 분기가 실행되지 않지만, 다음 호환 릴리스에서 재사용한다.
                     query = """
                         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
                                NULL AS draft_version_id, NULL AS draft_revision,
@@ -530,8 +542,9 @@ class PostgresPersonaStore:
         WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
     """
 
-    # 0001 호환 릴리스(list_personas와 같은 이유) — material_versions가 물리적으로 없을
-    # 때 쓴다.
+    # 호환 창 도구(list_personas와 같은 이유) — material_versions가 물리적으로 없는
+    # 구 revision에서 쓴다. 지금은 draft_schema_ready가 항상 True라 실행되지 않지만,
+    # 다음 호환 릴리스에서 재사용한다.
     _PERSONA_WITHOUT_DRAFT_SCHEMA = """
         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
                NULL AS draft_version_id, NULL AS draft_revision,
@@ -1114,6 +1127,13 @@ def _statement_timeout_value(deadline: float) -> str:
     return f"{max(1, int(_remaining_seconds(deadline) * 1000))}ms"
 
 
+# 프로세스당 한 번만 경고하기 위한 플래그. 여러 워커 스레드가 거의 동시에 연결을
+# 열면 드물게 중복 로그가 한두 번 더 찍힐 수 있다(락 없는 체크-후-설정) — 로그
+# 중복 방지가 목적이라 그 정도 경합은 감수한다, 잠금까지 걸 정확성이 필요한
+# 값이 아니다.
+_pgvector_adapter_warning_logged = False
+
+
 def _configure_connection(conn: Connection) -> None:
     """pgvector 타입 어댑터를 조건부로 등록한다.
 
@@ -1139,11 +1159,22 @@ def _configure_connection(conn: Connection) -> None:
     매 연결마다 이 조회 자체가 원인이 되어 버려지고 pool이 새 연결을 못 얻어
     PoolTimeout으로 번진다(실측 — register_vector를 건너뛰도록 처음 고쳤을 때
     이 commit을 빠뜨려 같은 증상이 그대로 재현됐다).
+
+    확장 유무는 이 함수가 불리는 연결 생성 시점에만 판정한다 — 앱이 계속 떠 있는
+    채로 나중에 migration이 확장을 만들어도(예: 0003을 뒤늦게 적용) 이미 열려
+    있던 기존 연결에는 반영되지 않는다. migration 적용 직후 gateway를 한 번
+    재시작(rollout restart)해야 새로 열리는 연결들이 어댑터를 등록한다.
     """
     exists = conn.execute("SELECT 1 FROM pg_type WHERE typname = 'vector'").fetchone()
     conn.commit()
     if exists is None:
-        logger.warning("pgvector adapter skipped: vector type not installed")
+        global _pgvector_adapter_warning_logged
+        if not _pgvector_adapter_warning_logged:
+            # 연결마다 반복 출력되면 pool이 새 연결을 계속 여는 동안 로그가
+            # 폭주한다 — 프로세스당 한 번만 알리면 충분하다(연결마다 알아야 할
+            # 새 정보가 없다).
+            logger.warning("pgvector adapter skipped: vector type not installed")
+            _pgvector_adapter_warning_logged = True
         return
     register_vector(conn)
 
