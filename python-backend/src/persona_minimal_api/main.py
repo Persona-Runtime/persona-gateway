@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 from psycopg import Error as PsycopgError
+from psycopg.errors import UndefinedTable
 from psycopg_pool import PoolTimeout
 
 from .config import Settings
@@ -241,13 +242,27 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
         # lock은 연결이 끊기면 자동으로 풀리지만(세션 범위), status는 그대로 남아 새
         # apply 요청을 "진행 중"으로 착각해 영원히 막는다. indexed_revision·indexed_at은
         # 손대지 않는다 — 죽기 전에 성공한 색인이 있었다면 그건 여전히 유효하다.
+        #
+        # 0001 호환 릴리스: material_versions가 물리적으로 없는 DB에서 이 UPDATE를
+        # 무조건 돌리면 시작 시점(lifespan)에 예외가 나 앱 자체가 뜨지 못한다 —
+        # readyz조차 응답할 수 없게 되어 호환 릴리스의 목적(0001에서도 Ready) 자체가
+        # 깨진다(실측 2026-09-21: 물리적 0001 다운그레이드 테스트에서 발견). 미리
+        # alembic_version을 조회해 스키마 유무를 판정하는 대신(별도 쿼리·타임아웃
+        # 예산이 필요해지고, 그 예산이 readyz 자체 예산과 겹치면 잠긴 상태에서 시작이
+        # 불필요하게 오래 걸린다 — 실측으로 확인함) UPDATE를 그대로 시도하고
+        # UndefinedTable만 잡아 건너뛴다. 테이블이 잠겨 있는 경우는(이 UPDATE에
+        # 원래부터 별도 timeout이 없었다) 이 변경 이전과 동일하게 둔다 — 이번 수정의
+        # 범위는 "테이블이 아예 없는" 0001 경우로 좁힌다.
         if isinstance(store, PostgresPersonaStore):
             with store.pool.connection() as connection, connection.transaction():
-                connection.execute(
-                    "UPDATE persona_minimal.material_versions "
-                    "SET status = 'failed', error_code = 'interrupted' "
-                    "WHERE status = 'processing'"
-                )
+                try:
+                    connection.execute(
+                        "UPDATE persona_minimal.material_versions "
+                        "SET status = 'failed', error_code = 'interrupted' "
+                        "WHERE status = 'processing'"
+                    )
+                except UndefinedTable:
+                    pass
         yield
         if owned_pool is not None:
             owned_pool.close()
