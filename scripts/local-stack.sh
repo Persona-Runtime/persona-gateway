@@ -203,6 +203,9 @@ gateway_url() {
 start_gateway() {
   local image="$1" runtime_url gateway_id
   runtime_url="postgresql://${runtime_role}:${runtime_password}@${postgres}:5432/${db_name}"
+  # PERSONA_EMBEDDING_URL은 config.py에서 기본값 없는 필수 필드다 — 없으면 앱이 시작
+  # 시점에 죽는다. 이 로컬 스택은 임베딩 서비스를 띄우지 않으므로 존재만 하면 되는
+  # 더미 값을 준다(실제로 그 주소에 연결하지 않는다).
   gateway_id="$(docker run --detach --name "$api" --network "$network" \
     --label "${owner_label}=${owner_value}" \
     --user 10001:10001 \
@@ -216,6 +219,7 @@ start_gateway() {
     --env PERSONA_STATIC_USER_ID="$user_id" \
     --env PERSONA_STATIC_DISPLAY_NAME="$display_name" \
     --env PERSONA_CURSOR_SIGNING_KEY="$cursor_key" \
+    --env PERSONA_EMBEDDING_URL="http://127.0.0.1:8081" \
     "$image")"
   guard_is_ours "$api" "$gateway_id"
 }
@@ -247,13 +251,15 @@ up() {
     3) exit 1 ;;
   esac
   # 호스트 포트를 공개하지 않는다. DB는 이 network 안에서만 접근한다.
+  # postgres:16-alpine이 아니라 pgvector/pgvector:pg16을 쓴다 — 0003부터 head
+  # migration이 pgvector 확장을 요구한다(material_chunks.embedding).
   local postgres_id
   postgres_id="$(docker run --detach --name "$postgres" --network "$network" \
     --label "${owner_label}=${owner_value}" \
     --env POSTGRES_USER="$superuser" \
     --env POSTGRES_PASSWORD="$super_password" \
     --env POSTGRES_DB="$db_name" \
-    postgres:16-alpine)"
+    pgvector/pgvector:pg16)"
   guard_is_ours "$postgres" "$postgres_id"
 
   local ready=false
