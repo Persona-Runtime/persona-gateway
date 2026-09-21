@@ -172,11 +172,14 @@ docker network create "$network" >/dev/null
 ok "임시 network 생성: ${network}"
 
 # DB는 network 안에서만 접근한다. 호스트 포트를 공개하지 않아 다른 작업과 섞이지 않는다.
+# postgres:16-alpine이 아니라 pgvector/pgvector:pg16을 쓴다 — 0003부터 head migration이
+# pgvector 확장을 요구한다(material_chunks.embedding). 실측 2026-09-21: 확장 없는
+# 이미지로 두 번 실패했다.
 docker run --detach --name "$postgres" --network "$network" \
   --env POSTGRES_USER="$db_user" \
   --env POSTGRES_PASSWORD="$db_password" \
   --env POSTGRES_DB="$db_name" \
-  postgres:16-alpine >/dev/null
+  pgvector/pgvector:pg16 >/dev/null
 ok "임시 Postgres 기동 (호스트 포트 비공개)"
 
 for _ in $(seq 1 30); do
@@ -215,6 +218,9 @@ else
 fi
 
 step "3. API 컨테이너 기동 (비루트 · read-only · 권한 최소화)"
+# PERSONA_EMBEDDING_URL은 config.py에서 기본값 없는 필수 필드다 — 없으면 Settings()가
+# 뜨는 시점에 죽는다(실측 2026-09-21). 이 smoke 시나리오는 임베딩 호출을 하지 않으므로
+# 존재만 하면 되는 더미 값을 준다(실제로 그 주소에 연결하지 않는다).
 docker run --detach --name "$api" --network "$network" --platform linux/amd64 \
   --user 10001:10001 \
   --read-only \
@@ -228,6 +234,7 @@ docker run --detach --name "$api" --network "$network" --platform linux/amd64 \
   --env PERSONA_STATIC_DISPLAY_NAME="$display_name" \
   --env PERSONA_CURSOR_SIGNING_KEY="$cursor_key" \
   --env PERSONA_DB_TIMEOUT_SECONDS="$db_timeout_seconds" \
+  --env PERSONA_EMBEDDING_URL="http://127.0.0.1:8081" \
   "$image" >/dev/null
 
 port="$(docker port "$api" 8080/tcp | awk -F: 'NR == 1 { print $NF }')"
