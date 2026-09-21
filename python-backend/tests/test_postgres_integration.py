@@ -744,6 +744,11 @@ def test_list_personas_and_get_persona_work_on_physically_downgraded_0001(
             )
 
             with TestClient(create_app(settings, store)) as app:
+                # 이 with 진입 자체가 lifespan(시작 훅)을 태운다 — 원래 버그(시작 훅이
+                # 0001에서 예외를 던져 앱이 안 뜨던 것)가 바로 여기서 잡혔다. readyz를
+                # 명시적으로 확인해 "시작 훅을 통과했다"는 사실을 눈에 보이게 남긴다.
+                assert app.get("/readyz").status_code == 200
+
                 headers = {
                     "Authorization": "Bearer integration-token",
                     "Idempotency-Key": str(uuid4()),

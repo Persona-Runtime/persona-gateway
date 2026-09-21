@@ -256,11 +256,18 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
         if isinstance(store, PostgresPersonaStore):
             with store.pool.connection() as connection, connection.transaction():
                 try:
-                    connection.execute(
-                        "UPDATE persona_minimal.material_versions "
-                        "SET status = 'failed', error_code = 'interrupted' "
-                        "WHERE status = 'processing'"
-                    )
+                    # savepoint — UPDATE가 실패해도 바깥 트랜잭션은 에러 상태로 남지
+                    # 않는다. psycopg3는 트랜잭션 블록 안에서 실패한 문장을 그냥
+                    # try/except로 삼키기만 하면 그 블록 전체가 서버 쪽에서 에러
+                    # 상태로 남아 COMMIT이 암묵적 ROLLBACK으로 바뀐다 — 지금은 이
+                    # 블록에 문장이 이거 하나뿐이라 결과가 우연히 같지만, 뒤에 다른
+                    # 문장이 추가되면 그것도 함께 버려진다.
+                    with connection.transaction():
+                        connection.execute(
+                            "UPDATE persona_minimal.material_versions "
+                            "SET status = 'failed', error_code = 'interrupted' "
+                            "WHERE status = 'processing'"
+                        )
                 except UndefinedTable:
                     pass
         yield
