@@ -62,18 +62,29 @@ SUPPORTED_ALEMBIC_REVISIONS = (
 DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks")
 
 
-def require_draft_schema(cur) -> None:
-    """alembic_version 마커만 읽어 초안 스키마 존재 여부를 가볍게 판정한다.
+def draft_schema_ready(cur) -> bool:
+    """alembic_version 마커만 읽어 초안 스키마(material_versions 등) 존재 여부를 판정한다.
 
-    is_ready()의 to_regclass 방식(테이블 실재를 직접 확인)과 다르게 마커만 본다 —
-    호출자가 뒤이어 material_versions 등을 어차피 SELECT/INSERT할 것이므로, 여기서는
-    "0001인데 초안 API를 불렀다"는 사용자 친화적인 409를 먼저 내는 것이 목적이다.
-    호출자는 dict_row cursor를 넘겨야 한다.
+    is_ready()의 to_regclass 방식(테이블 실재를 직접 확인)과 다르게 마커만 본다 — 가볍다.
+    이 함수 자체는 판정만 하고 무엇을 할지는 정하지 않는다: require_draft_schema는 이
+    결과가 False면 거절하고, list_personas·get_persona·lifespan 시작 훅은 대신 초안
+    관련 조회·정리를 건너뛴다(0001에서도 계속 200으로 응답해야 하는 엔드포인트라 거절할
+    수 없다). 호출자는 dict_row cursor를 넘겨야 한다.
     """
     cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
     row = cur.fetchone()
     version = row["version_num"] if row else None
-    if version not in DRAFT_SCHEMA_REVISIONS:
+    return version in DRAFT_SCHEMA_REVISIONS
+
+
+def require_draft_schema(cur) -> None:
+    """draft_schema_ready가 False면 SchemaNotReady를 던진다.
+
+    호출자가 뒤이어 material_versions 등을 어차피 SELECT/INSERT할 것이므로, 여기서는
+    "0001인데 초안 API를 불렀다"는 사용자 친화적인 409를 먼저 내는 것이 목적이다.
+    호출자는 dict_row cursor를 넘겨야 한다.
+    """
+    if not draft_schema_ready(cur):
         raise SchemaNotReady
 
 
@@ -376,22 +387,37 @@ class PostgresPersonaStore:
     ) -> list[Persona]:
         # 초안 요약만 join한다. 본문(content)은 여기서 절대 읽지 않는다 — 목록 한 번에
         # 캐릭터 수만큼의 원문을 실어 나르게 되고, 화면은 그중 아무것도 쓰지 않는다.
-        query = """
-            SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
-                   d.version_id AS draft_version_id, d.revision AS draft_revision,
-                   d.status AS draft_status, d.job_id AS draft_job_id
-            FROM persona_minimal.personas AS p
-            LEFT JOIN persona_minimal.material_versions AS d ON d.persona_id = p.id
-            WHERE p.owner_subject = %s AND p.deleted_at IS NULL
-        """
         values: list[object] = [owner_subject]
-        if cursor is not None:
-            query += " AND (p.created_at, p.id) < (%s, %s)"
-            values.extend([cursor.created_at, cursor.persona_id])
-        query += " ORDER BY p.created_at DESC, p.id DESC LIMIT %s"
-        values.append(limit)
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
+                if draft_schema_ready(cur):
+                    query = """
+                        SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+                               d.version_id AS draft_version_id, d.revision AS draft_revision,
+                               d.status AS draft_status, d.job_id AS draft_job_id
+                        FROM persona_minimal.personas AS p
+                        LEFT JOIN persona_minimal.material_versions AS d ON d.persona_id = p.id
+                        WHERE p.owner_subject = %s AND p.deleted_at IS NULL
+                    """
+                else:
+                    # 0001 호환 릴리스: material_versions가 물리적으로 없다. LEFT JOIN도
+                    # 참조 테이블이 없으면 PostgreSQL이 그 자리에서 예외를 던진다(join
+                    # 종류와 무관 — null 처리로 넘어가는 문제가 아니다) — 조인 자체를
+                    # 빼고 캐릭터만 돌려준다. list_personas·get_persona는 0001에서도
+                    # 200이어야 한다는 요구가 있어 거절할 수 없다(require_draft_schema와
+                    # 다른 이유로 draft_schema_ready를 쓴다).
+                    query = """
+                        SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+                               NULL AS draft_version_id, NULL AS draft_revision,
+                               NULL AS draft_status, NULL AS draft_job_id
+                        FROM persona_minimal.personas AS p
+                        WHERE p.owner_subject = %s AND p.deleted_at IS NULL
+                    """
+                if cursor is not None:
+                    query += " AND (p.created_at, p.id) < (%s, %s)"
+                    values.extend([cursor.created_at, cursor.persona_id])
+                query += " ORDER BY p.created_at DESC, p.id DESC LIMIT %s"
+                values.append(limit)
                 cur.execute(query, values)
                 return [_persona(row) for row in cur.fetchall()]
 
@@ -502,10 +528,25 @@ class PostgresPersonaStore:
         WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
     """
 
+    # 0001 호환 릴리스(list_personas와 같은 이유) — material_versions가 물리적으로 없을
+    # 때 쓴다.
+    _PERSONA_WITHOUT_DRAFT_SCHEMA = """
+        SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+               NULL AS draft_version_id, NULL AS draft_revision,
+               NULL AS draft_status, NULL AS draft_job_id
+        FROM persona_minimal.personas AS p
+        WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
+    """
+
     def get_persona(self, owner_subject: str, persona_id: UUID) -> Persona:
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
-                cur.execute(self._PERSONA_WITH_DRAFT, (persona_id, owner_subject))
+                query = (
+                    self._PERSONA_WITH_DRAFT
+                    if draft_schema_ready(cur)
+                    else self._PERSONA_WITHOUT_DRAFT_SCHEMA
+                )
+                cur.execute(query, (persona_id, owner_subject))
                 row = cur.fetchone()
                 if row is None:
                     raise PersonaNotFound
