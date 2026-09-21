@@ -1127,6 +1127,13 @@ def _statement_timeout_value(deadline: float) -> str:
     return f"{max(1, int(_remaining_seconds(deadline) * 1000))}ms"
 
 
+# 프로세스당 한 번만 경고하기 위한 플래그. 여러 워커 스레드가 거의 동시에 연결을
+# 열면 드물게 중복 로그가 한두 번 더 찍힐 수 있다(락 없는 체크-후-설정) — 로그
+# 중복 방지가 목적이라 그 정도 경합은 감수한다, 잠금까지 걸 정확성이 필요한
+# 값이 아니다.
+_pgvector_adapter_warning_logged = False
+
+
 def _configure_connection(conn: Connection) -> None:
     """pgvector 타입 어댑터를 조건부로 등록한다.
 
@@ -1152,11 +1159,22 @@ def _configure_connection(conn: Connection) -> None:
     매 연결마다 이 조회 자체가 원인이 되어 버려지고 pool이 새 연결을 못 얻어
     PoolTimeout으로 번진다(실측 — register_vector를 건너뛰도록 처음 고쳤을 때
     이 commit을 빠뜨려 같은 증상이 그대로 재현됐다).
+
+    확장 유무는 이 함수가 불리는 연결 생성 시점에만 판정한다 — 앱이 계속 떠 있는
+    채로 나중에 migration이 확장을 만들어도(예: 0003을 뒤늦게 적용) 이미 열려
+    있던 기존 연결에는 반영되지 않는다. migration 적용 직후 gateway를 한 번
+    재시작(rollout restart)해야 새로 열리는 연결들이 어댑터를 등록한다.
     """
     exists = conn.execute("SELECT 1 FROM pg_type WHERE typname = 'vector'").fetchone()
     conn.commit()
     if exists is None:
-        logger.warning("pgvector adapter skipped: vector type not installed")
+        global _pgvector_adapter_warning_logged
+        if not _pgvector_adapter_warning_logged:
+            # 연결마다 반복 출력되면 pool이 새 연결을 계속 여는 동안 로그가
+            # 폭주한다 — 프로세스당 한 번만 알리면 충분하다(연결마다 알아야 할
+            # 새 정보가 없다).
+            logger.warning("pgvector adapter skipped: vector type not installed")
+            _pgvector_adapter_warning_logged = True
         return
     register_vector(conn)
 
