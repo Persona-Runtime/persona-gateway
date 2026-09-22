@@ -237,13 +237,16 @@ Postgres+Qdrant의 원자 트랜잭션을 가정하지 않는다. 검증된 결�
 
 generation 상태: queued → running → completed/failed, 중단 요청 시 cancel_requested → cancelled.
 종료 증거가 불명확하면 reconciling으로 유지하며 같은 사용자의 새 생성 요청을 받지 않는다. 제한 시간 경과나 HTTP 연결 종료만으로 슬롯을 해제하지 않는다.
+Gateway 재시작(SIGTERM) 뒤에도 마찬가지다 — 이전 프로세스가 queued/running/cancel_requested로 남긴 generation은 기동 시 reconciling으로만 옮기고, "프로세스가 죽었으니 failed로 슬롯 해제"는 하지 않는다.
+
+reconciling에서 terminal(failed, failure_code `reconciliation_timeout`)로의 전환은 **지연 해소만** 한다 — 별도 background sweep은 두지 않는다. 판정 기준은 그 generation의 마지막 heartbeat/시작 시각(`heartbeat_at`)이며, 같은 사용자의 **다음 generation 요청이 잠금 안에서 들어왔을 때만** 300초를 넘겼는지 그 자리에서 확인해 넘겼으면 닫고 슬롯을 연다. 300초를 넘지 않았으면 여전히 409 `generation_in_progress`다. 즉 아무도 새 요청을 보내지 않으면 reconciling은 무기한 남을 수 있다 — 그게 "슬롯을 임의로 해제하지 않는다"는 원칙의 실제 동작이다.
 완료와 취소가 경합하면 먼저 확정된 terminal 상태를 유지한다. 200 cancel 응답만으로 취소 완료를 주장하지 않는다.
 서버 저장과 클라이언트 화면은 별개다. 완료를 DB에 저장한 뒤 done을 전송한다. done 전달 실패가 완료 기록을 취소로 바꾸면 안 된다.
 부분 답변은 저장된 범위까지만 재조회 가능하다. 스트림으로 보인 모든 바이트의 내구 저장을 보장한다고 표현하지 않는다.
 
 재시도는 대화의 최신 질문·최신 실패/중단 시도만 허용한다. 이후 질문이 있으면 409 `retry_not_latest`로 새 질문을 안내한다.
 같은 user_message_id에 새 generation/assistant_message ID를 연결하고 원래 version·입력 snapshot을 사용한다.
-입력 snapshot/버전이 제거됐거나 캐릭터가 삭제 중이면 거절한다. 현재 version으로 조용히 바꾸지 않는다.
+입력 snapshot/버전이 제거됐으면 409 `retry_input_unavailable`(검색 단계 전에 실패해 재사용할 입력 자체가 없는 경우)로, 캐릭터가 삭제 중이면 404로 거절한다. 현재 version으로 조용히 바꾸지 않는다.
 이전 실패 기록은 유지하되 후속 모델 문맥에는 선택된 정상 완료 시도만 한 번 포함한다.
 
 ## 8. SSE 계약
