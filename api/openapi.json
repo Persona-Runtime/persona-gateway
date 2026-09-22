@@ -2628,6 +2628,7 @@
             }
           },
           "failure_code": {
+            "description": "status가 failed일 때만 값이 있다. 자유 문자열이며 고정 enum이 아니다. Gateway가 내는 알려진 값: first_token_timeout(60초 안에 첫 토큰 없음), generation_timeout(전체 180초 초과), reconciliation_timeout(재시작·연결 끊김으로 reconciling이던 generation이 heartbeat 기준 300초 넘게 방치돼 같은 사용자의 다음 요청이 그 자리에서 닫음 — 별도 background sweep 없음), 그 외 업스트림이 낸 오류 코드.",
             "anyOf": [
               {
                 "type": "string"

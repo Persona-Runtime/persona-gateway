@@ -82,6 +82,11 @@ class BuildMessagesResult:
     messages: list[Message]
     truncated: bool
     stats: PromptStats
+    # 예산 초과로 잘려나간 뒤 실제로 프롬프트에 들어간 조각만 담는다(원래 검색된
+    # 전체 목록이 아니다) — 채팅 citation이 모델이 실제로 보지 못한 조각을 인용하지
+    # 않으려면 이 목록이 필요하다.
+    speech_chunks_used: list[RetrievedChunk]
+    body_chunks_used: list[RetrievedChunk]
 
 
 class QuestionTooLong(Exception):
@@ -218,4 +223,10 @@ def build_messages(
             "8192" if budget == BUDGET_8192 else "4096" if budget == BUDGET_4096 else "custom"
         ),
     )
-    return BuildMessagesResult(messages=messages, truncated=truncated, stats=stats)
+    return BuildMessagesResult(
+        messages=messages,
+        truncated=truncated,
+        stats=stats,
+        speech_chunks_used=speech_chunks,
+        body_chunks_used=body_chunks,
+    )

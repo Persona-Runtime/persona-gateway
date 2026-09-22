@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +33,14 @@ class Settings(BaseSettings):
     # 클러스터 미적용이라 이번에도 넣지 않는다(=off로 유지).
     forward_auth_enabled: bool = Field(
         default=False, validation_alias="PERSONA_FORWARD_AUTH_ENABLED"
+    )
+    # 값 도메인이 지금은 "mock" 하나뿐이다(vLLM 어댑터가 아직 없다) — 그래도 명시적
+    # 설정값으로 강제해 둔다. "llm"을 나중에 추가할 때, 연결 실패 시 조용히 mock으로
+    # fallback하는 경로가 생기지 않게 하려는 목적이다(feedback.md 명시 요구). Literal이라
+    # "mock" 외의 값은 pydantic이 기동 시점에 바로 거부한다 — 조용한 fallback 대신
+    # 시끄러운 실패.
+    chat_inference_mode: Literal["mock"] = Field(
+        default="mock", validation_alias="PERSONA_CHAT_INFERENCE_MODE"
     )
 
     @field_validator("static_user_id", "static_display_name")

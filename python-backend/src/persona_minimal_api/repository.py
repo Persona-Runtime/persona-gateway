@@ -55,14 +55,22 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 릴리스가 잠깐 0001까지 넓혔던 것을 원래대로 되돌린 것 — 다음 migration(0004)을
 # 낼 때 같은 패턴(호환 릴리스로 구·신 둘 다 잠깐 허용했다가, 적용 확인 후 새
 # revision 하나로 좁히기)을 또 쓴다.
-SUPPORTED_ALEMBIC_REVISIONS = ("0003_material_chunks",)
-# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 지금은
-# SUPPORTED_ALEMBIC_REVISIONS가 0003 하나뿐이라 이 목록의 "0002_persona_draft"
-# 쪽은 실제로 도달하지 않는 죽은 분기다(readyz가 통과하려면 이미 0003이어야
-# 하므로) — 지우지 않고 남겨 둔다. 다음 호환 창(0004)이 열리면 SUPPORTED_
-# ALEMBIC_REVISIONS가 다시 여러 값을 허용하게 되고, 그 순간 이 목록도 함께
-# 넓혀야 이 아래 draft_schema_ready 분기가 다시 의미를 갖는다.
-DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks")
+# 2026-09-22 호환 릴리스: 0004(채팅 테이블)를 새로 낸다. docs/migrations.md의 배포
+# 순서(호환 릴리스 → migration Job → grants → 기능 릴리스)대로, 이 이미지는 새 기능
+# 코드(chat/*)가 이미 있지만 0003 DB에서도 계속 Ready이게 구·신 둘 다 허용한다.
+# migration Job이 실제로 적용되고 확인된 뒤 ("0004_chat",) 하나로 좁히는 건 이후
+# 별도 커밋(기능 릴리스)이다 — 이 PR이 아니다.
+SUPPORTED_ALEMBIC_REVISIONS = ("0003_material_chunks", "0004_chat")
+# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 호환 창을
+# 다시 열면서(위 SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용) 이 목록도
+# "0003까지는 있다"는 뜻을 유지하도록 그대로 둔다 — 0004 DB에도 초안 스키마는
+# 당연히 있다(0002에서 만들어진 뒤 한 번도 지워지지 않았다).
+DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks", "0004_chat")
+# 채팅 스키마(conversations·user_messages·generations)는 0004에서 생겼다. 호환 창이
+# 열려 있는 동안(SUPPORTED_ALEMBIC_REVISIONS가 0003도 허용) 0003 DB엔 이 테이블들이
+# 없을 수 있다 — chat_schema_ready/require_chat_schema가 draft_schema_ready와 같은
+# "호환 창 도구" 패턴으로 이걸 가른다.
+CHAT_SCHEMA_REVISIONS = ("0004_chat",)
 
 
 def draft_schema_ready(cur) -> bool:
@@ -96,6 +104,28 @@ def require_draft_schema(cur) -> None:
     넘겨야 한다.
     """
     if not draft_schema_ready(cur):
+        raise SchemaNotReady
+
+
+def chat_schema_ready(cur) -> bool:
+    """alembic_version 마커만 읽어 채팅 스키마(conversations 등) 존재 여부를 판정한다.
+
+    draft_schema_ready와 같은 이유·같은 방식의 "호환 창 도구"다 — 0004 호환 릴리스
+    기간에만 실제로 갈린다. 호출자는 dict_row cursor를 넘겨야 한다.
+    """
+    cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
+    row = cur.fetchone()
+    version = row["version_num"] if row else None
+    return version in CHAT_SCHEMA_REVISIONS
+
+
+def require_chat_schema(cur) -> None:
+    """chat_schema_ready가 False면 SchemaNotReady를 던진다.
+
+    require_draft_schema와 같은 이유 — 호출자가 뒤이어 conversations 등을 SELECT/
+    INSERT할 것이므로, "구 revision인데 채팅 API를 불렀다"는 409를 먼저 낸다.
+    """
+    if not chat_schema_ready(cur):
         raise SchemaNotReady
 
 

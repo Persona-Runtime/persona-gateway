@@ -114,7 +114,7 @@ def test_me_requires_static_bearer_token() -> None:
     missing = api.get("/v1/me")
     assert missing.status_code == 401
     assert missing.json()["error"]["code"] == "unauthorized"
-    assert missing.headers["cache-control"] == "no-store"
+    assert missing.headers["cache-control"] == "no-store, no-transform"
 
     response = api.get("/v1/me", headers=headers())
     assert response.status_code == 200
@@ -185,7 +185,7 @@ def test_healthz_ignores_database_and_readyz_is_safe() -> None:
     unavailable = client(NotReadyStore()).get("/readyz")
     assert unavailable.status_code == 503
     assert unavailable.json() == {"status": "not_ready"}
-    assert unavailable.headers["cache-control"] == "no-store"
+    assert unavailable.headers["cache-control"] == "no-store, no-transform"
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
@@ -240,7 +240,7 @@ def test_non_ascii_bearer_token_is_unauthorized() -> None:
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthorized"
-    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["cache-control"] == "no-store, no-transform"
 
 
 @pytest.mark.parametrize(
@@ -263,7 +263,7 @@ def test_transient_database_failure_uses_safe_common_error_response(error: Excep
         "message": "잠시 후 다시 시도해주세요.",
         "request_id": response.headers["x-request-id"],
     }
-    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["cache-control"] == "no-store, no-transform"
 
 
 @pytest.mark.parametrize(
@@ -282,7 +282,7 @@ def test_non_transient_database_failure_is_safe_internal_error(error: Exception)
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert str(error) not in response.text
-    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["cache-control"] == "no-store, no-transform"
     assert response.headers["x-request-id"] == response.json()["error"]["request_id"]
 
 
@@ -295,7 +295,7 @@ def test_unexpected_failure_does_not_expose_exception_details() -> None:
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert "synthetic unexpected failure" not in response.text
-    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["cache-control"] == "no-store, no-transform"
     assert response.headers["x-request-id"] == response.json()["error"]["request_id"]
 
 

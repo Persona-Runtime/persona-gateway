@@ -61,3 +61,91 @@ def decode(value: str, key: str, expected_owner: str) -> PersonaCursor:
         if isinstance(exc, CursorError):
             raise
         raise CursorError("invalid") from exc
+
+
+@dataclass(frozen=True)
+class ConversationCursor:
+    owner_subject: str
+    created_at: datetime
+    conversation_id: UUID
+
+
+def encode_conversation_cursor(cursor: ConversationCursor, key: str) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "owner": cursor.owner_subject,
+            "created_at": cursor.created_at.isoformat(),
+            "id": str(cursor.conversation_id),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(key.encode("utf-8"), payload, hashlib.sha256).digest()
+    return f"{_b64encode(payload)}.{_b64encode(signature)}"
+
+
+def decode_conversation_cursor(value: str, key: str, expected_owner: str) -> ConversationCursor:
+    try:
+        payload_part, signature_part = value.split(".", 1)
+        payload, supplied_signature = _b64decode(payload_part), _b64decode(signature_part)
+        expected_signature = hmac.new(key.encode("utf-8"), payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise CursorError("signature")
+        decoded = json.loads(payload)
+        if decoded["v"] != 1 or decoded["owner"] != expected_owner:
+            raise CursorError("scope")
+        created_at = datetime.fromisoformat(decoded["created_at"])
+        if created_at.tzinfo is None:
+            raise CursorError("timestamp")
+        return ConversationCursor(expected_owner, created_at, UUID(decoded["id"]))
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, CursorError):
+            raise
+        raise CursorError("invalid") from exc
+
+
+@dataclass(frozen=True)
+class MessageCursor:
+    conversation_id: UUID
+    created_at: datetime
+    user_message_id: UUID
+
+
+def encode_message_cursor(cursor: MessageCursor, key: str) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "conversation_id": str(cursor.conversation_id),
+            "created_at": cursor.created_at.isoformat(),
+            "id": str(cursor.user_message_id),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(key.encode("utf-8"), payload, hashlib.sha256).digest()
+    return f"{_b64encode(payload)}.{_b64encode(signature)}"
+
+
+def decode_message_cursor(value: str, key: str, expected_conversation_id: UUID) -> MessageCursor:
+    # PersonaCursor·ConversationCursor는 owner_subject로 범위를 확인하지만, 메시지
+    # 커서는 conversation_id로 확인한다 — 소유권 자체는 호출자가 conversation 조회
+    # 시점에 이미 확인했고, 여기서는 "이 커서가 그 대화 것이 맞는지"만 본다(다른
+    # 대화의 커서를 재사용해 페이지를 훔쳐보는 것을 막는다).
+    try:
+        payload_part, signature_part = value.split(".", 1)
+        payload, supplied_signature = _b64decode(payload_part), _b64decode(signature_part)
+        expected_signature = hmac.new(key.encode("utf-8"), payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise CursorError("signature")
+        decoded = json.loads(payload)
+        if decoded["v"] != 1 or decoded["conversation_id"] != str(expected_conversation_id):
+            raise CursorError("scope")
+        created_at = datetime.fromisoformat(decoded["created_at"])
+        if created_at.tzinfo is None:
+            raise CursorError("timestamp")
+        return MessageCursor(expected_conversation_id, created_at, UUID(decoded["id"]))
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, CursorError):
+            raise
+        raise CursorError("invalid") from exc

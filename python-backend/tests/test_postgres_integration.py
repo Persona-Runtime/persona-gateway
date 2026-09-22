@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -14,6 +15,8 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 
+from persona_minimal_api.chat.fake_inference import FakeInferenceClient, UpstreamError
+from persona_minimal_api.chat.repository import ChatStore
 from persona_minimal_api.config import Settings
 from persona_minimal_api.indexing.embedding_client import EmbeddingResult
 from persona_minimal_api.indexing.runner import run_indexing
@@ -84,6 +87,11 @@ def store(database_url: str) -> PostgresPersonaStore:
     pool = create_pool(database_url, 2)
     yield PostgresPersonaStore(pool)
     pool.close()
+
+
+@pytest.fixture(scope="module")
+def chat_store(store: PostgresPersonaStore) -> ChatStore:
+    return ChatStore(store.pool)
 
 
 def test_atomic_limit_and_idempotency_survive_recreation(store: PostgresPersonaStore) -> None:
@@ -225,21 +233,16 @@ def test_readyz_requires_the_revision_this_release_supports(
 ) -> None:
     """이 릴리스가 요구하는 revision에서만 Ready다.
 
-    허용 목록을 넓히는 것은 **호환 릴리스의 역할**이지 기본값이 아니다. 새 migration을
-    낼 때 구·신 revision을 함께 허용하는 릴리스를 먼저 배포해 적용 시점의 공백을 없앤다.
-    그 규칙을 평소 릴리스로 가져오면, migration이 누락된 환경에서 Ready가 된 뒤
-    실제 요청이 스키마 부재로 실패한다.
+    2026-09-22 — 0004(채팅 테이블) 호환 릴리스를 다시 연다. docs/migrations.md:
+    "호환 릴리스는 자신의 테스트를 따로 쓴다. 구·신 둘 다 200이어야 한다." — 그래서
+    이번엔 0003·0004 둘 다 200이고, 그보다 옛 revision(0001·0002)과 알 수 없는
+    값은 503이어야 한다.
 
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    # 호환 창을 닫았다(2026-09-21) — 2026-09-19 호환 릴리스가 잠깐 0001까지
-    # 허용했던 것은 migration 0002·0003이 실제로 운영에 적용되고 복원 리허설까지
-    # 통과한 뒤 원래대로 좁혔다. 그 창이 열려 있던 동안의 동작(0001에서도 readyz
-    # 통과, 초안만 별도로 막힘)은
-    # test_list_personas_and_get_persona_still_work_when_revision_unsupported에서
-    # "호환 창 도구"가 계속 정확히 동작하는지로 형태를 바꿔 검증한다.
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0003_material_chunks",)
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0003_material_chunks", "0004_chat")
+    assert _readyz_with_revision(store, "0004_chat") == 200
     assert _readyz_with_revision(store, "0003_material_chunks") == 200
     assert _readyz_with_revision(store, "0002_persona_draft") == 503
     assert _readyz_with_revision(store, "0001_persona_minimal") == 503
@@ -692,7 +695,11 @@ def test_migration_0003_upgrade_and_downgrade_round_trip(round_trip_database_url
         finally:
             pool.close()
 
-        command.downgrade(config, "-1")
+        # head가 0004가 된 뒤에도 "0003이 추가한 것만 없어진 상태"를 보려는
+        # 것이므로 "-1"(head 기준 상대 한 단계)이 아니라 0003이 만든 것의 바로
+        # 이전 revision을 명시한다 — "-1"은 다음에 또 새 head가 생기면 다시
+        # 어긋난다.
+        command.downgrade(config, "0002_persona_draft")
 
         pool = create_pool(round_trip_database_url, 2)
         try:
@@ -1521,3 +1528,559 @@ def test_retrieve_endpoint_returns_body_and_speech_chunks_when_enabled(
     assert len(body["body"]) >= 1
     assert len(body["speech"]) >= 1
     assert set(body["body"][0].keys()) == {"kind", "heading_path", "ordinal", "score", "content"}
+
+
+# --- Chat API ------------------------------------------------------------------
+
+
+def test_migration_0004_upgrade_and_downgrade_round_trip(round_trip_database_url: str) -> None:
+    """feedback.md가 요구한 두 경로를 한 테스트로 함께 본다: 깨끗한 컨테이너에서
+    바로 head(0004)까지 올리는 것(이전 revision에서 0004), 그리고 -1(0003)로
+    내렸다가 다시 head로 올리는 것(0003 DB에서 0004). 0004는 pgvector 확장을 새로
+    만들지 않으므로(테이블만 추가) §2-14/§2-15류의 확장 잔재·권한 문제는 이
+    migration엔 해당 없다 — 그래서 그 부분(DROP EXTENSION 등)은 재현하지 않는다.
+    """
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                for table in (
+                    "conversations",
+                    "user_messages",
+                    "generations",
+                    "chat_idempotency_records",
+                ):
+                    assert _table_exists(connection, "persona_minimal", table), table
+                assert _column_exists(connection, "persona_minimal", "generations", "heartbeat_at")
+                assert _column_exists(
+                    connection, "persona_minimal", "generations", "input_snapshot"
+                )
+        finally:
+            pool.close()
+
+        command.downgrade(config, "-1")
+
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                for table in (
+                    "conversations",
+                    "user_messages",
+                    "generations",
+                    "chat_idempotency_records",
+                ):
+                    assert not _table_exists(connection, "persona_minimal", table), table
+                # 0003이 만든 건 그대로 남아 있어야 한다 — 이 downgrade는 0004가
+                # 추가한 것만 되돌린다.
+                assert _table_exists(connection, "persona_minimal", "material_chunks")
+        finally:
+            pool.close()
+
+        # "0003 DB → 0004" 경로: 방금 -1로 내려간 상태(=물리적으로 0003)에서 다시
+        # head로 올린다.
+        command.upgrade(config, "head")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert _table_exists(connection, "persona_minimal", "conversations")
+        finally:
+            pool.close()
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+
+
+def _chat_settings(owner: str) -> Settings:
+    return Settings(
+        DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
+        PERSONA_STATIC_BEARER_TOKEN="integration-token",
+        PERSONA_STATIC_USER_ID=owner,
+        PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
+        PERSONA_CURSOR_SIGNING_KEY="integration-cursor-key",
+    )
+
+
+def _parse_sse(text: str) -> list[tuple[str, dict]]:
+    events = []
+    for block in text.strip("\n").split("\n\n"):
+        if not block:
+            continue
+        lines = block.split("\n")
+        name = lines[0].removeprefix("event: ")
+        data = json.loads(lines[1].removeprefix("data: "))
+        events.append((name, data))
+    return events
+
+
+def _chat_client(store: PostgresPersonaStore, owner: str, inference_client=None) -> TestClient:
+    return TestClient(
+        create_app(
+            _chat_settings(owner), store, inference_client=inference_client or FakeInferenceClient()
+        )
+    )
+
+
+def test_create_conversation_requires_an_indexed_version(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = f"owner-{uuid4()}"
+    persona = store.create_persona(owner, "합성 사용자", "미색인 캐릭터", uuid4())
+    api = _chat_client(store, owner)
+
+    response = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "not_indexed"
+
+
+def test_chat_completions_streams_meta_citations_delta_done_in_order_and_persists(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "채팅대상",
+        "채팅대상은 침착한 안내자다.",
+        "채팅대상은 도서관 앞에서 소포를 발견했다.",
+        "채팅대상: 반갑습니다",
+    )
+    api = _chat_client(store, owner)
+
+    created = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["id"]
+
+    response = api.post(
+        "/v1/chat/completions",
+        headers={
+            "Authorization": "Bearer integration-token",
+            "Idempotency-Key": str(uuid4()),
+            "Accept": "text/event-stream",
+        },
+        json={"conversation_id": conversation_id, "message": "채팅대상에 대해 알려줘"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = _parse_sse(response.text)
+    names = [name for name, _ in events]
+    # meta 1회 → citations 1회 → delta 0회 이상(index 단조 증가) → done 1회.
+    assert names[0] == "meta"
+    assert names[1] == "citations"
+    assert names[-1] == "done"
+    delta_events = [data for name, data in events if name == "delta"]
+    assert [d["index"] for d in delta_events] == list(range(len(delta_events)))
+    assert len(delta_events) >= 1
+    assert events[1][1]["items"], "citations가 비어 있으면 안 된다(검색 결과가 있는 질문)"
+
+    generation_id = events[0][1]["generation_id"]
+    generation = chat_store.get_generation(owner, UUID(generation_id))
+    assert generation.status == "completed"
+    assert generation.content == "".join(d["text"] for d in delta_events)
+    assert generation.citations
+
+
+def test_chat_completions_idempotent_replay_does_not_create_new_message_or_generation(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "재전송대상",
+        "재전송대상은 침착한 안내자다.",
+        "재전송대상은 소포를 발견했다.",
+        "재전송대상: 안녕",
+    )
+    api = _chat_client(store, owner)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    key = str(uuid4())
+    first = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": key},
+        json={"conversation_id": conversation_id, "message": "안녕하세요"},
+    )
+    first_generation_id = _parse_sse(first.text)[0][1]["generation_id"]
+
+    with store.pool.connection() as connection:
+        message_count_before = connection.execute(
+            "SELECT count(*) FROM persona_minimal.user_messages WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()[0]
+        generation_count_before = connection.execute(
+            "SELECT count(*) FROM persona_minimal.generations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()[0]
+
+    replay = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": key},
+        json={"conversation_id": conversation_id, "message": "안녕하세요"},
+    )
+    assert replay.status_code == 200
+    assert replay.headers["content-type"].startswith("application/json")
+    body = replay.json()
+    assert body["replayed"] is True
+    assert body["generation"]["id"] == first_generation_id
+
+    with store.pool.connection() as connection:
+        message_count_after = connection.execute(
+            "SELECT count(*) FROM persona_minimal.user_messages WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()[0]
+        generation_count_after = connection.execute(
+            "SELECT count(*) FROM persona_minimal.generations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()[0]
+    assert message_count_after == message_count_before
+    assert generation_count_after == generation_count_before
+
+
+def test_active_generation_is_limited_to_one_per_user_across_different_personas(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§1: "한 사용자당 활성 generation은 persona와 무관하게 정확히 하나만
+    허용한다" — 서로 다른 캐릭터 두 개로 동시에 시작해도 하나만 성공해야 한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona_a, _ = _index_character(
+        store,
+        owner,
+        "동시성A",
+        "동시성A는 침착한 안내자다.",
+        "동시성A는 소포를 발견했다.",
+        "동시성A: 안녕",
+    )
+    persona_b, _ = _index_character(
+        store,
+        owner,
+        "동시성B",
+        "동시성B는 침착한 안내자다.",
+        "동시성B는 소포를 발견했다.",
+        "동시성B: 안녕",
+    )
+    # 델타 사이에 지연을 둬서(짧게) 두 요청이 동시에 accept 단계에서 경합하게 만든다.
+    slow_client = FakeInferenceClient(delay_before_first_chunk=0.05, delay_between_chunks=0.05)
+    api = _chat_client(store, owner, inference_client=slow_client)
+    conversation_a = api.post(
+        f"/v1/personas/{persona_a.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+    conversation_b = api.post(
+        f"/v1/personas/{persona_b.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    def attempt(conversation_id: str):
+        return api.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+            json={"conversation_id": conversation_id, "message": "안녕"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [
+            workers.submit(attempt, conversation_a),
+            workers.submit(attempt, conversation_b),
+        ]
+        responses = [future.result() for future in futures]
+
+    statuses = sorted(response.status_code for response in responses)
+    # 하나는 200(SSE 스트림 시작), 하나는 409(generation_in_progress)여야 한다.
+    assert statuses == [200, 409]
+    conflict = next(r for r in responses if r.status_code == 409)
+    assert conflict.json()["error"]["code"] == "generation_in_progress"
+
+
+def test_cancel_sets_cancel_requested_and_stream_ends_as_cancelled(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "취소대상",
+        "취소대상은 침착한 안내자다.",
+        "취소대상은 소포를 발견했다.",
+        "취소대상: 안녕",
+    )
+    # 느린 클라이언트를 별도 스레드에서 스트리밍하는 동안, 메인 스레드가 cancel을 부른다.
+    slow_client = FakeInferenceClient(
+        chunks=("가", "나", "다", "라", "마"), delay_between_chunks=0.05
+    )
+    api = _chat_client(store, owner, inference_client=slow_client)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    result: dict = {}
+
+    def stream():
+        result["response"] = api.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+            json={"conversation_id": conversation_id, "message": "안녕"},
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        future = workers.submit(stream)
+        time.sleep(0.06)  # 첫 delta 이후 취소하도록 살짝 기다린다
+        # generation_id를 얻으려면 DB에서 직접 조회한다(스트림이 아직 안 끝났으므로).
+        with store.pool.connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM persona_minimal.generations WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+        generation_id = row[0]
+        cancel_response = api.post(
+            f"/v1/generations/{generation_id}/cancel",
+            headers={"Authorization": "Bearer integration-token"},
+        )
+        future.result()
+
+    assert cancel_response.status_code == 200
+    events = _parse_sse(result["response"].text)
+    last_name, last_data = events[-1]
+    assert last_name == "error"
+    assert last_data["status"] == "cancelled"
+
+    generation = chat_store.get_generation(owner, generation_id)
+    assert generation.status == "cancelled"
+
+
+def test_retry_reuses_input_snapshot_without_calling_embed_again(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    embed_calls = []
+
+    def counting_embed(base_url, texts, input_type):
+        embed_calls.append(texts)
+        return _fake_embed(base_url, texts, input_type)
+
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", counting_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "재시도대상",
+        "재시도대상은 침착한 안내자다.",
+        "재시도대상은 소포를 발견했다.",
+        "재시도대상: 안녕",
+    )
+    # 원본을 일부러 실패시켜(업스트림 오류) 재시도 대상을 만든다.
+    failing_client = FakeInferenceClient(raise_before_start=UpstreamError("upstream_503"))
+    api = _chat_client(store, owner, inference_client=failing_client)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+    first = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": conversation_id, "message": "안녕"},
+    )
+    first_events = _parse_sse(first.text)
+    assert first_events[-1][0] == "error"
+    generation_id = first_events[0][1]["generation_id"]
+    original = chat_store.get_generation(owner, UUID(generation_id))
+    assert original.status == "failed"
+    embed_calls_after_first = len(embed_calls)
+    assert embed_calls_after_first >= 1  # 원본은 검색을 실제로 돌렸다
+
+    # 이제 정상 동작하는 클라이언트로 재시도한다.
+    api.app.state.inference_client = FakeInferenceClient()
+    retry_response = api.post(
+        f"/v1/generations/{generation_id}/retry",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert retry_response.status_code == 200, retry_response.text
+    retry_events = _parse_sse(retry_response.text)
+    assert retry_events[-1][0] == "done"
+    # retry는 검색을 다시 돌리지 않는다 — embed 호출 횟수가 늘지 않아야 한다.
+    assert len(embed_calls) == embed_calls_after_first
+
+
+def test_reconciling_generation_is_resolved_lazily_after_heartbeat_timeout(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reconciling → failed(reconciliation_timeout) 지연 해소. 실제로 300초를
+    기다리지 않는다 — heartbeat_at을 직접 300초보다 오래된 값으로 만든 뒤, 같은
+    사용자의 다음 요청이 그 자리에서 해소하는지 본다(feedback.md 확정 정책)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "정체대상",
+        "정체대상은 침착한 안내자다.",
+        "정체대상은 소포를 발견했다.",
+        "정체대상: 안녕",
+    )
+    api = _chat_client(store, owner)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    # 직접 stuck된 reconciling generation을 만든다(재시작 시뮬레이션을 거치지 않고
+    # 최종 상태만 재현 — lifespan 재시작 경로는 별도 테스트가 본다).
+    with store.pool.connection() as connection:
+        user_message_id = connection.execute(
+            "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (uuid4(), conversation_id, "오래된 질문"),
+        ).fetchone()[0]
+        stuck_generation_id = uuid4()
+        connection.execute(
+            "INSERT INTO persona_minimal.generations("
+            "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
+            ") VALUES (%s, %s, %s, "
+            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "'mock', 'reconciling', now() - interval '301 seconds')",
+            (stuck_generation_id, conversation_id, user_message_id, persona.id),
+        )
+        connection.commit()
+
+    response = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": conversation_id, "message": "새 질문"},
+    )
+    assert response.status_code == 200, response.text
+
+    stuck = chat_store.get_generation(owner, stuck_generation_id)
+    assert stuck.status == "failed"
+    assert stuck.failure_code == "reconciliation_timeout"
+
+
+def test_reconciling_generation_still_blocks_new_requests_before_timeout(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "대기대상",
+        "대기대상은 침착한 안내자다.",
+        "대기대상은 소포를 발견했다.",
+        "대기대상: 안녕",
+    )
+    api = _chat_client(store, owner)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    with store.pool.connection() as connection:
+        user_message_id = connection.execute(
+            "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (uuid4(), conversation_id, "방금 질문"),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO persona_minimal.generations("
+            "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
+            ") VALUES (%s, %s, %s, "
+            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "'mock', 'reconciling', now())",
+            (uuid4(), conversation_id, user_message_id, persona.id),
+        )
+        connection.commit()
+
+    response = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": conversation_id, "message": "새 질문"},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "generation_in_progress"
+
+
+def test_startup_reconciles_stale_running_generation_into_reconciling(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gateway 재시작 시뮬레이션 — 이전 프로세스가 running으로 남긴 generation이
+    유령 슬롯(영원히 활성)이 되지 않고 reconciling으로 전환되는지 본다.
+    "프로세스가 죽었으니 failed로 슬롯 해제"는 하지 않는다(feedback.md 명시 금지) —
+    그래서 여기서 최종 상태를 completed/failed가 아니라 reconciling으로 확인한다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "재시작대상",
+        "재시작대상은 침착한 안내자다.",
+        "재시작대상은 소포를 발견했다.",
+        "재시작대상: 안녕",
+    )
+    with store.pool.connection() as connection:
+        conversation_id = connection.execute(
+            "INSERT INTO persona_minimal.conversations(id, persona_id, owner_subject, initial_version_id, title) "
+            "VALUES (%s, %s, %s, "
+            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), %s) "
+            "RETURNING id",
+            (uuid4(), persona.id, owner, persona.id, "재시작 대화"),
+        ).fetchone()[0]
+        user_message_id = connection.execute(
+            "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (uuid4(), conversation_id, "죽기 전 질문"),
+        ).fetchone()[0]
+        stuck_generation_id = uuid4()
+        connection.execute(
+            "INSERT INTO persona_minimal.generations("
+            "id, conversation_id, user_message_id, version_id, mode, status"
+            ") VALUES (%s, %s, %s, "
+            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "'mock', 'running')",
+            (stuck_generation_id, conversation_id, user_message_id, persona.id),
+        )
+        connection.commit()
+
+    # create_app() 호출 자체가 lifespan을 태운다(TestClient를 with로 열 때).
+    with _chat_client(store, owner):
+        pass
+
+    reconciled = chat_store.get_generation(owner, stuck_generation_id)
+    assert reconciled.status == "reconciling"
