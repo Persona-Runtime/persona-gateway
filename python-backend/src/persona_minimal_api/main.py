@@ -8,16 +8,41 @@ from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 from psycopg import Error as PsycopgError
 from psycopg.errors import UndefinedTable
 from psycopg_pool import PoolTimeout
 
+from .chat import service as chat_service
+from .chat.fake_inference import FakeInferenceClient
+from .chat.inference import InferenceClient
+from .chat.repository import (
+    ChatStore,
+    Citation,
+    ConversationNotFound,
+    Generation,
+    GenerationInProgress,
+    GenerationNotFound,
+    IdempotencyConflict as ChatIdempotencyConflict,
+    RetryNotAllowed,
+)
 from .config import Settings
-from .cursor import CursorError, PersonaCursor, decode as decode_cursor, encode as encode_cursor
+from .cursor import (
+    ConversationCursor,
+    CursorError,
+    MessageCursor,
+    PersonaCursor,
+    decode as decode_cursor,
+    decode_conversation_cursor,
+    decode_message_cursor,
+    encode as encode_cursor,
+    encode_conversation_cursor,
+    encode_message_cursor,
+)
 from .indexing.embedding_client import EmbeddingError, embed
 from .indexing.runner import run_indexing
 from .repository import (
@@ -103,6 +128,12 @@ class DraftPatchRequest(BaseModel):
 class DraftApplyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int
+
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conversation_id: UUID
+    message: str
 
 
 def require_idempotency_key(raw: str | None) -> UUID:
@@ -224,17 +255,31 @@ def error_body(error: ApiError, request_id: str) -> dict[str, object]:
 def error_response(request: Request, error: ApiError) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None) or str(uuid4())
     response = JSONResponse(status_code=error.status, content=error_body(error, request_id))
-    response.headers["Cache-Control"] = "no-store"
+    # response_headers 미들웨어와 같은 값을 쓴다 — 예외 처리 경로가 그 미들웨어를
+    # 거치기 전에 이 응답을 반환하는 경우가 있어(실측: 일반 Exception 핸들러 경로),
+    # 여기서도 직접 맞춰 둬야 항상 같은 값이 나간다.
+    response.headers["Cache-Control"] = "no-store, no-transform"
     response.headers["X-Request-Id"] = request_id
     return response
 
 
-def create_app(settings: Settings | None = None, store: PersonaStore | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    store: PersonaStore | None = None,
+    inference_client: InferenceClient | None = None,
+) -> FastAPI:
     settings = settings or Settings()
     owned_pool = None
     if store is None:
         owned_pool = create_pool(settings.database_url, settings.database_timeout_seconds)
         store = PostgresPersonaStore(owned_pool)
+    # settings.chat_inference_mode는 지금 "mock"만 허용한다(config.py) — 그래서 여기
+    # 분기가 하나뿐이다. "llm"이 추가돼도 값이 다르면 기본 FakeInferenceClient로
+    # 조용히 넘어가지 않고, 그 분기를 명시적으로 추가하기 전까지는 pydantic이
+    # 기동 시점에 이미 막는다.
+    chat_store = ChatStore(store.pool) if isinstance(store, PostgresPersonaStore) else None
+    if inference_client is None:
+        inference_client = FakeInferenceClient()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -273,6 +318,27 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
                         )
                 except UndefinedTable:
                     pass
+
+            # 이전 프로세스가 generation 스트리밍 도중 죽었으면(SIGTERM·크래시) 그
+            # 행이 queued/running/cancel_requested에 멈춰 있다 — "프로세스가 죽었으니
+            # failed 처리 후 슬롯 해제"는 하지 않는다(feedback.md 명시 금지). 대신
+            # reconciling으로 옮겨 "결과를 모른다"를 정직하게 남긴다. 실제 terminal
+            # 전환은 별도 background sweep이 아니라, 같은 사용자의 다음 generation
+            # 요청이 잠금 안에서 heartbeat_at·300초를 보고 그 자리에서 처리한다
+            # (chat/repository.py의 _reject_or_resolve_active_generation).
+            #
+            # 0003 호환 창 동안은(채팅 스키마가 아직 없는 DB) UndefinedTable을 잡아
+            # 건너뛴다 — 위 material_versions 정리와 같은 이유.
+            if chat_store is not None:
+                try:
+                    reconciled = chat_store.reconcile_stale_generations_on_startup()
+                    if reconciled:
+                        logger.warning(
+                            "chat reconciliation: %d stale generation(s) marked reconciling",
+                            reconciled,
+                        )
+                except UndefinedTable:
+                    pass
         yield
         if owned_pool is not None:
             owned_pool.close()
@@ -282,12 +348,18 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
     )
     app.state.settings = settings
     app.state.store = store
+    app.state.chat_store = chat_store
+    app.state.inference_client = inference_client
 
     @app.middleware("http")
     async def response_headers(request: Request, call_next):
         request.state.request_id = str(uuid4())
         response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
+        # no-store가 no-cache보다 강한 지시라 SSE 스트리밍 응답에도 그대로 쓴다(중간
+        # 캐시가 아예 저장하지 못하게 한다). no-transform은 프록시가 응답 바디를
+        # 손대지 못하게 한다 — SSE가 중간에 재인코딩되면 이벤트 경계(빈 줄)가 깨질
+        # 수 있다.
+        response.headers["Cache-Control"] = "no-store, no-transform"
         # 브라우저가 Content-Type을 멋대로 추측하지 못하게 한다. 지금은 JSON만 돌려주지만,
         # 추측을 허용하면 오류 본문이나 프록시가 끼워 넣은 응답이 다른 형식으로 해석될 수 있다.
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -706,5 +778,321 @@ def create_app(settings: Settings | None = None, store: PersonaStore | None = No
             "body": [retrieve_chunk_response(chunk) for chunk in body],
             "speech": [retrieve_chunk_response(chunk) for chunk in speech],
         }
+
+    # --- Chat API ------------------------------------------------------------
+
+    def chat_error(error: Exception) -> ApiError:
+        """chat/repository.py 예외를 계약의 오류로 옮긴다. draft_error와 같은 패턴."""
+        if isinstance(error, PersonaNotFound):
+            return ApiError(404, "persona_not_found", "캐릭터를 찾을 수 없습니다.")
+        if isinstance(error, ConversationNotFound):
+            return ApiError(404, "conversation_not_found", "대화를 찾을 수 없습니다.")
+        if isinstance(error, GenerationNotFound):
+            return ApiError(404, "generation_not_found", "생성을 찾을 수 없습니다.")
+        if isinstance(error, NotIndexed):
+            return ApiError(409, "not_indexed", "아직 색인된 자료가 없습니다.")
+        if isinstance(error, SchemaNotReady):
+            return ApiError(
+                409, "schema_not_ready", "아직 이 기능을 쓸 수 없습니다. 잠시 후 다시 시도해주세요."
+            )
+        if isinstance(error, GenerationInProgress):
+            # 계약 §7: "다른 대화에 활성 생성이 있으면 409 generation_in_progress로
+            # 거절한다." 코드명은 계약이 정한 값 그대로다.
+            return ApiError(409, "generation_in_progress", "이미 진행 중인 응답이 있습니다.")
+        if isinstance(error, RetryNotAllowed):
+            messages = {
+                "retry_not_latest": "이 시도는 대화의 최신 질문이 아니라 다시 시도할 수 없습니다.",
+                "retry_input_unavailable": "재사용할 입력이 없어 다시 시도할 수 없습니다.",
+                "generation_in_progress": "이미 진행 중인 응답이 있습니다.",
+            }
+            return ApiError(
+                409, error.code, messages.get(error.code, "이 시도는 다시 시도할 수 없습니다.")
+            )
+        if isinstance(error, ChatIdempotencyConflict):
+            return ApiError(
+                409, "idempotency_conflict", "같은 키에 다른 요청을 사용할 수 없습니다."
+            )
+        if isinstance(error, chat_service.InvalidQuestion):
+            if error.code == "blank":
+                return ApiError(
+                    422,
+                    "invalid_message",
+                    "질문은 비어 있을 수 없습니다.",
+                    [{"field": "message", "code": "blank"}],
+                )
+            return ApiError(
+                422,
+                "invalid_message",
+                "질문은 2000자를 넘을 수 없습니다.",
+                [{"field": "message", "code": "too_long"}],
+            )
+        raise error
+
+    def citation_response(citation: Citation) -> dict[str, object]:
+        return citation.to_json()
+
+    def generation_response(generation: Generation) -> dict[str, object]:
+        return {
+            "id": str(generation.id),
+            "conversation_id": str(generation.conversation_id),
+            "user_message_id": str(generation.user_message_id),
+            "assistant_message_id": str(generation.assistant_message_id),
+            "version_id": str(generation.version_id),
+            "retry_of_generation_id": (
+                str(generation.retry_of_generation_id)
+                if generation.retry_of_generation_id
+                else None
+            ),
+            "mode": generation.mode,
+            "status": generation.status,
+            "content": generation.content,
+            "citations": [citation_response(c) for c in generation.citations],
+            "failure_code": generation.failure_code,
+            "can_retry": generation.can_retry,
+            "created_at": generation.created_at,
+            "finished_at": generation.finished_at,
+        }
+
+    def conversation_response(conversation) -> dict[str, object]:
+        return {
+            "id": str(conversation.id),
+            "persona_id": str(conversation.persona_id),
+            "title": conversation.title,
+            "initial_version_id": str(conversation.initial_version_id),
+            "material_changed": conversation.material_changed,
+            "active_generation_id": (
+                str(conversation.active_generation_id)
+                if conversation.active_generation_id
+                else None
+            ),
+            "created_at": conversation.created_at,
+            "updated_at": conversation.updated_at,
+        }
+
+    def user_message_response(message) -> dict[str, object]:
+        return {"id": str(message.id), "content": message.content, "created_at": message.created_at}
+
+    @app.post("/v1/personas/{persona_id}/conversations", status_code=201)
+    def create_conversation(
+        request: Request,
+        persona_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        key = require_idempotency_key(idempotency_key)
+        chat_store: ChatStore = request.app.state.chat_store
+        try:
+            conversation = chat_store.create_conversation(user[0], persona_id, key)
+        except Exception as error:
+            raise chat_error(error) from error
+        return conversation_response(conversation)
+
+    @app.get("/v1/personas/{persona_id}/conversations")
+    def list_conversations(
+        request: Request,
+        persona_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+        limit: int = 20,
+        cursor: str | None = None,
+    ):
+        if limit < 1 or limit > 100:
+            raise ApiError(400, "invalid_limit", "limit은 1에서 100 사이여야 합니다.")
+        decoded = None
+        if cursor is not None:
+            try:
+                decoded_cursor = decode_conversation_cursor(
+                    cursor,
+                    request.app.state.settings.cursor_signing_key.get_secret_value(),
+                    user[0],
+                )
+                decoded = (decoded_cursor.created_at, decoded_cursor.conversation_id)
+            except CursorError as exc:
+                raise ApiError(400, "invalid_cursor", "cursor를 확인해주세요.") from exc
+        chat_store: ChatStore = request.app.state.chat_store
+        try:
+            conversations = chat_store.list_conversations(user[0], persona_id, limit + 1, decoded)
+        except Exception as error:
+            raise chat_error(error) from error
+        has_next = len(conversations) > limit
+        page = conversations[:limit]
+        next_cursor = None
+        if has_next:
+            tail = page[-1]
+            next_cursor = encode_conversation_cursor(
+                ConversationCursor(user[0], tail.created_at, tail.id),
+                request.app.state.settings.cursor_signing_key.get_secret_value(),
+            )
+        return {
+            "items": [conversation_response(c) for c in page],
+            "next_cursor": next_cursor,
+        }
+
+    @app.get("/v1/conversations/{conversation_id}/messages")
+    def list_messages(
+        request: Request,
+        conversation_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+        limit: int = 20,
+        cursor: str | None = None,
+    ):
+        if limit < 1 or limit > 100:
+            raise ApiError(400, "invalid_limit", "limit은 1에서 100 사이여야 합니다.")
+        decoded = None
+        if cursor is not None:
+            try:
+                decoded_cursor = decode_message_cursor(
+                    cursor,
+                    request.app.state.settings.cursor_signing_key.get_secret_value(),
+                    conversation_id,
+                )
+                decoded = (decoded_cursor.created_at, decoded_cursor.user_message_id)
+            except CursorError as exc:
+                raise ApiError(400, "invalid_cursor", "cursor를 확인해주세요.") from exc
+        chat_store: ChatStore = request.app.state.chat_store
+        try:
+            turns = chat_store.list_messages(user[0], conversation_id, limit + 1, decoded)
+        except Exception as error:
+            raise chat_error(error) from error
+        has_next = len(turns) > limit
+        page = turns[:limit]
+        next_cursor = None
+        if has_next:
+            tail = page[-1]
+            next_cursor = encode_message_cursor(
+                MessageCursor(conversation_id, tail.user_message.created_at, tail.user_message.id),
+                request.app.state.settings.cursor_signing_key.get_secret_value(),
+            )
+        return {
+            "items": [
+                {
+                    "user_message": user_message_response(turn.user_message),
+                    "generations": [generation_response(g) for g in turn.generations],
+                }
+                for turn in page
+            ],
+            "next_cursor": next_cursor,
+        }
+
+    def _stream_headers(request_id: str) -> dict[str, str]:
+        return {"X-Request-Id": request_id}
+
+    @app.post("/v1/chat/completions")
+    def chat_completions(
+        request: Request,
+        body: ChatRequest,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        key = require_idempotency_key(idempotency_key)
+        try:
+            question = chat_service.validate_question(body.message)
+        except chat_service.InvalidQuestion as error:
+            raise chat_error(error) from error
+
+        chat_store: ChatStore = request.app.state.chat_store
+        try:
+            accepted = chat_service.accept_chat_completion(
+                chat_store, user[0], body.conversation_id, question, key
+            )
+        except Exception as error:
+            raise chat_error(error) from error
+
+        if accepted.replay:
+            # JSONResponse는 route가 dict를 직접 반환할 때와 달리 FastAPI의
+            # jsonable_encoder를 자동으로 거치지 않는다 — datetime 같은 값이 있으면
+            # 그냥 json.dumps가 TypeError를 낸다. 여기서 직접 인코딩한다.
+            return JSONResponse(
+                jsonable_encoder(
+                    {"replayed": True, "generation": generation_response(accepted.generation)}
+                ),
+                headers=_stream_headers(request.state.request_id),
+            )
+
+        # persona_id는 대화에서 다시 읽는다 — accept 단계는 그걸 반환하지 않는다.
+        with request.app.state.store.pool.connection() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT persona_id FROM persona_minimal.conversations WHERE id = %s",
+                    (body.conversation_id,),
+                )
+                persona_id = cur.fetchone()[0]
+
+        generator = chat_service.stream_generation(
+            pool=request.app.state.store.pool,
+            embedding_url=request.app.state.settings.embedding_url,
+            chat_store=chat_store,
+            owner_subject=user[0],
+            persona_id=persona_id,
+            generation=accepted.generation,
+            question=question,
+            inference_client=request.app.state.inference_client,
+        )
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers=_stream_headers(request.state.request_id),
+        )
+
+    @app.post("/v1/generations/{generation_id}/cancel")
+    def cancel_generation(
+        request: Request,
+        generation_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+    ):
+        chat_store: ChatStore = request.app.state.chat_store
+        try:
+            generation = chat_store.request_cancel(user[0], generation_id)
+        except Exception as error:
+            raise chat_error(error) from error
+        if generation.status == "cancel_requested":
+            request.app.state.inference_client.cancel(generation_id)
+        return generation_response(generation)
+
+    @app.post("/v1/generations/{generation_id}/retry")
+    def retry_generation(
+        request: Request,
+        generation_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        key = require_idempotency_key(idempotency_key)
+        chat_store: ChatStore = request.app.state.chat_store
+        try:
+            accepted = chat_service.accept_retry(chat_store, user[0], generation_id, key)
+        except Exception as error:
+            raise chat_error(error) from error
+
+        if accepted.replay:
+            return JSONResponse(
+                jsonable_encoder(
+                    {"replayed": True, "generation": generation_response(accepted.generation)}
+                ),
+                headers=_stream_headers(request.state.request_id),
+            )
+
+        with request.app.state.store.pool.connection() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT persona_id FROM persona_minimal.conversations WHERE id = %s",
+                    (accepted.generation.conversation_id,),
+                )
+                persona_id = cur.fetchone()[0]
+        question = accepted.generation.input_snapshot.question  # type: ignore[union-attr]
+
+        generator = chat_service.stream_generation(
+            pool=request.app.state.store.pool,
+            embedding_url=request.app.state.settings.embedding_url,
+            chat_store=chat_store,
+            owner_subject=user[0],
+            persona_id=persona_id,
+            generation=accepted.generation,
+            question=question,
+            inference_client=request.app.state.inference_client,
+        )
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers=_stream_headers(request.state.request_id),
+        )
 
     return app
