@@ -7,6 +7,8 @@ DB 처리·응답 변환을 역할로 나눈다). 저수준 SQL은 `chat/reposit
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from typing import Iterator
@@ -156,19 +158,20 @@ def stream_generation(
     클라이언트가 스트림 도중 연결을 끊으면 Starlette가 이 제너레이터에
     `GeneratorExit`을 던진다 — "프로세스가 안 죽었어도 결과를 모른다"를 그대로
     반영해 reconciling으로 남긴다(연결 종료만으로 슬롯을 즉시 해제하지 않는다).
-    meta를 보내기 전에는(아직 실제로 뭔가 시작하지 않았으므로) 이 처리가 필요 없다.
+    meta를 보내는 시점부터 이미 이 처리가 필요하다 — meta 직후(첫 delta조차 오기
+    전에) 끊기는 것도 "결과를 모르는" 경우이므로, try는 meta yield까지 감싼다.
     """
     metrics.GENERATIONS_STARTED.labels(mode=generation.mode).inc()
     start = time.monotonic()
-    yield format_meta(
-        generation_id=generation.id,
-        conversation_id=generation.conversation_id,
-        user_message_id=generation.user_message_id,
-        assistant_message_id=generation.assistant_message_id,
-        version_id=generation.version_id,
-        mode=generation.mode,
-    )
     try:
+        yield format_meta(
+            generation_id=generation.id,
+            conversation_id=generation.conversation_id,
+            user_message_id=generation.user_message_id,
+            assistant_message_id=generation.assistant_message_id,
+            version_id=generation.version_id,
+            mode=generation.mode,
+        )
         yield from _run_generation(
             pool=pool,
             embedding_url=embedding_url,
@@ -243,10 +246,16 @@ def _run_generation(
         yield format_citations(generation_id=generation.id, items=[c.to_json() for c in citations])
     except (PersonaNotFound, NotIndexed, SchemaNotReady, QuestionTooLong, EmbeddingError) as error:
         code = type(error).__name__
-        message = "응답을 준비할 수 없습니다."
-        chat_store.finish_generation(generation.id, status="failed", content="", failure_code=code)
-        metrics.GENERATIONS_FINISHED.labels(mode=generation.mode, terminal_reason="failed").inc()
-        yield format_error(generation_id=generation.id, code=code, message=message, status="failed")
+        # finish_generation이 저장된 실제 status를 돌려준다 — 검색 중에 별도 요청이
+        # cancel_requested를 남겼다면(이 실패 코드가 아니라) cancelled로 저장되고,
+        # 아래 이벤트도 그 실제 값을 따른다(DB와 클라이언트가 보는 결과를 일치시킨다).
+        persisted = chat_store.finish_generation(
+            generation.id, status="failed", content="", failure_code=code
+        )
+        metrics.GENERATIONS_FINISHED.labels(
+            mode=generation.mode, terminal_reason=persisted.status
+        ).inc()
+        yield _terminal_event(persisted, fallback_finish_reason="stop")
         return
 
     content_parts: list[str] = []
@@ -256,61 +265,87 @@ def _run_generation(
     failure_code: str | None = None
     first_chunk_at: float | None = None
 
+    # 동기 코드에서 블로킹 이터레이터(inference_client.start())를 선점형으로
+    # 끊으려면 별도 스레드가 필요하다 — queue.get(timeout=...)은 워커가 next() 안에서
+    # 블록 중이어도 정확히 그 시간에 반환되지만, 기존의 for 루프 조건 체크는 새
+    # chunk가 와야만 실행돼 업스트림이 조용히 멈추면 영원히 대기했다(고쳐지기 전
+    # 버그). 워커는 daemon 스레드다 — 이번 범위엔 실제 vLLM이 없어 무한 대기해도
+    # DB 커넥션 등 자원을 쥐고 있지 않으므로 프로세스 종료를 막지 않는 daemon으로
+    # 충분하다.
+    chunk_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def _drain() -> None:
+        try:
+            for piece in inference_client.start(
+                generation.id, messages, max_tokens=MAX_ANSWER_TOKENS
+            ):
+                chunk_queue.put(("chunk", piece))
+            chunk_queue.put(("end", None))
+        except Exception as error:  # UpstreamError 등 — 메인 스레드에서 다시 던진다
+            chunk_queue.put(("error", error))
+
+    threading.Thread(target=_drain, daemon=True).start()
+
     try:
-        for chunk in inference_client.start(generation.id, messages, max_tokens=MAX_ANSWER_TOKENS):
+        while True:
             now = time.monotonic()
-            if first_chunk_at is None:
-                first_chunk_at = now
-                metrics.TIME_TO_FIRST_TOKEN_SECONDS.observe(now - start)
-            elif now - start > total_deadline_seconds:
+            deadline = (
+                first_token_deadline_seconds if first_chunk_at is None else total_deadline_seconds
+            )
+            remaining = max(0.0, deadline - (now - start))
+            try:
+                kind, payload = chunk_queue.get(timeout=remaining)
+            except queue.Empty:
                 inference_client.cancel(generation.id)
                 terminal_status = "failed"
-                failure_code = "generation_timeout"
+                failure_code = (
+                    "first_token_timeout" if first_chunk_at is None else "generation_timeout"
+                )
                 finish_reason = "length"
                 break
-            content_parts.append(chunk)
-            yield format_delta(generation_id=generation.id, index=index, text=chunk)
+            if kind == "end":
+                break
+            if kind == "error":
+                raise payload  # type: ignore[misc]  # UpstreamError면 아래 except가 잡는다
+            if first_chunk_at is None:
+                first_chunk_at = time.monotonic()
+                metrics.TIME_TO_FIRST_TOKEN_SECONDS.observe(first_chunk_at - start)
+            content_parts.append(payload)  # type: ignore[arg-type]
+            yield format_delta(generation_id=generation.id, index=index, text=payload)  # type: ignore[arg-type]
             index += 1
-        else:
-            # for-else: 루프가 break 없이 끝났다(정상 종료 또는 upstream이 조용히
-            # 멈춤). 첫 토큰조차 없었다면 60초 판정은 아래에서 별도로 본다.
-            pass
-        if first_chunk_at is None and time.monotonic() - start > first_token_deadline_seconds:
-            terminal_status = "failed"
-            failure_code = "first_token_timeout"
-            finish_reason = "length"
     except UpstreamError as error:
         terminal_status = "failed"
         failure_code = error.code
         finish_reason = "length"
 
-    # 취소는 별도 요청(POST .../cancel)이 DB에 이미 cancel_requested로 남겨 뒀을 수
-    # 있다 — inference_client의 이터레이터가 조용히 멈추는 것과 "정상 종료"를
-    # 이걸로 구분한다. reconciling(연결 끊김·재시작)도 여기서 덮어쓰지 않는다 —
-    # 이 코드 경로가 실행 중이라는 건 이 프로세스가 여전히 살아 응답을 만들고
-    # 있다는 뜻이라 reconciling으로 전환될 이유가 없다.
-    current = chat_store.get_generation(owner_subject, generation.id)
-    if current.status == "cancel_requested":
-        terminal_status = "cancelled"
-        failure_code = None
-        finish_reason = "stop"
-
     content = "".join(content_parts)
-    chat_store.finish_generation(
+    # 취소는 별도 요청(POST .../cancel)이 DB에 이미 cancel_requested로 남겨 뒀을 수
+    # 있다 — finish_generation이 SQL CASE로 그 경우를 우선해 cancelled로 확정하고
+    # 실제 저장값을 돌려준다. 여기서 계산한 terminal_status/failure_code는 그
+    # 기본값일 뿐이고, 최종 판단은 항상 finish_generation의 반환값을 따른다(단일
+    # 진실 소스 — 파이썬 쪽에서 다시 조회해 비교하지 않는다).
+    persisted = chat_store.finish_generation(
         generation.id, status=terminal_status, content=content, failure_code=failure_code
     )
-    metrics.GENERATIONS_FINISHED.labels(mode=generation.mode, terminal_reason=terminal_status).inc()
+    metrics.GENERATIONS_FINISHED.labels(
+        mode=generation.mode, terminal_reason=persisted.status
+    ).inc()
     metrics.TOTAL_GENERATION_SECONDS.observe(time.monotonic() - start)
+    yield _terminal_event(persisted, fallback_finish_reason=finish_reason)
 
-    if terminal_status == "completed":
-        yield format_done(generation_id=generation.id, finish_reason=finish_reason)
-    else:
-        status_field = "cancelled" if terminal_status == "cancelled" else "failed"
-        yield format_error(
-            generation_id=generation.id,
-            code=failure_code or "cancelled",
-            message="응답 생성이 중단됐습니다."
-            if terminal_status == "cancelled"
-            else "응답 생성에 실패했습니다.",
-            status=status_field,
-        )
+
+def _terminal_event(persisted: Generation, *, fallback_finish_reason: str) -> str:
+    """저장된 실제 status를 기준으로 done/error SSE 프레임을 만든다."""
+    if persisted.status == "completed":
+        return format_done(generation_id=persisted.id, finish_reason=fallback_finish_reason)
+    status_field = "cancelled" if persisted.status == "cancelled" else "failed"
+    return format_error(
+        generation_id=persisted.id,
+        code=persisted.failure_code or "cancelled",
+        message=(
+            "응답 생성이 중단됐습니다."
+            if persisted.status == "cancelled"
+            else "응답 생성에 실패했습니다."
+        ),
+        status=status_field,
+    )
