@@ -15,10 +15,11 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 
+from persona_minimal_api.chat import service as chat_service
 from persona_minimal_api.chat.fake_inference import FakeInferenceClient, UpstreamError
 from persona_minimal_api.chat.repository import ChatStore
 from persona_minimal_api.config import Settings
-from persona_minimal_api.indexing.embedding_client import EmbeddingResult
+from persona_minimal_api.indexing.embedding_client import EmbeddingError, EmbeddingResult
 from persona_minimal_api.indexing.runner import run_indexing
 from persona_minimal_api.indexing.store import ChunkRecord, replace_chunks
 from persona_minimal_api.main import create_app
@@ -2084,3 +2085,398 @@ def test_startup_reconciles_stale_running_generation_into_reconciling(
 
     reconciled = chat_store.get_generation(owner, stuck_generation_id)
     assert reconciled.status == "reconciling"
+
+
+def test_first_token_timeout_actually_fires_for_slow_upstream(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """업스트림이 첫 청크도 안 주고 계속 블록해도 first_token_deadline_seconds를
+    실제로 넘기면 강제로 끊는다. 고치기 전에는 이 판정이 for 루프가 끝난(=업스트림이
+    결국 뭔가 응답한) 뒤에만 실행돼 죽은 코드였다 — 이 테스트는 업스트림이 1초를
+    자게 두고 데드라인은 0.05초로 줘서, 1초를 기다리지 않고 훨씬 먼저 끊기는지
+    본다(main.py는 이 값을 오버라이드하지 않으므로 서비스 함수를 직접 호출한다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "느림대상",
+        "느림대상은 침착한 안내자다.",
+        "느림대상은 소포를 발견했다.",
+        "느림대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+
+    hanging_client = FakeInferenceClient(delay_before_first_chunk=1.0)
+    started = time.monotonic()
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=hanging_client,
+        first_token_deadline_seconds=0.05,
+        total_deadline_seconds=5.0,
+    )
+    events = _parse_sse("".join(generator))
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"선점형 타임아웃이 아니라 업스트림이 끝나길 기다렸다({elapsed:.2f}s)"
+
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "first_token_timeout"
+    generation = chat_store.get_generation(owner, accepted.generation.id)
+    assert generation.status == "failed"
+    assert generation.failure_code == "first_token_timeout"
+
+
+def test_total_generation_timeout_fires_mid_stream(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """첫 청크는 받았지만 다음 청크가 안 오는 채로 total_deadline_seconds를
+    넘기면 강제로 끊는다. 고치기 전에는 "새 청크가 와야만" 이 검사가 실행돼
+    업스트림이 중간에 멈추면 영원히 대기했다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "중간멈춤대상",
+        "중간멈춤대상은 침착한 안내자다.",
+        "중간멈춤대상은 소포를 발견했다.",
+        "중간멈춤대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+
+    stalling_client = FakeInferenceClient(chunks=("가", "나", "다"), delay_between_chunks=1.0)
+    started = time.monotonic()
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=stalling_client,
+        first_token_deadline_seconds=5.0,
+        total_deadline_seconds=0.05,
+    )
+    events = _parse_sse("".join(generator))
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"선점형 타임아웃이 아니라 다음 청크를 기다렸다({elapsed:.2f}s)"
+
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "generation_timeout"
+    delta_events = [data for name, data in events if name == "delta"]
+    assert len(delta_events) == 1  # 첫 청크는 이미 받은 뒤 끊겼다
+    generation = chat_store.get_generation(owner, accepted.generation.id)
+    assert generation.status == "failed"
+    assert generation.failure_code == "generation_timeout"
+
+
+def test_stop_after_disconnect_is_recorded_as_failed_not_completed(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FakeInferenceClient(stop_after=N)는 "중간 upstream 단절"을 흉내 낸다 —
+    고치기 전에는 단순 return이라 정상 완료와 구분되지 않아 completed로 잘못
+    저장됐다. 이제는 UpstreamError를 던지므로 failed(upstream_disconnected)여야
+    한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "단절대상",
+        "단절대상은 침착한 안내자다.",
+        "단절대상은 소포를 발견했다.",
+        "단절대상: 안녕",
+    )
+    disconnecting_client = FakeInferenceClient(chunks=("가", "나", "다"), stop_after=1)
+    api = _chat_client(store, owner, inference_client=disconnecting_client)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    response = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": conversation_id, "message": "안녕"},
+    )
+    assert response.status_code == 200, response.text
+    events = _parse_sse(response.text)
+    assert events[-1][0] == "error"
+    assert events[-1][1]["status"] == "failed"
+    assert events[-1][1]["code"] == "upstream_disconnected"
+
+    generation_id = events[0][1]["generation_id"]
+    generation = chat_store.get_generation(owner, UUID(generation_id))
+    assert generation.status == "failed"
+    assert generation.failure_code == "upstream_disconnected"
+    assert generation.content == "가"  # 끊기기 전까지 받은 조각은 그대로 저장된다
+
+
+def test_disconnect_immediately_after_meta_becomes_reconciling(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """meta만 받고(첫 delta조차 오기 전) 연결이 끊기면 제너레이터가 meta를 보낸
+    지점에서 GeneratorExit을 받는다 — try가 meta yield까지 감싸야 reconciling으로
+    남는다(감싸지 않으면 queued로 방치돼 슬롯이 영구히 막힌다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "meta끊김대상",
+        "meta끊김대상은 침착한 안내자다.",
+        "meta끊김대상은 소포를 발견했다.",
+        "meta끊김대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=FakeInferenceClient(),
+    )
+    first = next(generator)
+    assert first.startswith("event: meta")
+    generator.close()  # Starlette가 클라이언트 연결 종료 시 하는 것과 같다.
+
+    reconciled = chat_store.get_generation(owner, accepted.generation.id)
+    assert reconciled.status == "reconciling"
+
+
+def test_disconnect_mid_stream_after_some_deltas_becomes_reconciling(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """delta 몇 개를 받은 뒤 연결이 끊겨도(이미 살아있는 요청 처리 중) reconciling
+    으로 남아야 한다 — completed도 failed도 아니라 "결과를 모른다"로 정직하게
+    표시한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "중간끊김대상",
+        "중간끊김대상은 침착한 안내자다.",
+        "중간끊김대상은 소포를 발견했다.",
+        "중간끊김대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=FakeInferenceClient(chunks=("가", "나", "다")),
+    )
+    assert next(generator).startswith("event: meta")
+    assert next(generator).startswith("event: citations")
+    assert next(generator).startswith("event: delta")
+    generator.close()
+
+    reconciled = chat_store.get_generation(owner, accepted.generation.id)
+    assert reconciled.status == "reconciling"
+
+
+def test_cancel_while_still_queued_is_not_clobbered_back_to_running(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """검색(네트워크 호출) 중, 아직 status='queued'인 상태에서 /cancel이 먼저
+    커밋되면 뒤이은 mark_generation_running이 그걸 running으로 되돌려 취소 의도를
+    잃으면 안 된다 — 최종 상태는 cancelled여야 한다(고치기 전에는 가드 없는
+    UPDATE가 cancel_requested를 덮어써 completed로 잘못 저장될 수 있었다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+
+    def slow_embed(base_url, texts, input_type):
+        time.sleep(0.15)
+        return _fake_embed(base_url, texts, input_type)
+
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", slow_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "경합대상",
+        "경합대상은 침착한 안내자다.",
+        "경합대상은 소포를 발견했다.",
+        "경합대상: 안녕",
+    )
+    api = _chat_client(store, owner)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    result: dict = {}
+
+    def stream():
+        result["response"] = api.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+            json={"conversation_id": conversation_id, "message": "안녕"},
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        future = workers.submit(stream)
+        time.sleep(0.03)  # slow_embed가 아직 자는 동안(=아직 queued) 취소를 보낸다
+        with store.pool.connection() as connection:
+            row = connection.execute(
+                "SELECT id, status FROM persona_minimal.generations WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+        generation_id = row[0]
+        assert row[1] == "queued", "검색 도중(queued)에 취소를 보내야 의미가 있는 테스트다"
+        cancel_response = api.post(
+            f"/v1/generations/{generation_id}/cancel",
+            headers={"Authorization": "Bearer integration-token"},
+        )
+        future.result()
+
+    assert cancel_response.status_code == 200, cancel_response.text
+    assert cancel_response.json()["status"] == "cancel_requested"
+
+    events = _parse_sse(result["response"].text)
+    assert events[-1][0] == "error"
+    assert events[-1][1]["status"] == "cancelled"
+    generation = chat_store.get_generation(owner, generation_id)
+    assert generation.status == "cancelled"
+
+
+def test_stuck_cancel_requested_is_resolved_lazily_after_heartbeat_timeout(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cancel_requested로 고착된 채 오래(300초 이상) 방치된 generation은 reconciling
+    과 같은 지연 해소 경로를 탄다 — 같은 사용자의 다음 요청이 그 자리에서
+    failed(reconciliation_timeout)로 닫고 슬롯을 연다. 고치기 전에는 이 상태를
+    구할 방법이 프로세스 재시작뿐이었다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "취소고착대상",
+        "취소고착대상은 침착한 안내자다.",
+        "취소고착대상은 소포를 발견했다.",
+        "취소고착대상: 안녕",
+    )
+    api = _chat_client(store, owner)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    with store.pool.connection() as connection:
+        user_message_id = connection.execute(
+            "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (uuid4(), conversation_id, "고착된 질문"),
+        ).fetchone()[0]
+        stuck_generation_id = uuid4()
+        connection.execute(
+            "INSERT INTO persona_minimal.generations("
+            "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
+            ") VALUES (%s, %s, %s, "
+            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "'mock', 'cancel_requested', now() - interval '301 seconds')",
+            (stuck_generation_id, conversation_id, user_message_id, persona.id),
+        )
+        connection.commit()
+
+    response = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": conversation_id, "message": "새 질문"},
+    )
+    assert response.status_code == 200, response.text
+
+    stuck = chat_store.get_generation(owner, stuck_generation_id)
+    assert stuck.status == "failed"
+    assert stuck.failure_code == "reconciliation_timeout"
+
+
+def test_retry_input_unavailable_when_original_failed_before_search(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """검색 단계 자체에서 실패한 generation은 input_snapshot이 없다 — 재사용할
+    immutable 입력이 없으므로 재시도는 409 retry_input_unavailable이어야 한다
+    (검색을 새로 돌려 "현재 버전으로 조용히 바꾸는" 것은 계약이 금지한다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+
+    def failing_embed(base_url, texts, input_type):
+        raise EmbeddingError("embedding 서비스 실패")
+
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", failing_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "검색실패대상",
+        "검색실패대상은 침착한 안내자다.",
+        "검색실패대상은 소포를 발견했다.",
+        "검색실패대상: 안녕",
+    )
+    api = _chat_client(store, owner)
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    ).json()["id"]
+
+    first = api.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": conversation_id, "message": "안녕"},
+    )
+    assert first.status_code == 200, first.text
+    first_events = _parse_sse(first.text)
+    assert first_events[-1][0] == "error"
+    generation_id = first_events[0][1]["generation_id"]
+    original = chat_store.get_generation(owner, UUID(generation_id))
+    assert original.status == "failed"
+    assert original.input_snapshot is None
+
+    retry_response = api.post(
+        f"/v1/generations/{generation_id}/retry",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert retry_response.status_code == 409, retry_response.text
+    assert retry_response.json()["error"]["code"] == "retry_input_unavailable"
