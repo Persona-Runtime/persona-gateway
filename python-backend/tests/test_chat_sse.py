@@ -84,9 +84,20 @@ def test_fake_inference_cancel_stops_remaining_chunks() -> None:
 
 
 def test_fake_inference_stop_after_simulates_mid_stream_disconnect() -> None:
+    # stop_after는 정상 완료(취소)가 아니라 "중간에 연결이 끊겼다"는 뜻이다 —
+    # Protocol 계약상 예외 없는 조용한 종료는 취소 전용이므로, 일부 chunk를 이미
+    # 내보낸 뒤에도 반드시 UpstreamError를 던져야 한다(단순 return이면 서비스
+    # 계층이 정상 완료와 구분할 수 없다).
     client = FakeInferenceClient(chunks=("a", "b", "c"), stop_after=1)
-    chunks = list(client.start(uuid4(), messages=[], max_tokens=512))
-    assert chunks == ["a"]
+    iterator = client.start(uuid4(), messages=[], max_tokens=512)
+    assert next(iterator) == "a"
+    try:
+        next(iterator)
+        raised = False
+    except UpstreamError as error:
+        raised = True
+        assert error.code == "upstream_disconnected"
+    assert raised
 
 
 def test_fake_inference_raise_before_start_simulates_upstream_error() -> None:

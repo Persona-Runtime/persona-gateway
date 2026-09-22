@@ -50,9 +50,10 @@ class FakeInferenceClient:
             줄여서 검증한다(실제로 60~180초를 기다리지 않는다).
         raise_before_start: 설정하면 `start()` 호출 즉시 이 예외를 던진다(업스트림
             429/503/형식 오류 시뮬레이션 — `UpstreamError` 사용을 권장).
-        stop_after: 설정하면 그 개수만큼만 내보내고 나머지 chunks 없이 그냥
-            반환한다(정상 done이 아니라 "중간 upstream 단절" 시뮬레이션 — 서비스
-            계층이 이걸 정상 완료와 구분해야 한다).
+        stop_after: 설정하면 그 개수만큼만 내보내고 `UpstreamError("upstream_
+            disconnected")`를 던진다(정상 done이 아니라 "중간 upstream 단절"
+            시뮬레이션). Protocol 계약상 예외 없이 조용히 멈추는 건 취소 전용이라
+            — 단순 `return`으로는 정상 완료와 구분되지 않는다.
         """
         self._chunks = chunks
         self._delay_before_first_chunk = delay_before_first_chunk
@@ -82,7 +83,9 @@ class FakeInferenceClient:
         emitted = 0
         for chunk in self._chunks:
             if self._stop_after is not None and emitted >= self._stop_after:
-                return
+                # 중간 upstream 단절 — 취소가 아니므로 조용히 return하지 않는다
+                # (Protocol 계약: 예외 없는 종료는 취소 전용).
+                raise UpstreamError("upstream_disconnected")
             if event.is_set():
                 # 취소됨 — 남은 조각을 더 만들지 않고 그냥 반환한다(예외 아님).
                 return
