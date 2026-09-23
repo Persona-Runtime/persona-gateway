@@ -14,6 +14,24 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # personas.active_version_id를 여기서 함께 추가한다(2026-09-23).
+    #
+    # 원래 이 컬럼은 계약(service-api-v1.md §2·§6, openapi의 Persona.active_version_id)에만
+    # 있고 어느 migration에도 없었다 — API 응답은 상수 null을 내보내고 있었다. 활성화
+    # (draft/activate)를 구현하려면 실제 컬럼이 필요하다.
+    #
+    # 왜 새 revision(0005)이 아니라 이미 머지된 0004를 고치는가: 0004는 아직 어떤
+    # 영속 DB에도 적용되지 않았다(운영 DB는 0003, 테스트는 매번 새 컨테이너). 별도
+    # revision으로 나누면 호환 창과 migration Job이 한 번씩 더 필요한데, 얻는 것이
+    # 없다. 이 판단은 "아직 적용 전"이 전제이므로, 0004가 한 번이라도 적용된 뒤에는
+    # 같은 방식을 쓰지 않는다.
+    #
+    # NULL 허용이다 — 적용본이 없는 캐릭터가 정상 상태다(자료 입력 전·색인 전).
+    # FK는 걸지 않는다: material_versions는 persona당 한 행이라 계속 갱신되므로
+    # 참조로 묶으면 "그 캐릭터의 현재 버전"이 되어 적용 시점의 의미를 잃는다
+    # (conversations.initial_version_id와 같은 이유, 아래 주석 참고).
+    op.execute("ALTER TABLE persona_minimal.personas ADD COLUMN active_version_id uuid")
+
     # owner_subject를 personas 조인 없이 직접 들고 있는다 — idempotency_records와 같은
     # 이유(denormalize)이고, "사용자당 활성 generation 1개"를 모든 대화에 걸쳐 확인할 때
     # personas를 매번 조인하지 않아도 된다.
@@ -147,3 +165,4 @@ def downgrade() -> None:
     op.execute("DROP TABLE persona_minimal.user_messages")
     op.execute("DROP INDEX persona_minimal.conversations_persona_owner_created_idx")
     op.execute("DROP TABLE persona_minimal.conversations")
+    op.execute("ALTER TABLE persona_minimal.personas DROP COLUMN active_version_id")

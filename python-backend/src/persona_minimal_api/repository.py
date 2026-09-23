@@ -4,7 +4,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
@@ -201,6 +201,23 @@ class NotIndexed(Exception):
     검색할 대상 자체가 없다."""
 
 
+class NotActivatable(Exception):
+    """초안은 있지만 지금 활성화할 수 없다(Draft.can_activate가 거짓).
+
+    색인이 끝나지 않았거나(status != 'ready'), 색인 뒤 자료를 더 고쳐
+    indexed_revision이 현재 revision보다 뒤처진 경우다. 후자를 막지 않으면
+    방금 고친 내용이 빠진 색인이 적용본이 된다."""
+
+
+class NoActiveVersion(Exception):
+    """적용본(personas.active_version_id)이 없다.
+
+    대화는 적용본 위에서만 시작한다(계약 §7 "새 대화는 적용본이 있어야 한다").
+    색인만 끝나고 아직 활성화하지 않은 상태와 색인 자체가 없는 상태를 구분하려고
+    NotIndexed와 따로 둔다 — 화면이 "활성화하세요"와 "자료를 넣으세요"를 다르게
+    안내할 수 있어야 한다."""
+
+
 class SchemaNotReady(Exception):
     """migration이 아직 초안 스키마(material_versions 등)를 만들지 않았다(0001).
 
@@ -233,6 +250,15 @@ class DraftSummary:
     revision: int
     status: str
     job_id: UUID | None
+    # requires_processing을 목록에서도 상세와 같은 규칙으로 계산하려면 이 값이 필요하다.
+    # 예전에는 목록이 상수 True를 싣고 상세만 계산해, 같은 초안이 화면마다 다르게
+    # 보일 수 있었다.
+    indexed_revision: int | None = None
+
+    @property
+    def requires_processing(self) -> bool:
+        """Draft.requires_processing과 같은 규칙(그쪽 docstring 참고)."""
+        return not (self.status == "ready" and self.indexed_revision == self.revision)
 
 
 @dataclass(frozen=True)
@@ -242,19 +268,22 @@ class Persona:
     created_at: datetime
     deletion_id: UUID | None
     deleted_at: datetime | None
+    active_version_id: UUID | None = None
     draft: DraftSummary | None = None
 
     @property
     def status(self) -> str:
         """계약 2절이 정한 계산 규칙 그대로다.
 
-        deleting이 우선이고, 적용본이 있으면 ready다(적용본은 아직 없다).
+        deleting이 우선이고, **적용본이 있으면 초안 처리 여부와 무관하게 ready**다.
         적용본이 없으면 초안 없음=needs_material, 실행 중=preparing, 그 외 초안 존재=review_required.
 
         저장 전용 경로로 만든 초안은 job이 없으므로 preparing이 되지 않는다.
         """
         if self.deletion_id is not None and self.deleted_at is None:
             return "deleting"
+        if self.active_version_id is not None:
+            return "ready"
         if self.draft is None:
             return "needs_material"
         if self.draft.job_id is not None and self.draft.status == "processing":
@@ -302,18 +331,34 @@ class Draft:
     error_code: str | None
 
     @property
-    def requires_processing(self) -> bool:
-        """처리가 필요한지. **지금은 항상 참이다.**
+    def can_activate(self) -> bool:
+        """지금 이 초안을 적용본으로 활성화할 수 있는지(서버 판정값, 계약 §2).
 
-        이 값을 거짓으로 만들 수 있는 것은 처리 결과를 아는 쪽뿐인데, 그 처리기가 아직 없다.
-        여기서 임의로 거짓을 돌려주면 웹이 "바로 적용할 수 있다"고 표시하게 된다.
+        조건은 두 개가 동시에 참일 때다 — 마지막 적용 시도가 성공했고(status='ready'),
+        그 성공한 색인이 **지금 내용의** 색인이어야 한다(indexed_revision == revision).
+        둘을 따로 보는 이유: 색인 성공 뒤 자료를 더 고치면 revision만 올라가고
+        indexed_revision은 그대로라, status만 보면 "성공했으니 적용 가능"으로 잘못
+        읽힌다. 그 상태로 활성화하면 사용자가 방금 고친 내용이 빠진 색인이 적용본이 된다.
         """
-        return True
+        return self.status == "ready" and self.indexed_revision == self.revision
 
     @property
-    def can_activate(self) -> bool:
-        """적용할 수 있는지. **지금은 항상 거짓이다.** 근거는 위와 같다."""
-        return False
+    def requires_processing(self) -> bool:
+        """색인을 (다시) 돌려야 하는지. can_activate의 반대다.
+
+        편집 직후(revision만 올라감)·실패·진행 중이 전부 여기 해당한다 — 어느 쪽이든
+        지금 내용으로 색인이 끝나 있지 않다는 뜻은 같다.
+        """
+        return not self.can_activate
+
+
+@dataclass(frozen=True)
+class ActivatedVersion:
+    """activate_draft의 결과. 계약의 Activated 응답 그대로다."""
+
+    persona_id: UUID
+    version_id: UUID
+    activated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -373,6 +418,10 @@ class PersonaStore(Protocol):
         self, owner_subject: str, persona_id: UUID, expected_revision: int
     ) -> IndexingHandle: ...
 
+    def activate_draft(
+        self, owner_subject: str, persona_id: UUID, expected_revision: int
+    ) -> ActivatedVersion: ...
+
 
 @runtime_checkable
 class ReadinessStore(Protocol):
@@ -391,12 +440,16 @@ def _persona(row: dict[str, object]) -> Persona:
         created_at=row["created_at"],  # type: ignore[arg-type]
         deletion_id=row["deletion_id"],  # type: ignore[arg-type]
         deleted_at=row["deleted_at"],  # type: ignore[arg-type]
+        # 0001~0003 시절 SELECT에는 이 컬럼이 없다. 호환 창(0003·0004 둘 다 허용)
+        # 동안에는 0003 DB에서도 이 함수가 불리므로 get()으로 읽는다.
+        active_version_id=row.get("active_version_id"),  # type: ignore[arg-type]
         draft=(
             DraftSummary(
                 version_id=version_id,  # type: ignore[arg-type]
                 revision=row["draft_revision"],  # type: ignore[arg-type]
                 status=row["draft_status"],  # type: ignore[arg-type]
                 job_id=row["draft_job_id"],  # type: ignore[arg-type]
+                indexed_revision=row.get("draft_indexed_revision"),  # type: ignore[arg-type]
             )
             if version_id is not None
             else None
@@ -432,10 +485,20 @@ class PostgresPersonaStore:
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
                 if draft_schema_ready(cur):
-                    query = """
+                    # active_version_id는 0004에서 생겼다. 호환 창 동안 0003 DB에서도
+                    # 이 목록은 200이어야 하므로, 컬럼이 없는 revision에서는 상수
+                    # NULL로 대신한다(컬럼을 그냥 쓰면 UndefinedColumn으로 죽는다).
+                    active_column = (
+                        "p.active_version_id"
+                        if chat_schema_ready(cur)
+                        else "NULL AS active_version_id"
+                    )
+                    query = f"""
                         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+                               {active_column},
                                d.version_id AS draft_version_id, d.revision AS draft_revision,
-                               d.status AS draft_status, d.job_id AS draft_job_id
+                               d.status AS draft_status, d.job_id AS draft_job_id,
+                               d.indexed_revision AS draft_indexed_revision
                         FROM persona_minimal.personas AS p
                         LEFT JOIN persona_minimal.material_versions AS d ON d.persona_id = p.id
                         WHERE p.owner_subject = %s AND p.deleted_at IS NULL
@@ -453,7 +516,8 @@ class PostgresPersonaStore:
                     query = """
                         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
                                NULL AS draft_version_id, NULL AS draft_revision,
-                               NULL AS draft_status, NULL AS draft_job_id
+                               NULL AS draft_status, NULL AS draft_job_id,
+                               NULL AS draft_indexed_revision
                         FROM persona_minimal.personas AS p
                         WHERE p.owner_subject = %s AND p.deleted_at IS NULL
                     """
@@ -563,10 +627,14 @@ class PostgresPersonaStore:
 
     # --- 캐릭터 상세와 초안 ------------------------------------------------
 
+    # {active} 자리에는 p.active_version_id(0004 이상) 또는 NULL 상수(0003, 호환 창)가
+    # 들어간다 — list_personas와 같은 이유다.
     _PERSONA_WITH_DRAFT = """
         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+               {active},
                d.version_id AS draft_version_id, d.revision AS draft_revision,
-               d.status AS draft_status, d.job_id AS draft_job_id
+               d.status AS draft_status, d.job_id AS draft_job_id,
+               d.indexed_revision AS draft_indexed_revision
         FROM persona_minimal.personas AS p
         LEFT JOIN persona_minimal.material_versions AS d ON d.persona_id = p.id
         WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
@@ -578,7 +646,8 @@ class PostgresPersonaStore:
     _PERSONA_WITHOUT_DRAFT_SCHEMA = """
         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
                NULL AS draft_version_id, NULL AS draft_revision,
-               NULL AS draft_status, NULL AS draft_job_id
+               NULL AS draft_status, NULL AS draft_job_id,
+               NULL AS draft_indexed_revision
         FROM persona_minimal.personas AS p
         WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
     """
@@ -586,11 +655,16 @@ class PostgresPersonaStore:
     def get_persona(self, owner_subject: str, persona_id: UUID) -> Persona:
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
-                query = (
-                    self._PERSONA_WITH_DRAFT
-                    if draft_schema_ready(cur)
-                    else self._PERSONA_WITHOUT_DRAFT_SCHEMA
-                )
+                if draft_schema_ready(cur):
+                    query = self._PERSONA_WITH_DRAFT.format(
+                        active=(
+                            "p.active_version_id"
+                            if chat_schema_ready(cur)
+                            else "NULL AS active_version_id"
+                        )
+                    )
+                else:
+                    query = self._PERSONA_WITHOUT_DRAFT_SCHEMA
                 cur.execute(query, (persona_id, owner_subject))
                 row = cur.fetchone()
                 if row is None:
@@ -866,6 +940,71 @@ class PostgresPersonaStore:
                     updated = self._read_draft(cur, persona_id)
                     self._guard_draft_limits(updated.settings, updated.sources)
                     return updated
+
+    def activate_draft(
+        self, owner_subject: str, persona_id: UUID, expected_revision: int
+    ) -> ActivatedVersion:
+        """색인이 끝난 초안을 캐릭터의 적용본으로 세운다(계약 §6).
+
+        순서: 캐릭터 잠금 → 초안 행 잠금 → revision CAS → can_activate 판정 →
+        personas.active_version_id 전환. 잠금을 먼저 잡는 이유는 판정과 전환 사이에
+        PATCH나 색인이 끼어들면 "판정할 때는 최신이었는데 적용할 때는 아닌" 상태가
+        그대로 적용본이 되기 때문이다.
+
+        **초안 슬롯을 비우지 않는다.** 계약 §6은 "성공 후 초안 슬롯은 비워 다음 수정을
+        허용한다"고 적지만, 지금 스키마에서 그렇게 하면 적용본이 쓸 색인이 사라진다 —
+        material_sources가 material_versions(persona_id)를 참조하고 material_chunks가
+        material_sources(id)를 참조해, 초안 행을 지우려면 자료와 조각을 먼저 지워야
+        한다. 계약이 전제하는 "immutable settings + immutable index reference 묶음"
+        (§6)이 별도 테이블로 있어야 가능한 동작이고, 그 스키마는 아직 없다.
+        그래서 지금은 포인터만 세우고 초안은 그대로 둔다 — 재적용은 같은 슬롯에서
+        수정 → 색인 → activate로 반복한다.
+
+        같은 이유로 active_version_id가 가리키는 version_id는 불변 스냅샷이 아니다:
+        material_versions는 캐릭터당 한 행이고 PATCH는 revision만 올리므로 version_id가
+        유지된다. 즉 지금의 적용본은 "이 캐릭터는 한 번 이상 활성화됐다"는 표시에
+        가깝고, 재색인하면 같은 version_id 아래 조각이 바뀐다. 불변 묶음은 후속 과제다.
+        """
+        with self.pool.connection() as connection:
+            with connection.transaction():
+                with connection.cursor(row_factory=dict_row) as cur:
+                    require_draft_schema(cur)
+                    require_chat_schema(cur)
+                    self._lock_persona(cur, owner_subject, persona_id)
+                    cur.execute(
+                        """
+                        SELECT version_id, revision, status, indexed_revision
+                        FROM persona_minimal.material_versions
+                        WHERE persona_id = %s FOR UPDATE
+                        """,
+                        (persona_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise DraftNotFound
+                    if row["revision"] != expected_revision:
+                        raise RevisionConflict
+                    # Draft.can_activate와 같은 규칙이다. 여기서 다시 판정하는 이유는
+                    # 응답을 만들 때 읽은 값과 지금 잠근 행이 다를 수 있어서다.
+                    if not (
+                        row["status"] == "ready" and row["indexed_revision"] == row["revision"]
+                    ):
+                        raise NotActivatable
+                    cur.execute(
+                        """
+                        UPDATE persona_minimal.personas
+                        SET active_version_id = %s
+                        WHERE id = %s
+                        RETURNING active_version_id
+                        """,
+                        (row["version_id"], persona_id),
+                    )
+                    activated = cur.fetchone()
+                    return ActivatedVersion(
+                        persona_id=persona_id,
+                        version_id=activated["active_version_id"],
+                        activated_at=datetime.now(timezone.utc),
+                    )
 
     def start_indexing(
         self, owner_subject: str, persona_id: UUID, expected_revision: int

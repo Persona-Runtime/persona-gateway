@@ -54,7 +54,9 @@ from .repository import (
     DuplicatePersonaName,
     IdempotencyConflict,
     IndexingInProgress,
+    NoActiveVersion,
     NoSourcesToIndex,
+    NotActivatable,
     NotIndexed,
     Persona,
     PersonaLimitExceeded,
@@ -168,8 +170,9 @@ def draft_summary_response(persona: Persona) -> dict[str, object] | None:
         "revision": persona.draft.revision,
         "status": persona.draft.status,
         "job_id": str(persona.draft.job_id) if persona.draft.job_id else None,
-        # 처리기가 없으므로 항상 처리가 필요하다. Draft.requires_processing과 같은 이유다.
-        "requires_processing": True,
+        # 상세 응답(draft_response)과 같은 규칙으로 계산한다 — 예전엔 여기만 상수 True라
+        # 같은 초안이 목록과 상세에서 다르게 보일 수 있었다.
+        "requires_processing": persona.draft.requires_processing,
     }
 
 
@@ -178,7 +181,9 @@ def persona_response(persona: Persona) -> dict[str, object]:
         "id": str(persona.id),
         "name": persona.name,
         "status": persona.status,
-        "active_version_id": None,
+        "active_version_id": (
+            str(persona.active_version_id) if persona.active_version_id else None
+        ),
         "draft": draft_summary_response(persona),
         "deletion_id": str(persona.deletion_id) if persona.deletion_id else None,
         "created_at": persona.created_at,
@@ -188,7 +193,11 @@ def persona_response(persona: Persona) -> dict[str, object]:
 def persona_detail_response(persona: Persona) -> dict[str, object]:
     """계약의 PersonaDetail. 목록 응답에 active_version을 더한 모양이다."""
     detail = persona_response(persona)
-    # 적용본은 아직 없다. 처리·활성화가 구현되면 그때 채운다.
+    # active_version_id(포인터)는 위에서 채웠지만 active_version(상세)은 계속 null이다.
+    # 계약의 Version은 id·settings·sources·activated_at을 모두 요구하는데, 지금 스키마엔
+    # 적용 시점의 설정·자료를 고정해 둔 불변 묶음도 activated_at 컬럼도 없다(계약 §6).
+    # 일부만 채워 내보내면 additionalProperties:false·required를 어기므로, 묶음이
+    # 생길 때까지 null을 유지한다.
     detail["active_version"] = None
     return detail
 
@@ -686,6 +695,43 @@ def create_app(
             content={"version_id": str(handle.version_id), "status": "processing"},
         )
 
+    @app.post("/v1/personas/{persona_id}/draft/activate")
+    def activate_draft(
+        request: Request,
+        persona_id: UUID,
+        body: DraftApplyRequest,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        """색인이 끝난 초안을 적용본으로 세운다(계약 §6).
+
+        apply(색인)와 다른 동작이다 — apply는 자료를 청킹·임베딩해 검색 색인을 만들고,
+        activate는 그 결과를 캐릭터가 실제로 쓸 적용본으로 지정한다. 대화는 적용본이
+        있어야 시작할 수 있다(§7).
+        """
+        require_idempotency_key(idempotency_key)
+        try:
+            activated = request.app.state.store.activate_draft(
+                user[0], persona_id, body.expected_revision
+            )
+        except RevisionConflict as error:
+            raise ApiError(
+                409, "revision_mismatch", "그 사이에 초안이 바뀌었습니다. 다시 읽고 적용해주세요."
+            ) from error
+        except NotActivatable as error:
+            raise ApiError(
+                409,
+                "not_activatable",
+                "아직 활성화할 수 없습니다. 지금 내용으로 색인을 먼저 끝내주세요.",
+            ) from error
+        except Exception as error:
+            raise draft_error(error) from error
+        return {
+            "persona_id": str(activated.persona_id),
+            "version_id": str(activated.version_id),
+            "activated_at": activated.activated_at,
+        }
+
     @app.delete("/v1/personas/{persona_id}/draft", status_code=204)
     def discard_draft(
         request: Request,
@@ -789,6 +835,12 @@ def create_app(
             return ApiError(404, "conversation_not_found", "대화를 찾을 수 없습니다.")
         if isinstance(error, GenerationNotFound):
             return ApiError(404, "generation_not_found", "생성을 찾을 수 없습니다.")
+        if isinstance(error, NoActiveVersion):
+            # 계약 §7 "새 대화는 적용본이 있어야 한다". 색인만 끝난 상태와 구분한다 —
+            # 화면이 "활성화하세요"와 "자료를 넣으세요"를 다르게 안내해야 한다.
+            return ApiError(
+                409, "no_active_version", "아직 적용본이 없습니다. 자료를 적용(활성화)해주세요."
+            )
         if isinstance(error, NotIndexed):
             return ApiError(409, "not_indexed", "아직 색인된 자료가 없습니다.")
         if isinstance(error, SchemaNotReady):

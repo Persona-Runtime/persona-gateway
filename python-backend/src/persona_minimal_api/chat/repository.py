@@ -17,7 +17,12 @@ from uuid import UUID, uuid4
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from ..repository import NotIndexed, PersonaNotFound, SchemaNotReady, chat_schema_ready
+from ..repository import (
+    NoActiveVersion,
+    PersonaNotFound,
+    SchemaNotReady,
+    chat_schema_ready,
+)
 from ..retrieval.prompt import Message
 
 # 활성 상태 — 이 상태들이면 "사용자당 활성 generation 1개" 슬롯을 쥐고 있다.
@@ -255,7 +260,7 @@ class ChatStore:
                 # 같은 이유).
                 cur.execute(
                     """
-                    SELECT name FROM persona_minimal.personas
+                    SELECT name, active_version_id FROM persona_minimal.personas
                     WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL
                     FOR UPDATE
                     """,
@@ -265,18 +270,11 @@ class ChatStore:
                 if persona_row is None:
                     raise PersonaNotFound
 
-                cur.execute(
-                    """
-                    SELECT version_id, indexed_revision FROM persona_minimal.material_versions
-                    WHERE persona_id = %s
-                    """,
-                    (persona_id,),
-                )
-                version_row = cur.fetchone()
-                if version_row is None or version_row["indexed_revision"] is None:
-                    # "적용된 version" = 색인에 성공한 버전이 있음(service-api-v1.md
-                    # §2 indexed_revision 정의). 별도 "적용" 기능은 아직 없다.
-                    raise NotIndexed
+                # 계약 §7: "새 대화는 적용본이 있어야 한다." 색인만 끝난 초안으로는
+                # 시작하지 않는다 — 색인은 검색 재료가 준비됐다는 뜻일 뿐이고, 그것을
+                # 실제로 쓸지는 활성화(draft/activate)가 정한다.
+                if persona_row["active_version_id"] is None:
+                    raise NoActiveVersion
 
                 conversation_id = uuid4()
                 cur.execute(
@@ -289,7 +287,7 @@ class ChatStore:
                         conversation_id,
                         persona_id,
                         owner_subject,
-                        version_row["version_id"],
+                        persona_row["active_version_id"],
                         persona_row["name"],
                     ),
                 )
@@ -527,14 +525,17 @@ class ChatStore:
 
                 self._reject_or_resolve_active_generation(cur, owner_subject)
 
+                # 질문마다 **그 시점의 적용본**을 서버가 고른다(계약 §7). 대화의
+                # initial_version_id를 쓰지 않는 이유: 대화 도중 새 적용본이 생기면
+                # 이후 질문은 새 적용본으로 답해야 하고, 그 사실을 generation.version_id에
+                # 남겨 어떤 적용본이 답했는지 나중에 확인할 수 있어야 한다.
                 cur.execute(
-                    "SELECT version_id, indexed_revision FROM persona_minimal.material_versions "
-                    "WHERE persona_id = %s",
+                    "SELECT active_version_id FROM persona_minimal.personas WHERE id = %s",
                     (persona_id,),
                 )
                 version_row = cur.fetchone()
-                if version_row is None or version_row["indexed_revision"] is None:
-                    raise NotIndexed
+                if version_row is None or version_row["active_version_id"] is None:
+                    raise NoActiveVersion
 
                 user_message_id = uuid4()
                 cur.execute(
@@ -551,7 +552,12 @@ class ChatStore:
                         id, conversation_id, user_message_id, version_id, mode, status
                     ) VALUES (%s, %s, %s, %s, 'mock', 'queued')
                     """,
-                    (generation_id, conversation_id, user_message_id, version_row["version_id"]),
+                    (
+                        generation_id,
+                        conversation_id,
+                        user_message_id,
+                        version_row["active_version_id"],
+                    ),
                 )
                 cur.execute(
                     """

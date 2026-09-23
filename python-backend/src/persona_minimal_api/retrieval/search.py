@@ -110,10 +110,21 @@ def retrieve_context(
     owner_subject: str,
     persona_id: UUID,
     question: str,
+    version_id: UUID | None = None,
 ) -> RetrievedContext:
     """질문 임베딩 1회 + 본문/대사 검색 2회를 묶는다. 질문 원문은 로그·예외
-    메시지에 넣지 않는다."""
-    version_id, indexed_revision = load_indexed_version(pool, owner_subject, persona_id)
+    메시지에 넣지 않는다.
+
+    version_id를 주면 그 버전의 조각만 검색한다 — 채팅 생성은 접수 시점에 고른
+    적용본(generations.version_id)을 넘겨, 검색이 그 사이 바뀐 다른 버전을 읽지
+    않게 한다(계약 §7 "서버가 현재 적용 version을 선택한다"). 안 주면 색인된
+    버전을 직접 찾는다(/retrieve 디버그 엔드포인트가 그 경로를 쓴다).
+    """
+    if version_id is None:
+        version_id, indexed_revision = load_indexed_version(pool, owner_subject, persona_id)
+    else:
+        # 호출자가 이미 버전을 골랐다 — indexed_revision은 표시용 정보라 함께 읽는다.
+        _, indexed_revision = load_indexed_version(pool, owner_subject, persona_id)
     result = embed(embedding_base_url, [question], "query")
     query_vector = result.vectors[0]
     with pool.connection() as connection:

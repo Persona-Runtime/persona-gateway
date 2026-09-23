@@ -959,7 +959,7 @@
         "tags": [
           "Drafts"
         ],
-        "description": "검증한 최신 초안 활성화. 미구현·대체됨 — draft/apply가 처리+적용을 한 번에 한다.",
+        "description": "색인이 끝난 초안(can_activate=true)을 캐릭터의 적용본으로 세운다. draft/apply(색인)와 다른 동작이다 — 대화는 적용본이 있어야 시작할 수 있다. expected_revision 불일치는 409 revision_mismatch, 아직 색인이 안 끝났으면 409 not_activatable.",
         "parameters": [
           {
             "in": "path",
@@ -1025,8 +1025,7 @@
               }
             }
           }
-        },
-        "deprecated": true
+        }
       }
     },
     "/v1/personas/{persona_id}/conversations": {

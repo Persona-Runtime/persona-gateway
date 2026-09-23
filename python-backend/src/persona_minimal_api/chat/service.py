@@ -217,6 +217,9 @@ def _run_generation(
                 owner_subject=owner_subject,
                 persona_id=persona_id,
                 question=question,
+                # 접수 시점에 고른 적용본으로 검색한다 — 그 사이 재색인·재활성화가
+                # 있어도 이 생성은 기록된 version_id 그대로 답한다.
+                version_id=generation.version_id,
             )
             settings_name, settings_profile = _persona_settings(pool, persona_id)
             history = chat_store.load_history(
