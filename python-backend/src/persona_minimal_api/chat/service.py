@@ -93,8 +93,12 @@ def accept_retry(
     return RetryAccepted(generation=generation, replay=replay)
 
 
-def _persona_settings(pool: ConnectionPool, persona_id: UUID) -> tuple[str, str]:
+def _version_settings(pool: ConnectionPool, version_id: UUID) -> tuple[str, str]:
     """build_messages에 필요한 settings_name·settings_profile만 가볍게 읽는다.
+
+    **이 generation이 답하기로 한 version의** 설정이다. 캐릭터 기준으로 읽으면 아직
+    활성화하지 않은 초안의 profile이 프롬프트에 들어가 — 사용자가 적용하지도 않은
+    설정으로 캐릭터가 답한다. 검색을 generation.version_id로 고정한 것과 같은 이유다.
 
     get_persona처럼 draft 전체(자료·상태)를 조립하지 않는다 — 스트리밍 시작 지연을
     줄이려는 목적이라 여기서 필요한 두 컬럼만 본다.
@@ -103,8 +107,8 @@ def _persona_settings(pool: ConnectionPool, persona_id: UUID) -> tuple[str, str]
         with connection.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT settings_name, settings_profile FROM persona_minimal.material_versions "
-                "WHERE persona_id = %s",
-                (persona_id,),
+                "WHERE version_id = %s",
+                (version_id,),
             )
             row = cur.fetchone()
     if row is None:
@@ -221,7 +225,7 @@ def _run_generation(
                 # 있어도 이 생성은 기록된 version_id 그대로 답한다.
                 version_id=generation.version_id,
             )
-            settings_name, settings_profile = _persona_settings(pool, persona_id)
+            settings_name, settings_profile = _version_settings(pool, generation.version_id)
             history = chat_store.load_history(
                 generation.conversation_id, before_user_message_id=generation.user_message_id
             )
