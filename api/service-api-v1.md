@@ -86,13 +86,13 @@ rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `faile
 | POST | `/v1/personas/{persona_id}/uploads` | 202 JobAccepted | 최초 입력용. 적용본/초안 없어야 함 |
 | GET | `/v1/jobs/{job_id}` | 200 Job | 소유자만 조회 |
 | POST | `/v1/jobs/{job_id}/retry` | 202 JobAccepted | 실패 종료·동일 초안 revision·can_retry |
-| POST | `/v1/personas/{persona_id}/draft` | 201 Draft | 현재 `base_version_id`에서 생성, 기존 초안 없음 |
+| POST | `/v1/personas/{persona_id}/draft` | 201 Draft | `{settings}`로 새로 시작하거나 `{base_version_id}`로 적용본에서 파생. 기존 초안 있으면 409 `draft_exists`, 적용본이 아닌 base는 404 `version_not_found` |
 | GET | `/v1/personas/{persona_id}/draft` | 200 Draft | 설정·원문·주의사항과 revision 조회 |
-| PATCH | `/v1/personas/{persona_id}/draft` | 200 Draft | expected_revision, 실행 중 수정 금지 |
-| DELETE | `/v1/personas/{persona_id}/draft` | 204 | query expected_revision, 실행 종료 확인 |
+| PATCH | `/v1/personas/{persona_id}/draft` | 200 Draft | expected_revision, 실행 중 수정 금지. 활성화로 슬롯이 비었으면 409 `draft_not_started` |
+| DELETE | `/v1/personas/{persona_id}/draft` | 204 | query expected_revision, 실행 종료 확인. 슬롯이 비었으면 409 `draft_not_started` |
 | POST | `/v1/personas/{persona_id}/draft/process` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
 | POST | `/v1/personas/{persona_id}/draft/activate` | 200 Activated | 색인이 끝난 초안(can_activate)을 적용본으로. revision 불일치 409 `revision_mismatch`, 색인 미완 409 `not_activatable` |
-| POST | `/v1/personas/{persona_id}/draft/apply` | 202 `{version_id, status}` | expected_revision 불일치 409 `revision_mismatch`, 진행 중 409 `indexing_in_progress`, 자료 없음 422 `no_content` |
+| POST | `/v1/personas/{persona_id}/draft/apply` | 202 `{version_id, status}` | expected_revision 불일치 409 `revision_mismatch`, 진행 중 409 `indexing_in_progress`, 자료 없음 422 `no_content`, 슬롯 비었음 409 `draft_not_started` |
 | POST | `/v1/personas/{persona_id}/conversations` | 201 Conversation | 적용본 필요(없으면 409 `no_active_version`), GPU 가용성은 생성 조건 아님 |
 | GET | `/v1/personas/{persona_id}/conversations` | 200 ConversationPage | 캐릭터별 소유자 목록 |
 | GET | `/v1/conversations/{conversation_id}/messages` | 200 MessagePage | 질문별 생성 시도·저장된 부분 답변 |
@@ -165,6 +165,8 @@ speech_examples = 길을 묻는 사람에게: 차근차근 같이 찾아볼까�
 `/uploads`는 여러 자료를 한 번에 접수하며 **처리 job을 함께 큐에 넣는** 경로다.
 초안이 이미 있으면 `/uploads`를 재호출하지 않는다. 현재 초안 입력을 바꾸고 process를 호출한다.
 기존 적용본 수정은 `POST draft(base_version_id)` → PATCH → 필요한 경우 process → activate다.
+`base_version_id`는 **그 캐릭터의 현재 적용본만** 허용한다(그 외는 404 `version_not_found`). 임의의 옛 version을 받아주면 사용자가 모르는 사이 오래된 자료로 되돌아가고, version_id가 응답에 노출되므로 남의 version을 찔러보는 경로도 열린다.
+파생은 설정과 자료 행을 **복제**한다(자료 id도 새로 발급한다). 색인 조각은 복사하지 않는다 — 새 초안은 어차피 재색인을 거쳐야 활성화할 수 있고(`can_activate`가 `indexed_revision == revision`을 요구한다), 그동안 적용본의 조각은 그대로 남아 대화가 끊기지 않는다.
 
 PATCH는 JSON이다. `expected_revision`과 선택적인 `settings`, `upsert_sources`, `remove_source_ids`를 받는다.
 기존 문서는 id로 갱신하고, 신규 문서는 id 없이 보내 서버가 ID를 발급한다. 제거 ID는 현재 초안의 것이어야 한다.
@@ -211,7 +213,9 @@ index가 없을 수 있는 profile-only 구성은 검색을 생략한다. 공유
 materialization은 job/attempt/revision으로 격리하고 dispatcher가 최신 결과만 publish한다.
 Postgres+Qdrant의 원자 트랜잭션을 가정하지 않는다. 검증된 결과만 참조한 뒤 활성 포인터를 CAS로 전환한다.
 `activate`는 expected_revision, base version, can_activate, 삭제 여부를 확인한다. 성공 후 초안 슬롯은 비워 다음 수정을 허용한다.
-**현재 구현(2026-09-23)은 슬롯을 비우지 않는다** — `material_sources`가 `material_versions(persona_id)`를, `material_chunks`가 `material_sources(id)`를 참조해 초안 행을 지우면 방금 적용한 색인 조각까지 사라진다. 위 문단이 전제하는 "immutable settings + immutable index reference 묶음"을 별도 테이블로 두기 전에는 포인터(`personas.active_version_id`)만 세우고 초안은 남긴다. 같은 이유로 그 포인터가 가리키는 version_id는 불변 스냅샷이 아니다(재색인하면 같은 id 아래 조각이 바뀐다). 불변 묶음은 후속 과제다.
+구현(2026-09-23, migration 0004)은 `material_versions`를 캐릭터당 한 행이 아니라 독립 엔티티로 두고, `personas`가 `active_version_id`·`draft_version_id` 두 포인터로 가리킨다. 활성화는 포인터 전환뿐이다 — `active_version_id := draft_version_id`, `draft_version_id := NULL`. version 행·자료·색인 조각은 하나도 옮기거나 지우지 않으므로, 적용본은 자기 설정·자료·조각을 그대로 들고 있고 그 위에서 시작한 대화는 끊기지 않는다.
+활성화 뒤 초안 슬롯이 비어 있는 상태에서 PATCH·apply·DELETE가 오면 409 `draft_not_started`다(적용본도 초안도 없으면 404 `draft_not_found`). 적용된 자료는 직접 고치지 않고 `POST draft(base_version_id)`로 새 version을 파서 고친다.
+옛 version 행과 그 조각은 지우지 않는다 — 대화(`conversations.initial_version_id`)와 진행 중인 생성이 참조한다. 정리 정책은 11절의 잔여 설계 항목이다.
 이전 답변이 사용하는 version/input snapshot은 종료되기 전에 정리하지 않는다.
 
 ## 7. 대화·질문·재시도

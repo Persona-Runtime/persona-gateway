@@ -309,18 +309,24 @@ class ChatStore:
                 )
                 return self._conversation_by_id(cur, conversation_id)
 
+    # material_changed는 "이 대화가 시작한 적용본이 아직도 그 캐릭터의 적용본인가"다.
+    # personas.active_version_id를 직접 읽는다 — material_versions를 persona_id로
+    # 조인하면 캐릭터에 version이 여럿(적용본 + 새 초안)일 때 대화가 그 수만큼
+    # 중복되고, 고르는 행에 따라 판정도 달라진다. personas는 c.persona_id의 FK
+    # 대상이라 반드시 한 행이다.
+    _CONVERSATION_COLUMNS = """
+        SELECT c.id, c.persona_id, c.initial_version_id, c.title, c.created_at, c.updated_at,
+               p.active_version_id AS current_version_id,
+               (SELECT g.id FROM persona_minimal.generations AS g
+                WHERE g.conversation_id = c.id AND g.status = ANY(%s)
+                ORDER BY g.created_at DESC LIMIT 1) AS active_generation_id
+        FROM persona_minimal.conversations AS c
+        JOIN persona_minimal.personas AS p ON p.id = c.persona_id
+    """
+
     def _conversation_by_id(self, cur, conversation_id: UUID) -> Conversation:
         cur.execute(
-            """
-            SELECT c.id, c.persona_id, c.initial_version_id, c.title, c.created_at, c.updated_at,
-                   mv.version_id AS current_version_id,
-                   (SELECT g.id FROM persona_minimal.generations AS g
-                    WHERE g.conversation_id = c.id AND g.status = ANY(%s)
-                    ORDER BY g.created_at DESC LIMIT 1) AS active_generation_id
-            FROM persona_minimal.conversations AS c
-            LEFT JOIN persona_minimal.material_versions AS mv ON mv.persona_id = c.persona_id
-            WHERE c.id = %s
-            """,
+            self._CONVERSATION_COLUMNS + " WHERE c.id = %s",
             (list(ACTIVE_STATUSES), conversation_id),
         )
         row = cur.fetchone()
@@ -343,16 +349,7 @@ class ChatStore:
         self, owner_subject: str, persona_id: UUID, limit: int, cursor: tuple[datetime, UUID] | None
     ) -> list[Conversation]:
         values: list[object] = [list(ACTIVE_STATUSES), persona_id, owner_subject]
-        query = """
-            SELECT c.id, c.persona_id, c.initial_version_id, c.title, c.created_at, c.updated_at,
-                   mv.version_id AS current_version_id,
-                   (SELECT g.id FROM persona_minimal.generations AS g
-                    WHERE g.conversation_id = c.id AND g.status = ANY(%s)
-                    ORDER BY g.created_at DESC LIMIT 1) AS active_generation_id
-            FROM persona_minimal.conversations AS c
-            LEFT JOIN persona_minimal.material_versions AS mv ON mv.persona_id = c.persona_id
-            WHERE c.persona_id = %s AND c.owner_subject = %s
-        """
+        query = self._CONVERSATION_COLUMNS + " WHERE c.persona_id = %s AND c.owner_subject = %s"
         if cursor is not None:
             query += " AND (c.created_at, c.id) < (%s, %s)"
             values.extend([cursor[0], cursor[1]])

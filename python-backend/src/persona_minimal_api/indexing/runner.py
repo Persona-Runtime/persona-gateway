@@ -108,10 +108,13 @@ def _load_sources(handle: IndexingHandle) -> list[dict[str, object]]:
     # 커밋되지 않고 `putconn` 시 psycopg_pool의 리셋에 의해 통째로 롤백된다.
     with handle.connection.transaction():
         with handle.connection.cursor(row_factory=dict_row) as cur:
+            # 이 version의 자료만 읽는다. persona 기준으로 읽으면 이미 활성화된
+            # 적용본의 자료까지 이 색인에 섞여 들어간다 — 사용자가 초안에서 지운
+            # 내용이 검색 결과로 되살아난다.
             cur.execute(
                 "SELECT id, kind, content FROM persona_minimal.material_sources "
-                "WHERE persona_id = %s AND kind = ANY(%s) ORDER BY kind, created_at, id",
-                (handle.persona_id, list(CHUNKABLE_KINDS)),
+                "WHERE version_id = %s AND kind = ANY(%s) ORDER BY kind, created_at, id",
+                (handle.version_id, list(CHUNKABLE_KINDS)),
             )
             return cur.fetchall()
 
@@ -146,9 +149,9 @@ def _mark_ready_in(handle: IndexingHandle) -> None:
             UPDATE persona_minimal.material_versions
             SET status = CASE WHEN revision = %s THEN 'ready' ELSE status END,
                 indexed_revision = %s, indexed_at = now(), error_code = NULL
-            WHERE persona_id = %s
+            WHERE version_id = %s
             """,
-            (handle.revision, handle.revision, handle.persona_id),
+            (handle.revision, handle.revision, handle.version_id),
         )
 
 
@@ -162,7 +165,7 @@ def _mark_failed(handle: IndexingHandle, error_code: str) -> None:
                 """
                 UPDATE persona_minimal.material_versions
                 SET status = 'failed', error_code = %s
-                WHERE persona_id = %s AND revision = %s
+                WHERE version_id = %s AND revision = %s
                 """,
-                (error_code, handle.persona_id, handle.revision),
+                (error_code, handle.version_id, handle.revision),
             )

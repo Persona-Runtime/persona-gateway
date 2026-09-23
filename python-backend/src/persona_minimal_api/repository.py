@@ -129,6 +129,24 @@ def require_chat_schema(cur) -> None:
         raise SchemaNotReady
 
 
+def require_draft_pointer_schema(cur) -> None:
+    """초안 API 전체(조회·생성·수정·색인·활성화·폐기)가 요구하는 스키마를 확인한다.
+
+    0004에서 초안은 "캐릭터당 material_versions 한 행"이 아니라 personas.
+    draft_version_id가 가리키는 version 행이 됐다. 그 컬럼이 없는 0003 DB에서는
+    초안 질의가 컬럼 자체를 찾지 못해 500으로 끝나므로, 여기서 먼저 409
+    schema_not_ready로 끊는다.
+
+    호환 창(SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용) 동안 DB가 아직
+    0003이면 초안 화면 전체가 잠시 409가 된다 — 호환 릴리스 배포부터 migration Job
+    완료까지의 몇 분이다(docs/migrations.md의 배포 순서). 목록·상세(list_personas·
+    get_persona)는 그 사이에도 200이어야 해서 이 검사를 받지 않고, 대신 컬럼이 없는
+    revision에서는 상수 NULL로 대신하는 이중 쿼리를 쓴다.
+    """
+    require_draft_schema(cur)
+    require_chat_schema(cur)
+
+
 class SafePoolLogFilter(logging.Filter):
     """psycopg pool의 원문 연결 오류가 운영 로그에 남지 않게 한다."""
 
@@ -177,6 +195,20 @@ class DraftNotFound(Exception):
 
 class DraftAlreadyExists(Exception):
     """초안은 캐릭터당 하나다(계약 2절)."""
+
+
+class DraftNotStarted(Exception):
+    """적용본은 있는데 초안 슬롯이 비어 있다. 고치려면 새 초안을 먼저 시작해야 한다.
+
+    DraftNotFound(404)와 가른다: 초안도 적용본도 없으면 "이 캐릭터엔 아직 아무것도
+    없다"는 404가 맞다. 반면 활성화 직후 슬롯이 빈 상태는 **정상**이고 POST /draft
+    한 번으로 이어갈 수 있으므로, 없어진 자원이 아니라 지금 할 수 없는 동작이라는
+    뜻의 409로 알린다 — 화면이 "새 초안 시작"을 안내할 수 있어야 한다.
+    """
+
+
+class BaseVersionNotFound(Exception):
+    """base_version_id가 이 캐릭터의 적용본이 아니다(오타·낡은 값·타인의 version)."""
 
 
 class RevisionConflict(Exception):
@@ -394,8 +426,9 @@ class PersonaStore(Protocol):
         self,
         owner_subject: str,
         persona_id: UUID,
-        settings: DraftSettings,
+        settings: DraftSettings | None,
         idempotency_key: UUID,
+        base_version_id: UUID | None = None,
     ) -> Draft: ...
 
     def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft: ...
@@ -463,6 +496,15 @@ def fingerprint_settings(settings: DraftSettings) -> bytes:
     return hashlib.sha256(joined.encode("utf-8")).digest()
 
 
+def fingerprint_base_version(base_version_id: UUID) -> bytes:
+    """적용본에서 파생하는 초안 생성 요청의 지문.
+
+    settings 경로와 같은 함수를 쓸 수 없다 — 요청 본문이 다르다(계약의 oneOf).
+    접두사를 붙여 두 경로의 지문이 우연히도 같아지지 않게 한다.
+    """
+    return hashlib.sha256(f"base_version:{base_version_id}".encode("utf-8")).digest()
+
+
 def draft_scope(persona_id: UUID) -> str:
     """초안 멱등 기록의 target_scope. persona_id를 값으로 넣는다.
 
@@ -484,18 +526,16 @@ class PostgresPersonaStore:
         values: list[object] = [owner_subject]
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
-                if draft_schema_ready(cur):
-                    # active_version_id는 0004에서 생겼다. 호환 창 동안 0003 DB에서도
-                    # 이 목록은 200이어야 하므로, 컬럼이 없는 revision에서는 상수
-                    # NULL로 대신한다(컬럼을 그냥 쓰면 UndefinedColumn으로 죽는다).
-                    active_column = (
-                        "p.active_version_id"
-                        if chat_schema_ready(cur)
-                        else "NULL AS active_version_id"
-                    )
-                    query = f"""
+                if chat_schema_ready(cur):
+                    query = self._PERSONA_LIST_WITH_POINTERS
+                elif draft_schema_ready(cur):
+                    # 호환 창 도구 — 0003 DB에는 초안 포인터 컬럼이 없다. 그 시절엔
+                    # 캐릭터당 version이 한 행이라 persona_id로 조인해야 하고,
+                    # 적용본이라는 개념 자체가 없어 active_version_id는 상수 NULL이다.
+                    # 컬럼을 그냥 쓰면 UndefinedColumn으로 죽으므로 질의를 통째로 가른다.
+                    query = """
                         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
-                               {active_column},
+                               NULL AS active_version_id,
                                d.version_id AS draft_version_id, d.revision AS draft_revision,
                                d.status AS draft_status, d.job_id AS draft_job_id,
                                d.indexed_revision AS draft_indexed_revision
@@ -627,11 +667,36 @@ class PostgresPersonaStore:
 
     # --- 캐릭터 상세와 초안 ------------------------------------------------
 
-    # {active} 자리에는 p.active_version_id(0004 이상) 또는 NULL 상수(0003, 호환 창)가
-    # 들어간다 — list_personas와 같은 이유다.
+    # 초안은 personas.draft_version_id가 가리키는 version 행이다 — persona_id로 조인하면
+    # 안 된다. 한 캐릭터에 version이 여럿(적용본 + 새 초안) 있을 수 있어, persona_id
+    # 조인은 같은 캐릭터를 version 수만큼 중복시킨다.
+    _PERSONA_LIST_WITH_POINTERS = """
+        SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+               p.active_version_id,
+               d.version_id AS draft_version_id, d.revision AS draft_revision,
+               d.status AS draft_status, d.job_id AS draft_job_id,
+               d.indexed_revision AS draft_indexed_revision
+        FROM persona_minimal.personas AS p
+        LEFT JOIN persona_minimal.material_versions AS d ON d.version_id = p.draft_version_id
+        WHERE p.owner_subject = %s AND p.deleted_at IS NULL
+    """
+
+    _PERSONA_WITH_POINTERS = """
+        SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
+               p.active_version_id,
+               d.version_id AS draft_version_id, d.revision AS draft_revision,
+               d.status AS draft_status, d.job_id AS draft_job_id,
+               d.indexed_revision AS draft_indexed_revision
+        FROM persona_minimal.personas AS p
+        LEFT JOIN persona_minimal.material_versions AS d ON d.version_id = p.draft_version_id
+        WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL
+    """
+
+    # 호환 창 도구(list_personas와 같은 이유) — 초안 포인터 컬럼이 없는 0003 DB에서
+    # 쓴다. 그 시절 스키마대로 persona_id로 조인하고 적용본은 상수 NULL로 둔다.
     _PERSONA_WITH_DRAFT = """
         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
-               {active},
+               NULL AS active_version_id,
                d.version_id AS draft_version_id, d.revision AS draft_revision,
                d.status AS draft_status, d.job_id AS draft_job_id,
                d.indexed_revision AS draft_indexed_revision
@@ -655,14 +720,10 @@ class PostgresPersonaStore:
     def get_persona(self, owner_subject: str, persona_id: UUID) -> Persona:
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
-                if draft_schema_ready(cur):
-                    query = self._PERSONA_WITH_DRAFT.format(
-                        active=(
-                            "p.active_version_id"
-                            if chat_schema_ready(cur)
-                            else "NULL AS active_version_id"
-                        )
-                    )
+                if chat_schema_ready(cur):
+                    query = self._PERSONA_WITH_POINTERS
+                elif draft_schema_ready(cur):
+                    query = self._PERSONA_WITH_DRAFT
                 else:
                     query = self._PERSONA_WITHOUT_DRAFT_SCHEMA
                 cur.execute(query, (persona_id, owner_subject))
@@ -671,36 +732,57 @@ class PostgresPersonaStore:
                     raise PersonaNotFound
                 return _persona(row)
 
-    def _lock_persona(self, cur, owner_subject: str, persona_id: UUID) -> None:
-        """소유자 범위로 캐릭터를 잠근다.
+    def _lock_persona(self, cur, owner_subject: str, persona_id: UUID) -> dict:
+        """소유자 범위로 캐릭터를 잠그고 초안·적용본 포인터를 돌려준다.
 
         타인 소유와 부재를 같은 PersonaNotFound로 올린다. 둘을 구분해 알리면
         남의 캐릭터가 존재하는지가 새어 나간다.
 
-        FOR UPDATE로 잠그는 이유: 초안을 만드는 동안 같은 캐릭터에 다른 요청이 들어오면
-        둘 다 "초안 없음"을 보고 각자 만들려 한다. PK가 막아 주지만 오류가 아니라
-        409로 답해야 하므로 여기서 직렬화한다.
+        FOR UPDATE로 잠그는 이유: 초안 슬롯(draft_version_id)이 이제 personas의 컬럼
+        하나다. 잠그지 않으면 동시 요청 둘이 각각 "슬롯 비어 있음"을 보고 각자 version을
+        만들어 나중에 커밋한 쪽이 앞선 version을 포인터에서 떨어뜨린 채 남긴다 — PK가
+        막아 주던 것을 이제 이 잠금이 대신한다.
+
+        포인터를 여기서 함께 읽는 이유: 초안 관련 메서드는 예외 없이 잠금 직후 "지금
+        초안이 어느 version인가"를 알아야 한다. 따로 읽으면 잠금과 읽기 사이가 비어
+        같은 경합이 되돌아온다.
         """
         cur.execute(
             """
-            SELECT id FROM persona_minimal.personas
+            SELECT id, draft_version_id, active_version_id FROM persona_minimal.personas
             WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL
             FOR UPDATE
             """,
             (persona_id, owner_subject),
         )
-        if cur.fetchone() is None:
+        row = cur.fetchone()
+        if row is None:
             raise PersonaNotFound
+        return row
 
-    def _read_draft(self, cur, persona_id: UUID) -> Draft:
+    @staticmethod
+    def _draft_version_of(persona_row: dict) -> UUID:
+        """잠근 캐릭터 행에서 지금 초안 version을 꺼낸다. 없으면 상황에 맞는 예외.
+
+        적용본이 있으면 "슬롯이 비었을 뿐"이므로 409(DraftNotStarted), 둘 다 없으면
+        404(DraftNotFound)다 — 두 예외의 docstring 참고.
+        """
+        version_id = persona_row["draft_version_id"]
+        if version_id is None:
+            if persona_row["active_version_id"] is not None:
+                raise DraftNotStarted
+            raise DraftNotFound
+        return version_id
+
+    def _read_draft(self, cur, version_id: UUID) -> Draft:
         cur.execute(
             """
             SELECT persona_id, version_id, revision, status, job_id, base_version_id,
                    settings_name, settings_profile, settings_speech_examples, updated_at,
                    indexed_revision, indexed_at, error_code
-            FROM persona_minimal.material_versions WHERE persona_id = %s
+            FROM persona_minimal.material_versions WHERE version_id = %s
             """,
-            (persona_id,),
+            (version_id,),
         )
         row = cur.fetchone()
         if row is None:
@@ -709,9 +791,9 @@ class PostgresPersonaStore:
             """
             SELECT id, kind, filename, content, byte_size, sha256
             FROM persona_minimal.material_sources
-            WHERE persona_id = %s ORDER BY kind, created_at, id
+            WHERE version_id = %s ORDER BY kind, created_at, id
             """,
-            (persona_id,),
+            (version_id,),
         )
         sources = tuple(
             DraftSource(
@@ -746,39 +828,60 @@ class PostgresPersonaStore:
     def get_draft(self, owner_subject: str, persona_id: UUID) -> Draft:
         with self.pool.connection() as connection:
             with connection.cursor(row_factory=dict_row) as cur:
-                require_draft_schema(cur)
+                require_draft_pointer_schema(cur)
+                # 읽기만 하므로 잠그지 않는다.
                 cur.execute(
                     """
-                    SELECT 1 FROM persona_minimal.personas
+                    SELECT draft_version_id, active_version_id FROM persona_minimal.personas
                     WHERE id = %s AND owner_subject = %s AND deleted_at IS NULL
                     """,
                     (persona_id, owner_subject),
                 )
-                if cur.fetchone() is None:
+                row = cur.fetchone()
+                if row is None:
                     raise PersonaNotFound
-                return self._read_draft(cur, persona_id)
+                return self._read_draft(cur, self._draft_version_of(row))
 
     def create_draft(
         self,
         owner_subject: str,
         persona_id: UUID,
-        settings: DraftSettings,
+        settings: DraftSettings | None,
         idempotency_key: UUID,
+        base_version_id: UUID | None = None,
     ) -> Draft:
-        """처리 없이 초안을 시작한다. job을 만들지 않는다(계약 5절).
+        """새 초안 version을 만들고 캐릭터의 초안 슬롯에 매단다. job은 만들지 않는다(계약 5절).
+
+        계약의 oneOf 그대로 두 경로가 있다 — `settings`면 빈 초안으로 새로 시작하고,
+        `base_version_id`면 그 적용본의 설정과 자료를 복사해 이어서 고친다. 호출자가
+        정확히 하나만 넘겨야 한다.
+
+        **조각(material_chunks)은 복사하지 않는다.** 복사하면 같은 본문의 임베딩이
+        두 벌이 되는데, 새 초안은 어차피 재색인을 거쳐야 적용할 수 있다(can_activate가
+        indexed_revision == revision을 요구한다). 새 version의 조각은 그 재색인 때
+        새 version_id 아래 생긴다 — 그동안 적용본의 조각은 그대로 남아 대화가 끊기지
+        않는다.
 
         멱등 기록은 캐릭터 생성과 같은 테이블·같은 순서를 쓴다 — 캐릭터 행을 잠근 뒤
-        기록을 보고, 같은 키면 그때 만든 초안을 그대로 돌려준다.
+        기록을 보고, 같은 키면 **그때 만든 version**을 그대로 돌려준다. 초안 슬롯이
+        아니라 기록에 적힌 version을 읽는 이유: 그 사이 활성화가 일어나면 슬롯이
+        비어, 슬롯을 읽는 replay는 같은 키인데 404가 된다(계약 §4 위반).
         """
-        fingerprint = fingerprint_settings(settings)
+        if (settings is None) == (base_version_id is None):
+            raise ValueError("settings 또는 base_version_id 중 정확히 하나만 넘겨야 한다")
+        fingerprint = (
+            fingerprint_settings(settings)
+            if settings is not None
+            else fingerprint_base_version(base_version_id)  # type: ignore[arg-type]
+        )
         with self.pool.connection() as connection:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
-                    require_draft_schema(cur)
-                    self._lock_persona(cur, owner_subject, persona_id)
+                    require_draft_pointer_schema(cur)
+                    persona_row = self._lock_persona(cur, owner_subject, persona_id)
                     cur.execute(
                         """
-                        SELECT request_fingerprint
+                        SELECT request_fingerprint, version_id
                         FROM persona_minimal.idempotency_records
                         WHERE owner_subject = %s AND operation = %s AND target_scope = %s
                           AND idempotency_key = %s
@@ -796,38 +899,34 @@ class PostgresPersonaStore:
                         # 응답이 유실된 요청의 재전송이 실패로 보인다.
                         if bytes(record["request_fingerprint"]) != fingerprint:
                             raise IdempotencyConflict
-                        return self._read_draft(cur, persona_id)
+                        return self._read_draft(cur, record["version_id"])
 
-                    cur.execute(
-                        "SELECT 1 FROM persona_minimal.material_versions WHERE persona_id = %s",
-                        (persona_id,),
-                    )
-                    if cur.fetchone() is not None:
+                    if persona_row["draft_version_id"] is not None:
                         raise DraftAlreadyExists
 
-                    self._guard_draft_limits(settings, ())
+                    version_id = uuid4()
+                    if settings is not None:
+                        self._guard_draft_limits(settings, ())
+                        self._insert_version(cur, persona_id, version_id, settings, None)
+                    else:
+                        self._copy_version(
+                            cur,
+                            persona_row,
+                            persona_id,
+                            version_id,
+                            base_version_id,  # type: ignore[arg-type]
+                        )
 
                     cur.execute(
-                        """
-                        INSERT INTO persona_minimal.material_versions
-                            (persona_id, version_id, revision, status,
-                             settings_name, settings_profile, settings_speech_examples)
-                        VALUES (%s, %s, 1, 'editing', %s, %s, %s)
-                        """,
-                        (
-                            persona_id,
-                            uuid4(),
-                            settings.name,
-                            settings.profile,
-                            settings.speech_examples,
-                        ),
+                        "UPDATE persona_minimal.personas SET draft_version_id = %s WHERE id = %s",
+                        (version_id, persona_id),
                     )
                     cur.execute(
                         """
                         INSERT INTO persona_minimal.idempotency_records(
                             owner_subject, operation, target_scope, idempotency_key,
-                            request_fingerprint, persona_id
-                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                            request_fingerprint, persona_id, version_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             owner_subject,
@@ -836,16 +935,115 @@ class PostgresPersonaStore:
                             idempotency_key,
                             fingerprint,
                             persona_id,
+                            version_id,
                         ),
                     )
-                    return self._read_draft(cur, persona_id)
+                    return self._read_draft(cur, version_id)
+
+    @staticmethod
+    def _insert_version(
+        cur,
+        persona_id: UUID,
+        version_id: UUID,
+        settings: DraftSettings,
+        base_version_id: UUID | None,
+    ) -> None:
+        """새 초안 version 행 하나. revision은 언제나 1에서 시작한다 —
+        revision은 "이 version을 몇 번 고쳤는가"라서 파생본도 새로 센다."""
+        cur.execute(
+            """
+            INSERT INTO persona_minimal.material_versions
+                (persona_id, version_id, revision, status, base_version_id,
+                 settings_name, settings_profile, settings_speech_examples)
+            VALUES (%s, %s, 1, 'editing', %s, %s, %s, %s)
+            """,
+            (
+                persona_id,
+                version_id,
+                base_version_id,
+                settings.name,
+                settings.profile,
+                settings.speech_examples,
+            ),
+        )
+
+    def _copy_version(
+        self,
+        cur,
+        persona_row: dict,
+        persona_id: UUID,
+        version_id: UUID,
+        base_version_id: UUID,
+    ) -> None:
+        """적용본의 설정과 자료를 새 version으로 복사한다.
+
+        파생 대상은 **그 캐릭터의 현재 적용본만** 허용한다. 임의의 옛 version을
+        허용하면 사용자가 모르는 사이 오래된 자료로 되돌아갈 수 있고, 남의 version_id를
+        찔러보는 경로도 열린다(version_id는 API 응답에 노출된다).
+
+        자료는 id를 새로 만들어 넣는다. 같은 id를 다시 쓰면 적용본의 자료 행을 그대로
+        가리키게 되어, 초안에서 그 자료를 고치는 순간 적용본의 본문까지 바뀐다 —
+        적용본 보존이 이 설계의 목적이므로 행 자체를 복제한다. material_chunks가
+        source_id로 옛 행을 참조하고 있는 것도 그대로 유지된다.
+        """
+        if base_version_id != persona_row["active_version_id"]:
+            raise BaseVersionNotFound
+        cur.execute(
+            """
+            SELECT settings_name, settings_profile, settings_speech_examples
+            FROM persona_minimal.material_versions WHERE version_id = %s
+            """,
+            (base_version_id,),
+        )
+        base = cur.fetchone()
+        if base is None:
+            raise BaseVersionNotFound
+        self._insert_version(
+            cur,
+            persona_id,
+            version_id,
+            DraftSettings(
+                name=base["settings_name"],
+                profile=base["settings_profile"],
+                speech_examples=base["settings_speech_examples"],
+            ),
+            base_version_id,
+        )
+        cur.execute(
+            """
+            SELECT kind, filename, content, byte_size, sha256
+            FROM persona_minimal.material_sources
+            WHERE version_id = %s ORDER BY kind, created_at, id
+            """,
+            (base_version_id,),
+        )
+        # id는 DB 함수(gen_random_uuid)가 아니라 여기서 만든다 — 이 코드베이스는 모든
+        # id를 앱에서 만들고(0001 주석), 그래야 PostgreSQL 버전에 기대지 않는다.
+        for source in cur.fetchall():
+            cur.execute(
+                """
+                INSERT INTO persona_minimal.material_sources
+                    (id, version_id, kind, filename, content, byte_size, sha256)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    uuid4(),
+                    version_id,
+                    source["kind"],
+                    source["filename"],
+                    source["content"],
+                    source["byte_size"],
+                    source["sha256"],
+                ),
+            )
 
     def discard_draft(self, owner_subject: str, persona_id: UUID, idempotency_key: UUID) -> None:
-        """초안과 그 자료를 지운다. 캐릭터는 남는다."""
+        """초안 version과 그 자료·조각만 지운다. 캐릭터와 적용본은 남는다."""
         with self.pool.connection() as connection:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
-                    self._lock_persona(cur, owner_subject, persona_id)
+                    require_draft_pointer_schema(cur)
+                    persona_row = self._lock_persona(cur, owner_subject, persona_id)
                     cur.execute(
                         """
                         SELECT 1 FROM persona_minimal.idempotency_records
@@ -864,18 +1062,33 @@ class PostgresPersonaStore:
                         # 404를 내면 요청자는 실패한 줄 알고 되돌리려 한다.
                         return
 
-                    # 자료를 먼저 지운다. FK가 초안을 가리키고 있다.
+                    # 실패하는 경로에서는 멱등 기록을 남기지 않는다 — 키를 비워 둬야
+                    # 같은 키로 다시 시도할 수 있다.
+                    version_id = self._draft_version_of(persona_row)
+
+                    # 슬롯을 먼저 비운다. personas.draft_version_id가 이 version을
+                    # 참조하고 있어(FK) 가리키는 채로는 행을 지울 수 없다.
                     cur.execute(
-                        "DELETE FROM persona_minimal.material_sources WHERE persona_id = %s",
+                        "UPDATE persona_minimal.personas SET draft_version_id = NULL WHERE id = %s",
                         (persona_id,),
                     )
+                    # 참조하는 쪽부터 지운다: 조각 → 자료 → version.
+                    # 조각을 함께 지우는 이유: material_chunks.source_id가 자료를
+                    # 참조하므로, 색인까지 끝낸 초안을 폐기하면 조각이 남아 자료 DELETE가
+                    # FK로 막힌다. 이 version의 조각은 이 초안 말고 아무도 쓰지 않는다 —
+                    # 적용본은 자기 version_id의 조각을 따로 갖고 있다.
                     cur.execute(
-                        "DELETE FROM persona_minimal.material_versions WHERE persona_id = %s",
-                        (persona_id,),
+                        "DELETE FROM persona_minimal.material_chunks WHERE version_id = %s",
+                        (version_id,),
                     )
-                    if cur.rowcount == 0:
-                        # 실패한 요청의 키는 비워 둬야 같은 키로 다시 시도할 수 있다.
-                        raise DraftNotFound
+                    cur.execute(
+                        "DELETE FROM persona_minimal.material_sources WHERE version_id = %s",
+                        (version_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM persona_minimal.material_versions WHERE version_id = %s",
+                        (version_id,),
+                    )
                     cur.execute(
                         """
                         INSERT INTO persona_minimal.idempotency_records(
@@ -910,14 +1123,18 @@ class PostgresPersonaStore:
         with self.pool.connection() as connection:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
-                    require_draft_schema(cur)
-                    self._lock_persona(cur, owner_subject, persona_id)
+                    require_draft_pointer_schema(cur)
+                    persona_row = self._lock_persona(cur, owner_subject, persona_id)
+                    # 적용본은 여기로 오지 않는다 — 초안 슬롯이 가리키는 version만
+                    # 고친다. 활성화된 version에 PATCH가 오면 슬롯이 비어 있으므로
+                    # DraftNotStarted(409)로 끊긴다.
+                    version_id = self._draft_version_of(persona_row)
                     # 초안 행까지 잠근다. 위의 캐릭터 잠금만으로는 같은 캐릭터의
                     # 동시 PATCH가 같은 revision을 읽는 것을 막지 못한다.
                     cur.execute(
                         "SELECT revision FROM persona_minimal.material_versions "
-                        "WHERE persona_id = %s FOR UPDATE",
-                        (persona_id,),
+                        "WHERE version_id = %s FOR UPDATE",
+                        (version_id,),
                     )
                     row = cur.fetchone()
                     if row is None:
@@ -925,19 +1142,19 @@ class PostgresPersonaStore:
                     if row["revision"] != expected_revision:
                         raise RevisionConflict
 
-                    current = self._read_draft(cur, persona_id)
-                    self._apply_settings(cur, persona_id, current, settings, upsert_sources)
-                    self._apply_sources(cur, persona_id, current, upsert_sources, remove_source_ids)
+                    current = self._read_draft(cur, version_id)
+                    self._apply_settings(cur, version_id, current, settings, upsert_sources)
+                    self._apply_sources(cur, version_id, current, upsert_sources, remove_source_ids)
 
                     cur.execute(
                         """
                         UPDATE persona_minimal.material_versions
                         SET revision = revision + 1, status = 'editing', updated_at = now()
-                        WHERE persona_id = %s
+                        WHERE version_id = %s
                         """,
-                        (persona_id,),
+                        (version_id,),
                     )
-                    updated = self._read_draft(cur, persona_id)
+                    updated = self._read_draft(cur, version_id)
                     self._guard_draft_limits(updated.settings, updated.sources)
                     return updated
 
@@ -947,37 +1164,33 @@ class PostgresPersonaStore:
         """색인이 끝난 초안을 캐릭터의 적용본으로 세운다(계약 §6).
 
         순서: 캐릭터 잠금 → 초안 행 잠금 → revision CAS → can_activate 판정 →
-        personas.active_version_id 전환. 잠금을 먼저 잡는 이유는 판정과 전환 사이에
-        PATCH나 색인이 끼어들면 "판정할 때는 최신이었는데 적용할 때는 아닌" 상태가
-        그대로 적용본이 되기 때문이다.
+        포인터 전환. 잠금을 먼저 잡는 이유는 판정과 전환 사이에 PATCH나 색인이
+        끼어들면 "판정할 때는 최신이었는데 적용할 때는 아닌" 상태가 그대로 적용본이
+        되기 때문이다.
 
-        **초안 슬롯을 비우지 않는다.** 계약 §6은 "성공 후 초안 슬롯은 비워 다음 수정을
-        허용한다"고 적지만, 지금 스키마에서 그렇게 하면 적용본이 쓸 색인이 사라진다 —
-        material_sources가 material_versions(persona_id)를 참조하고 material_chunks가
-        material_sources(id)를 참조해, 초안 행을 지우려면 자료와 조각을 먼저 지워야
-        한다. 계약이 전제하는 "immutable settings + immutable index reference 묶음"
-        (§6)이 별도 테이블로 있어야 가능한 동작이고, 그 스키마는 아직 없다.
-        그래서 지금은 포인터만 세우고 초안은 그대로 둔다 — 재적용은 같은 슬롯에서
-        수정 → 색인 → activate로 반복한다.
+        전환은 포인터 두 개를 옮기는 것뿐이다 — active_version_id := 그 version,
+        draft_version_id := NULL. **version 행·자료·조각은 하나도 건드리지 않는다.**
+        그래서 활성화 뒤에도 적용본은 자기 자료와 조각을 그대로 갖고, 대화는 그
+        version_id로 계속 검색한다. 계약 §6이 말하는 "성공 후 초안 슬롯은 비워 다음
+        수정을 허용한다"가 이 NULL 대입이고, 다음 수정은 POST /draft가 base_version_id로
+        만드는 **새 version 행**에서 시작한다(create_draft 참고).
 
-        같은 이유로 active_version_id가 가리키는 version_id는 불변 스냅샷이 아니다:
-        material_versions는 캐릭터당 한 행이고 PATCH는 revision만 올리므로 version_id가
-        유지된다. 즉 지금의 적용본은 "이 캐릭터는 한 번 이상 활성화됐다"는 표시에
-        가깝고, 재색인하면 같은 version_id 아래 조각이 바뀐다. 불변 묶음은 후속 과제다.
+        옛 version 행은 지우지 않는다. 대화(conversations.initial_version_id)와
+        조각이 그 값을 가리키고 있어서다 — 정리 정책은 후속 과제다.
         """
         with self.pool.connection() as connection:
             with connection.transaction():
                 with connection.cursor(row_factory=dict_row) as cur:
-                    require_draft_schema(cur)
-                    require_chat_schema(cur)
-                    self._lock_persona(cur, owner_subject, persona_id)
+                    require_draft_pointer_schema(cur)
+                    persona_row = self._lock_persona(cur, owner_subject, persona_id)
+                    version_id = self._draft_version_of(persona_row)
                     cur.execute(
                         """
-                        SELECT version_id, revision, status, indexed_revision
+                        SELECT revision, status, indexed_revision
                         FROM persona_minimal.material_versions
-                        WHERE persona_id = %s FOR UPDATE
+                        WHERE version_id = %s FOR UPDATE
                         """,
-                        (persona_id,),
+                        (version_id,),
                     )
                     row = cur.fetchone()
                     if row is None:
@@ -993,11 +1206,11 @@ class PostgresPersonaStore:
                     cur.execute(
                         """
                         UPDATE persona_minimal.personas
-                        SET active_version_id = %s
+                        SET active_version_id = %s, draft_version_id = NULL
                         WHERE id = %s
                         RETURNING active_version_id
                         """,
-                        (row["version_id"], persona_id),
+                        (version_id, persona_id),
                     )
                     activated = cur.fetchone()
                     return ActivatedVersion(
@@ -1025,18 +1238,24 @@ class PostgresPersonaStore:
                 with connection.cursor(row_factory=dict_row) as cur:
                     # advisory lock을 잡기 전에 확인한다 — 여기서 실패하면 아직 아무
                     # 잠금도 없어 뒤따르는 unlock 없이 바로 예외를 던져도 된다.
-                    require_draft_schema(cur)
-                    self._lock_persona(cur, owner_subject, persona_id)
+                    require_draft_pointer_schema(cur)
+                    persona_row = self._lock_persona(cur, owner_subject, persona_id)
+                    # 초안이 없으면(활성화 직후) 여기서 끝난다 — 적용본을 다시 색인하는
+                    # 경로는 없다. 고치려면 POST /draft로 새 초안을 시작해야 한다.
+                    version_id = self._draft_version_of(persona_row)
 
+                    # advisory lock은 캐릭터 키를 그대로 쓴다 — 초안은 여전히 캐릭터당
+                    # 하나뿐이라 이 키만으로 동시 색인이 배타적이다. version 키로 바꾸면
+                    # 오히려 같은 캐릭터의 서로 다른 version을 동시에 색인할 수 있게 된다.
                     cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (str(persona_id),))
                     locked = cur.fetchone()["pg_try_advisory_lock"]
                     if not locked:
                         raise IndexingInProgress
 
                     cur.execute(
-                        "SELECT version_id, revision, status FROM persona_minimal.material_versions "
-                        "WHERE persona_id = %s FOR UPDATE",
-                        (persona_id,),
+                        "SELECT revision, status FROM persona_minimal.material_versions "
+                        "WHERE version_id = %s FOR UPDATE",
+                        (version_id,),
                     )
                     row = cur.fetchone()
                     if row is None:
@@ -1054,19 +1273,18 @@ class PostgresPersonaStore:
                     # 바로 거절한다.
                     cur.execute(
                         "SELECT EXISTS (SELECT 1 FROM persona_minimal.material_sources "
-                        "WHERE persona_id = %s AND kind = ANY(%s))",
-                        (persona_id, list(CHUNKABLE_KINDS)),
+                        "WHERE version_id = %s AND kind = ANY(%s))",
+                        (version_id, list(CHUNKABLE_KINDS)),
                     )
                     if not cur.fetchone()["exists"]:
                         cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
                         raise NoSourcesToIndex
 
                     revision = row["revision"]
-                    version_id = row["version_id"]
                     cur.execute(
                         "UPDATE persona_minimal.material_versions SET status = 'processing' "
-                        "WHERE persona_id = %s",
-                        (persona_id,),
+                        "WHERE version_id = %s",
+                        (version_id,),
                     )
         except BaseException:
             # pg_try_advisory_lock 성공 뒤 FOR UPDATE/UPDATE에서 예상 밖 DB 오류가 나면
@@ -1093,7 +1311,7 @@ class PostgresPersonaStore:
     def _apply_settings(
         self,
         cur,
-        persona_id: UUID,
+        version_id: UUID,
         current: Draft,
         settings: dict[str, str] | None,
         upsert_sources: list[dict[str, object]],
@@ -1121,20 +1339,20 @@ class PostgresPersonaStore:
             """
             UPDATE persona_minimal.material_versions
             SET settings_name = %s, settings_profile = %s, settings_speech_examples = %s
-            WHERE persona_id = %s
+            WHERE version_id = %s
             """,
             (
                 name,
                 profile,
                 settings.get("speech_examples", current.settings.speech_examples),
-                persona_id,
+                version_id,
             ),
         )
 
     def _apply_sources(
         self,
         cur,
-        persona_id: UUID,
+        version_id: UUID,
         current: Draft,
         upsert_sources: list[dict[str, object]],
         remove_source_ids: list[UUID],
@@ -1155,9 +1373,18 @@ class PostgresPersonaStore:
                     raise DraftValidationError("conflicting_fields")
 
         for source_id in remove_source_ids:
+            # 그 자료의 조각을 먼저 지운다. material_chunks.source_id가 자료를
+            # 참조하므로, 한 번이라도 색인한 초안에서 자료를 빼면 남은 조각 때문에
+            # 이 DELETE가 FK로 막힌다. 이 초안 version의 조각이므로 적용본과는
+            # 무관하다 — 적용본은 자기 version_id의 조각을 따로 갖고 있다.
             cur.execute(
-                "DELETE FROM persona_minimal.material_sources WHERE persona_id = %s AND id = %s",
-                (persona_id, source_id),
+                "DELETE FROM persona_minimal.material_chunks "
+                "WHERE version_id = %s AND source_id = %s",
+                (version_id, source_id),
+            )
+            cur.execute(
+                "DELETE FROM persona_minimal.material_sources WHERE version_id = %s AND id = %s",
+                (version_id, source_id),
             )
 
         for item in upsert_sources:
@@ -1178,7 +1405,7 @@ class PostgresPersonaStore:
             cur.execute(
                 """
                 INSERT INTO persona_minimal.material_sources
-                    (id, persona_id, kind, filename, content, byte_size, sha256)
+                    (id, version_id, kind, filename, content, byte_size, sha256)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     kind = EXCLUDED.kind,
@@ -1189,7 +1416,7 @@ class PostgresPersonaStore:
                 """,
                 (
                     item.get("id") or uuid4(),
-                    persona_id,
+                    version_id,
                     kind,
                     filename,
                     content,
