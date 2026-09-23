@@ -326,7 +326,7 @@ Unicode 문자 수·byte length를 구분하며 한글·이모지 경계 테스�
 원문 quota는 DB·벡터·대화·WAL·관측 데이터를 포함한 실제 디스크 상한이 아니다. 각각 별도 용량 관측이 필요하다.
 
 512토큰에 도달한 정상 답변은 `done.finish_reason=length`로 저장·표시한다. 시간 초과와 혼동하지 않는다.
-첫 답변/전체 시간 초과는 각각 `first_response_timeout`/`generation_timeout`으로 안전하게 안내하고 생성 중단을 요청한다.
+첫 답변/전체 시간 초과는 각각 `first_token_timeout`/`generation_timeout`으로 안전하게 안내하고 생성 중단을 요청한다.
 SSE 연결이 살아 있으면 error를 보내고 done은 보내지 않는다. 부분 답변은 중단 상태로 남기며 자동 재시도하지 않는다.
 종료 확인 전 cancel_requested/reconciling을 유지하고, 종료 확인 후 실패 원인을 보존한 failed로 확정한다.
 자료 조회·편집 등 비생성 작업에는 생성 슬롯을 적용하지 않는다. 처리 중 초안 수정 금지 등 기존 제약은 유지한다.

@@ -23,6 +23,13 @@ from ..retrieval.prompt import Message
 # 활성 상태 — 이 상태들이면 "사용자당 활성 generation 1개" 슬롯을 쥐고 있다.
 ACTIVE_STATUSES = ("queued", "running", "cancel_requested", "reconciling")
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+# finish_generation/mark_generation_reconciling이 "아직 이 프로세스가 붙잡고 있는
+# 살아있는 generation"으로 인정해 손댈 수 있는 상태. reconciling은 빠진다 —
+# reconciling으로 전환됐다는 건 이미 이 코드 경로(제너레이터)가 GeneratorExit로
+# 빠져나갔다는 뜻이라, 같은 제너레이터가 그 뒤 다시 finish_generation을 부를 일이
+# 없다(만약 부른다면 그건 다른 프로세스/요청이 잘못 끼어든 것이므로 오히려 막아야
+# 한다).
+FINISHABLE_STATUSES = ("queued", "running", "cancel_requested")
 
 # reconciling→failed 지연 해소 기준. background sweep은 없다 — 같은 사용자의 다음
 # generation 요청이 잠금 안에서 들어왔을 때만, 이 시간을 넘겼으면 그 자리에서
@@ -571,11 +578,16 @@ class ChatStore:
     def _reject_or_resolve_active_generation(self, cur, owner_subject: str) -> None:
         """활성 generation이 있으면 원칙적으로 GenerationInProgress를 던진다.
 
-        단, 그 활성 generation이 reconciling이고 heartbeat_at이
-        RECONCILIATION_TIMEOUT_SECONDS보다 오래됐으면 — 재시작·연결 끊김 뒤 아무도
-        해소하지 않은 채 방치된 것으로 보고 이 자리에서 failed(reconciliation_timeout)로
-        닫고 슬롯을 연다(feedback.md 확정 정책 — 별도 background sweep 없음, "같은
-        사용자의 다음 요청이 잠금 안에서 들어왔을 때만" 해소).
+        단, 그 활성 generation이 reconciling **또는 cancel_requested**이고
+        heartbeat_at이 RECONCILIATION_TIMEOUT_SECONDS보다 오래됐으면 — 재시작·연결
+        끊김·취소 응답 유실 뒤 아무도 해소하지 않은 채 방치된 것으로 보고 이 자리에서
+        failed(reconciliation_timeout)로 닫고 슬롯을 연다(feedback.md 확정 정책 —
+        별도 background sweep 없음, "같은 사용자의 다음 요청이 잠금 안에서 들어왔을
+        때만" 해소). cancel_requested도 같은 취급인 이유: 취소를 요청받은 generation이
+        업스트림 취소 확인을 영영 못 받으면(예: 어댑터가 죽거나 응답을 잃어버리면)
+        reconciling과 마찬가지로 "종료를 확정할 수 없는 채로 슬롯만 쥐고 있는" 상태라
+        같은 구조가 필요하다 — 새 실패 코드를 따로 만들지 않고 기존 지연 해소 경로를
+        그대로 재사용한다.
         """
         cur.execute(
             """
@@ -591,7 +603,7 @@ class ChatStore:
         row = cur.fetchone()
         if row is None:
             return
-        if row["status"] == "reconciling":
+        if row["status"] in ("reconciling", "cancel_requested"):
             age = datetime.now(timezone.utc) - row["heartbeat_at"]
             if age > timedelta(seconds=RECONCILIATION_TIMEOUT_SECONDS):
                 cur.execute(
@@ -641,12 +653,20 @@ class ChatStore:
     # --- generation 진행 --------------------------------------------------
 
     def mark_generation_running(self, generation_id: UUID, snapshot: InputSnapshot) -> None:
+        """queued → running 전이. status='queued' 가드가 핵심이다 — 검색(네트워크
+        호출) 중에 별도 요청(POST .../cancel)이 먼저 cancel_requested로 바꿔 놨으면
+        이 UPDATE는 아무 일도 하지 않는다(0행). 가드 없이 무조건 썼다면 cancel_requested를
+        running으로 되돌려 취소 의도를 DB에서 잃어버렸을 것이다 — 그 값을 이 함수의
+        반환값으로 알릴 필요는 없다: 이후 어떤 순서로 진행되든 finish_generation이
+        같은 행의 "현재" status를 다시 SQL CASE로 직접 보고 최종 상태를 결정하므로,
+        여기서 실패해도 최종 결과는 항상 옳다(단일 진실 소스를 finish_generation
+        하나로 좁힌다)."""
         with self.pool.connection() as connection, connection.transaction():
             connection.execute(
                 """
                 UPDATE persona_minimal.generations
                 SET status = 'running', citations = %s, input_snapshot = %s, heartbeat_at = now()
-                WHERE id = %s
+                WHERE id = %s AND status = 'queued'
                 """,
                 (
                     json.dumps([c.to_json() for c in snapshot.citations]),
@@ -657,17 +677,45 @@ class ChatStore:
 
     def finish_generation(
         self, generation_id: UUID, *, status: str, content: str, failure_code: str | None
-    ) -> None:
-        """계약대로 done/error SSE를 보내기 **전에** 호출해 DB에 먼저 반영한다."""
+    ) -> Generation:
+        """계약대로 done/error SSE를 보내기 **전에** 호출해 DB에 먼저 반영한다.
+
+        호출자가 계산한 status/failure_code는 "이 자리까지 정상적으로 온 경우"의
+        기본값일 뿐이다 — 그 사이 별도 요청(POST .../cancel)이 cancel_requested를
+        남겼을 수 있어, 먼저 확정된 취소 의도를 존중해 실제로는 cancelled로 써야
+        한다. 이 판단을 파이썬에서 먼저 SELECT로 읽고 나중에 UPDATE하면 그 사이에
+        또 경합이 생긴다(TOCTOU) — 하나의 UPDATE 문 안에서 저장돼 있는 현재
+        status를 SQL CASE로 직접 보고 결정해 "확인"과 "반영" 사이의 틈을 없앤다.
+        WHERE 가드(queued/running/cancel_requested)는 이미 terminal이거나
+        reconciling으로 넘어간 행을 또 덮어쓰지 않게 막는다 — 그런 경우 RETURNING이
+        빈 결과를 주므로 저장된 실제 값을 다시 읽어 돌려준다."""
         with self.pool.connection() as connection, connection.transaction():
-            connection.execute(
-                """
-                UPDATE persona_minimal.generations
-                SET status = %s, content = %s, failure_code = %s, finished_at = now()
-                WHERE id = %s
-                """,
-                (status, content, failure_code, generation_id),
-            )
+            with connection.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    UPDATE persona_minimal.generations
+                    SET status = CASE WHEN status = 'cancel_requested' THEN 'cancelled' ELSE %(status)s END,
+                        content = %(content)s,
+                        failure_code = CASE WHEN status = 'cancel_requested' THEN NULL
+                                            ELSE %(failure_code)s END,
+                        finished_at = now()
+                    WHERE id = %(id)s AND status = ANY(%(finishable)s)
+                    RETURNING id, conversation_id, user_message_id, version_id, mode, status,
+                              content, citations, failure_code, retry_of_generation_id,
+                              input_snapshot, created_at, finished_at
+                    """,
+                    {
+                        "status": status,
+                        "content": content,
+                        "failure_code": failure_code,
+                        "id": generation_id,
+                        "finishable": list(FINISHABLE_STATUSES),
+                    },
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return self._generation_by_id(cur, generation_id)
+                return _generation(row)
 
     def mark_generation_reconciling(self, generation_id: UUID) -> None:
         """연결이 끊기거나 Gateway가 재시작될 때 호출한다 — 성공도 실패도 아니라고
@@ -715,10 +763,13 @@ class ChatStore:
                 # terminal이면 그대로 둔다(계약: "200은 취소 완료 보장이 아님... terminal
                 # 상태면 그대로 반환"). queued/running만 cancel_requested로 바꾼다 —
                 # reconciling은 "결과를 모른다"는 뜻이라 cancel_requested로 덮으면
-                # 오히려 아는 척하는 것이 된다.
+                # 오히려 아는 척하는 것이 된다. heartbeat_at을 여기서도 갱신해야
+                # cancel_requested로 고착된 행을 _reject_or_resolve_active_generation의
+                # 지연 해소가 "언제부터 멈춰 있었는지" 기준으로 판단할 수 있다.
                 cur.execute(
                     """
-                    UPDATE persona_minimal.generations SET status = 'cancel_requested'
+                    UPDATE persona_minimal.generations
+                    SET status = 'cancel_requested', heartbeat_at = now()
                     WHERE id = %s AND status IN ('queued', 'running')
                     """,
                     (generation_id,),
