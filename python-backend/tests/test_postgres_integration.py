@@ -27,6 +27,7 @@ from persona_minimal_api.repository import (
     SUPPORTED_ALEMBIC_REVISIONS,
     DraftAlreadyExists,
     DraftNotFound,
+    DraftNotStarted,
     DraftSettings,
     DraftValidationError,
     IdempotencyConflict,
@@ -605,8 +606,8 @@ def test_discard_removes_draft_and_sources(store: PostgresPersonaStore) -> None:
 
     with store.pool.connection() as connection:
         left = connection.execute(
-            "SELECT count(*) FROM persona_minimal.material_sources WHERE persona_id = %s",
-            (persona.id,),
+            "SELECT count(*) FROM persona_minimal.material_sources WHERE version_id = %s",
+            (draft.version_id,),
         ).fetchone()[0]
     assert left == 0
 
@@ -980,9 +981,9 @@ def _fabricate_ready_index(
                 """
                 UPDATE persona_minimal.material_versions
                 SET status = 'ready', indexed_revision = %s, indexed_at = now(), error_code = NULL
-                WHERE persona_id = %s
+                WHERE version_id = %s
                 """,
-                (revision, persona_id),
+                (revision, handle.version_id),
             )
     try:
         handle.connection.execute("SELECT pg_advisory_unlock(hashtext(%s))", (str(persona_id),))
@@ -1137,8 +1138,8 @@ def test_run_indexing_failure_after_concurrent_edit_does_not_touch_editing(
 
     with store.pool.connection() as connection:
         error_code = connection.execute(
-            "SELECT error_code FROM persona_minimal.material_versions WHERE persona_id = %s",
-            (persona.id,),
+            "SELECT error_code FROM persona_minimal.material_versions WHERE version_id = %s",
+            (final.version_id,),
         ).fetchone()[0]
     assert error_code is None  # status가 안 바뀌었으니 error_code도 안 남는다
 
@@ -1274,8 +1275,8 @@ def test_startup_marks_stale_processing_as_interrupted_and_keeps_indexed_fields(
     assert final.indexed_revision == ready.revision  # 기동 훅은 indexed_*를 안 건드린다
     with store.pool.connection() as connection:
         error_code = connection.execute(
-            "SELECT error_code FROM persona_minimal.material_versions WHERE persona_id = %s",
-            (persona.id,),
+            "SELECT error_code FROM persona_minimal.material_versions WHERE version_id = %s",
+            (final.version_id,),
         ).fetchone()[0]
     assert error_code == "interrupted"
 
@@ -1386,8 +1387,9 @@ def test_retrieve_context_and_build_messages_keep_injections_in_data_blocks_and_
     haneui, haneui_patched = _index_character(
         store, owner, "하늬", "조용한 기상 관측소 관리인이다.", _HANEUI_EVENTS, _HANEUI_SPEECH
     )
-    assert store.get_draft(owner, moru.id).status == "ready"
-    assert store.get_draft(owner, haneui.id).status == "ready"
+    # 활성화가 끝났으므로 초안 슬롯은 비어 있고, 색인 결과는 적용본이 들고 있다.
+    assert store.get_persona(owner, moru.id).active_version_id == moru_patched.version_id
+    assert store.get_persona(owner, haneui.id).active_version_id == haneui_patched.version_id
 
     moru_context = retrieve_context(
         store.pool,
@@ -1510,7 +1512,7 @@ def test_retrieve_endpoint_returns_body_and_speech_chunks_when_enabled(
     monkeypatch.setattr("persona_minimal_api.main.embed", _fake_embed)
 
     owner = f"owner-{uuid4()}"
-    persona, _ = _index_character(
+    persona, indexed = _index_character(
         store,
         owner,
         "질의대상",
@@ -1518,7 +1520,8 @@ def test_retrieve_endpoint_returns_body_and_speech_chunks_when_enabled(
         "질의대상은 도서관 앞에서 소포를 발견했다.",
         "질의대상: 반갑습니다",
     )
-    assert store.get_draft(owner, persona.id).status == "ready"
+    # 활성화까지 끝났으므로 /retrieve는 적용본을 검색한다(초안 슬롯은 비어 있다).
+    assert store.get_persona(owner, persona.id).active_version_id == indexed.version_id
     api = TestClient(create_app(_retrieve_settings(owner, debug_enabled=True), store))
 
     response = api.get(
@@ -1594,6 +1597,156 @@ def test_migration_0004_upgrade_and_downgrade_round_trip(round_trip_database_url
         try:
             with pool.connection() as connection:
                 assert _table_exists(connection, "persona_minimal", "conversations")
+        finally:
+            pool.close()
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+
+
+def test_migration_0004_downgrade_with_real_data_preserves_material_and_drops_only_chat(
+    round_trip_database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """위 왕복 테스트는 스키마(테이블·컬럼 존재)만 본다 — 이 테스트는 실제 데이터가
+    있는 상태에서 downgrade가 0004가 만든 것(채팅 4개 테이블 + personas.active_
+    version_id/draft_version_id + material_sources.version_id +
+    idempotency_records.version_id + material_versions PK 이동)만 되돌리고,
+    0004가 만들지 않은 데이터(캐릭터 이름·material_versions 설정·조각·소스 본문)는
+    그대로 남기는지 확인한다.
+
+    _index_character는 초안 1개를 만들고 바로 activate하므로 캐릭터당
+    material_versions 행이 정확히 1개다 — downgrade 맨 앞의 가드(캐릭터당 행이
+    둘 이상이면 0002 PK로 되돌릴 수 없어 RAISE EXCEPTION)를 건드리지 않는
+    경로만 이 테스트가 검증한다. 그 가드 자체(여러 version이 있을 때 downgrade가
+    거부되는지)는 별도 관심사라 여기서 다루지 않는다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+
+        owner = f"owner-{uuid4()}"
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            data_store = PostgresPersonaStore(pool)
+            data_chat_store = ChatStore(pool)
+            # _index_character가 색인 + activate_draft까지 끝낸 상태를 만든다 —
+            # material_versions/material_sources/material_chunks 실 데이터 +
+            # personas.active_version_id가 채워진다(store.activate_draft 내부).
+            persona, patched = _index_character(
+                data_store,
+                owner,
+                "다운그레이드대상",
+                "다운그레이드대상은 침착한 안내자다.",
+                "다운그레이드대상은 소포를 발견했다.",
+                "다운그레이드대상: 안녕",
+            )
+            data_chat_store.create_conversation(owner, persona.id, uuid4())
+            with pool.connection() as connection:
+                active_version_id = connection.execute(
+                    "SELECT active_version_id FROM persona_minimal.personas WHERE id = %s",
+                    (persona.id,),
+                ).fetchone()[0]
+                assert active_version_id is not None
+                chunk_count_before = connection.execute(
+                    "SELECT count(*) FROM persona_minimal.material_chunks WHERE persona_id = %s",
+                    (persona.id,),
+                ).fetchone()[0]
+                assert chunk_count_before > 0
+                source_content_before = connection.execute(
+                    "SELECT content FROM persona_minimal.material_sources "
+                    "WHERE version_id = %s AND kind = 'events'",
+                    (active_version_id,),
+                ).fetchone()[0]
+                assert source_content_before == "다운그레이드대상은 소포를 발견했다."
+        finally:
+            pool.close()
+
+        command.downgrade(config, "-1")
+
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                for table in (
+                    "conversations",
+                    "user_messages",
+                    "generations",
+                    "chat_idempotency_records",
+                ):
+                    assert not _table_exists(connection, "persona_minimal", table), table
+                for column in ("active_version_id", "draft_version_id"):
+                    assert not _column_exists(connection, "persona_minimal", "personas", column), (
+                        column
+                    )
+                assert not _column_exists(
+                    connection, "persona_minimal", "material_sources", "version_id"
+                )
+                assert not _column_exists(
+                    connection, "persona_minimal", "idempotency_records", "version_id"
+                )
+                # material_sources는 downgrade 도중 persona_id를 version에서
+                # 백필해 되살린다(0004가 지웠던 컬럼) — 0002 PK(persona_id)로
+                # 다시 읽을 수 있어야 한다.
+                assert _column_exists(
+                    connection, "persona_minimal", "material_sources", "persona_id"
+                )
+
+                # 0004가 만들지 않은 데이터는 그대로다.
+                persona_row = connection.execute(
+                    "SELECT name FROM persona_minimal.personas WHERE id = %s", (persona.id,)
+                ).fetchone()
+                assert persona_row is not None
+                assert persona_row[0] == "다운그레이드대상"
+                version_row = connection.execute(
+                    "SELECT settings_name, indexed_revision FROM persona_minimal.material_versions "
+                    "WHERE persona_id = %s",
+                    (persona.id,),
+                ).fetchone()
+                assert version_row is not None
+                assert version_row[0] == "다운그레이드대상"
+                assert version_row[1] == patched.revision
+                chunk_count_after = connection.execute(
+                    "SELECT count(*) FROM persona_minimal.material_chunks WHERE persona_id = %s",
+                    (persona.id,),
+                ).fetchone()[0]
+                assert chunk_count_after == chunk_count_before
+                source_content_after = connection.execute(
+                    "SELECT content FROM persona_minimal.material_sources "
+                    "WHERE persona_id = %s AND kind = 'events'",
+                    (persona.id,),
+                ).fetchone()[0]
+                assert source_content_after == source_content_before
+        finally:
+            pool.close()
+
+        # 다시 head로 올려 이후 테스트가 기대하는 스키마 상태로 되돌려 둔다(기존
+        # 왕복 테스트와 같은 관례).
+        command.upgrade(config, "head")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert _table_exists(connection, "persona_minimal", "conversations")
+                for column in ("active_version_id", "draft_version_id"):
+                    assert _column_exists(connection, "persona_minimal", "personas", column), column
+                assert _column_exists(
+                    connection, "persona_minimal", "material_sources", "version_id"
+                )
+                # 컬럼 자체는 DROP→ADD(+ 백필)로 되살아나지만, 백필 시점의 값은
+                # downgrade가 만든 산출물이지 원래 값의 보존이 아니다 — 이건 DROP
+                # COLUMN의 본질적 한계이지 이 migration의 결함이 아니다. 그래서
+                # 정확한 값 동일성은 확인하지 않는다(0004가 만든 것의 재현이므로).
+                persona_row = connection.execute(
+                    "SELECT active_version_id FROM persona_minimal.personas WHERE id = %s",
+                    (persona.id,),
+                ).fetchone()
+                assert persona_row is not None
+                assert persona_row[0] is None
         finally:
             pool.close()
     finally:
@@ -1681,6 +1834,155 @@ def test_activate_sets_active_version_and_opens_conversations(
     )
     assert created.status_code == 201, created.text
     assert created.json()["initial_version_id"] == str(indexed.version_id)
+
+
+def _chunks_of(store: PostgresPersonaStore, version_id) -> list[tuple]:
+    with store.pool.connection() as connection:
+        return connection.execute(
+            "SELECT id, source_id, kind, ordinal, content FROM persona_minimal.material_chunks "
+            "WHERE version_id = %s ORDER BY kind, ordinal, id",
+            (version_id,),
+        ).fetchall()
+
+
+def test_new_draft_after_activate_keeps_the_applied_version_intact(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """activate → 새 초안(base_version_id) → 수정 → 재색인의 전 구간에서 적용본이 보존된다.
+
+    이 테스트가 고정하는 규칙은 세 가지다.
+      1. 활성화하면 초안 슬롯이 비고(계약 §6), 적용본의 자료·조각은 그대로 남는다.
+      2. 적용본에서 파생한 새 초안을 고쳐 재색인해도 **적용본의 조각은 한 행도 바뀌지
+         않는다** — 재색인이 version_id로만 조각을 지우기 때문이다.
+      3. 이미 시작한 대화는 계속 적용본(initial_version_id)으로 답한다. 새 초안을
+         활성화해야 비로소 포인터가 옮겨가고, 그때 material_changed가 켜진다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    api = _chat_client(store, owner)
+    headers = {"Authorization": "Bearer integration-token"}
+
+    def with_key() -> dict[str, str]:
+        return {**headers, "Idempotency-Key": str(uuid4())}
+
+    persona = store.create_persona(owner, "합성 사용자", "재편집 캐릭터", uuid4())
+    draft = store.create_draft(
+        owner,
+        persona.id,
+        DraftSettings(name="모루", profile="첫 소개", speech_examples=""),
+        uuid4(),
+    )
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "첫 사건"}], []
+    )
+    run_indexing(store.start_indexing(owner, persona.id, patched.revision), "http://unused")
+    applied_version_id = patched.version_id
+
+    activate = api.post(
+        f"/v1/personas/{persona.id}/draft/activate",
+        json={"expected_revision": patched.revision},
+        headers=with_key(),
+    )
+    assert activate.status_code == 200, activate.text
+    applied_chunks = _chunks_of(store, applied_version_id)
+    assert applied_chunks, "적용본에는 색인 조각이 있어야 한다"
+
+    conversation_id = api.post(
+        f"/v1/personas/{persona.id}/conversations", headers=with_key()
+    ).json()["id"]
+
+    # --- 1. 슬롯이 비었다: 조회도 수정도 색인도 초안이 없다고 답한다 -------------
+    with pytest.raises(DraftNotStarted):
+        store.get_draft(owner, persona.id)
+    for path, payload in (
+        (f"/v1/personas/{persona.id}/draft", {"expected_revision": 1, "settings": {"name": "x"}}),
+        (f"/v1/personas/{persona.id}/draft/apply", {"expected_revision": 1}),
+    ):
+        blocked = (
+            api.patch(path, json=payload, headers=with_key())
+            if path.endswith("/draft")
+            else api.post(path, json=payload, headers=with_key())
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"]["code"] == "draft_not_started"
+
+    # --- 2. 적용본에서 새 초안을 판다 -------------------------------------------
+    created = api.post(
+        f"/v1/personas/{persona.id}/draft",
+        json={"base_version_id": str(applied_version_id)},
+        headers=with_key(),
+    )
+    assert created.status_code == 201, created.text
+    new_draft = created.json()
+    assert new_draft["version_id"] != str(applied_version_id)  # 새 version 행이다
+    assert new_draft["base_version_id"] == str(applied_version_id)
+    assert new_draft["settings"]["profile"] == "첫 소개"  # 설정이 복사됐다
+    assert [s["content"] for s in new_draft["sources"]] == ["첫 사건"]  # 자료도 복사됐다
+    # 자료는 **행을 복제한다.** 같은 id를 다시 쓰면 초안 수정이 적용본 본문까지 바꾼다.
+    applied_source_ids = {str(row[1]) for row in applied_chunks}
+    assert {s["id"] for s in new_draft["sources"]}.isdisjoint(applied_source_ids)
+
+    # --- 3. 새 초안을 고치고 재색인한다 -----------------------------------------
+    edited = store.patch_draft(
+        owner,
+        persona.id,
+        new_draft["revision"],
+        None,
+        [{"kind": "events", "content": "고친 사건"}],
+        [],
+    )
+    run_indexing(store.start_indexing(owner, persona.id, edited.revision), "http://unused")
+
+    # 적용본 조각은 개수도 내용도 그대로다 — 재색인은 새 version_id 아래에서 돈다.
+    assert _chunks_of(store, applied_version_id) == applied_chunks
+    new_chunks = _chunks_of(store, edited.version_id)
+    assert new_chunks and new_chunks != applied_chunks
+
+    # 대화는 여전히 적용본으로 답한다. 포인터도 아직 안 옮겨졌다.
+    assert store.get_persona(owner, persona.id).active_version_id == applied_version_id
+    listed = api.get(f"/v1/personas/{persona.id}/conversations", headers=headers).json()["items"]
+    conversation = next(item for item in listed if item["id"] == conversation_id)
+    assert conversation["initial_version_id"] == str(applied_version_id)
+    assert conversation["material_changed"] is False
+
+    # --- 4. 새 초안을 활성화해야 비로소 포인터가 옮겨간다 -------------------------
+    second = api.post(
+        f"/v1/personas/{persona.id}/draft/activate",
+        json={"expected_revision": edited.revision},
+        headers=with_key(),
+    )
+    assert second.status_code == 200, second.text
+    assert store.get_persona(owner, persona.id).active_version_id == edited.version_id
+    # 옛 적용본의 조각은 지우지 않는다 — 그 위에서 시작한 대화가 아직 참조한다.
+    assert _chunks_of(store, applied_version_id) == applied_chunks
+    listed = api.get(f"/v1/personas/{persona.id}/conversations", headers=headers).json()["items"]
+    conversation = next(item for item in listed if item["id"] == conversation_id)
+    assert conversation["initial_version_id"] == str(applied_version_id)
+    assert conversation["material_changed"] is True
+
+
+def test_base_version_id_must_be_the_active_version(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """파생 대상은 그 캐릭터의 적용본만 허용한다.
+
+    임의의 version_id를 받아주면 사용자가 모르는 사이 옛 자료로 되돌아가고,
+    version_id가 응답에 노출되므로 남의 version을 찔러보는 경로도 열린다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    api = _chat_client(store, owner)
+    headers = {"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())}
+
+    persona = store.create_persona(owner, "합성 사용자", "파생 검증 캐릭터", uuid4())
+    # 적용본이 아직 없다 — 파생할 대상이 없으므로 404다.
+    missing = api.post(
+        f"/v1/personas/{persona.id}/draft",
+        json={"base_version_id": str(uuid4())},
+        headers=headers,
+    )
+    assert missing.status_code == 404, missing.text
+    assert missing.json()["error"]["code"] == "version_not_found"
 
 
 def test_activate_rejects_stale_revision_and_unindexed_edit(
@@ -2101,7 +2403,7 @@ def test_reconciling_generation_is_resolved_lazily_after_heartbeat_timeout(
             "INSERT INTO persona_minimal.generations("
             "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
             ") VALUES (%s, %s, %s, "
-            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), "
             "'mock', 'reconciling', now() - interval '301 seconds')",
             (stuck_generation_id, conversation_id, user_message_id, persona.id),
         )
@@ -2150,7 +2452,7 @@ def test_reconciling_generation_still_blocks_new_requests_before_timeout(
             "INSERT INTO persona_minimal.generations("
             "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
             ") VALUES (%s, %s, %s, "
-            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), "
             "'mock', 'reconciling', now())",
             (uuid4(), conversation_id, user_message_id, persona.id),
         )
@@ -2189,7 +2491,7 @@ def test_startup_reconciles_stale_running_generation_into_reconciling(
         conversation_id = connection.execute(
             "INSERT INTO persona_minimal.conversations(id, persona_id, owner_subject, initial_version_id, title) "
             "VALUES (%s, %s, %s, "
-            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), %s) "
+            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), %s) "
             "RETURNING id",
             (uuid4(), persona.id, owner, persona.id, "재시작 대화"),
         ).fetchone()[0]
@@ -2203,7 +2505,7 @@ def test_startup_reconciles_stale_running_generation_into_reconciling(
             "INSERT INTO persona_minimal.generations("
             "id, conversation_id, user_message_id, version_id, mode, status"
             ") VALUES (%s, %s, %s, "
-            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), "
             "'mock', 'running')",
             (stuck_generation_id, conversation_id, user_message_id, persona.id),
         )
@@ -2545,7 +2847,7 @@ def test_stuck_cancel_requested_is_resolved_lazily_after_heartbeat_timeout(
             "INSERT INTO persona_minimal.generations("
             "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
             ") VALUES (%s, %s, %s, "
-            "(SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s), "
+            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), "
             "'mock', 'cancel_requested', now() - interval '301 seconds')",
             (stuck_generation_id, conversation_id, user_message_id, persona.id),
         )
@@ -2610,3 +2912,120 @@ def test_retry_input_unavailable_when_original_failed_before_search(
     )
     assert retry_response.status_code == 409, retry_response.text
     assert retry_response.json()["error"]["code"] == "retry_input_unavailable"
+
+
+class _BrokenInferenceClient:
+    """정상 프로토콜을 어기는 어댑터 버그를 흉내낸다 — UpstreamError가 아니라
+    아무 예외나 던진다(어댑터 내부 로직 버그, 직렬화 실패 등 예상 못한 상황).
+    UpstreamError 전용 except로는 안 잡혀야 stream_generation의 마지막
+    안전망(except Exception)을 검증할 수 있다."""
+
+    def start(self, generation_id: UUID, messages: list, *, max_tokens: int):
+        del generation_id, messages, max_tokens
+        raise RuntimeError("어댑터 내부 버그")
+
+    def cancel(self, generation_id: UUID) -> None:
+        del generation_id
+
+
+def test_unexpected_error_during_retrieval_is_recorded_failed_and_releases_slot(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """검색 단계에서 UpstreamError도 아니고 기존에 잡던 특정 예외들(NotIndexed 등)
+    도 아닌 임의의 버그(RuntimeError)가 나도 generation이 queued로 방치되지 않고
+    failed(internal_error)로 닫혀야 한다 — 슬롯도 풀려 같은 사용자의 다음 요청이
+    바로 접수돼야 한다. 고치기 전에는 이 예외가 그대로 새어나가 슬롯을 영구
+    고착시켰다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+
+    def broken_embed(base_url, texts, input_type):
+        raise RuntimeError("임베딩 서비스 버그")
+
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", broken_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "검색버그대상",
+        "검색버그대상은 침착한 안내자다.",
+        "검색버그대상은 소포를 발견했다.",
+        "검색버그대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=FakeInferenceClient(),
+    )
+    events = _parse_sse("".join(generator))
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "internal_error"
+    assert events[-1][1]["status"] == "failed"
+
+    generation = chat_store.get_generation(owner, accepted.generation.id)
+    assert generation.status == "failed"
+    assert generation.failure_code == "internal_error"
+
+    # 슬롯이 풀렸는지 — 같은 사용자의 다음 요청이 409 없이 바로 접수돼야 한다
+    # (HTTP 계층의 201에 대응).
+    next_accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "다음 질문", uuid4()
+    )
+    assert next_accepted.generation.status == "queued"
+
+
+def test_unexpected_error_from_inference_adapter_is_recorded_failed_and_releases_slot(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """어댑터(inference_client.start)가 UpstreamError가 아닌 임의 예외(버그)를
+    던져도 같은 안전망으로 failed(internal_error)가 되고 슬롯이 풀려야 한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "어댑터버그대상",
+        "어댑터버그대상은 침착한 안내자다.",
+        "어댑터버그대상은 소포를 발견했다.",
+        "어댑터버그대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=_BrokenInferenceClient(),
+    )
+    events = _parse_sse("".join(generator))
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "internal_error"
+    assert events[-1][1]["status"] == "failed"
+
+    generation = chat_store.get_generation(owner, accepted.generation.id)
+    assert generation.status == "failed"
+    assert generation.failure_code == "internal_error"
+
+    next_accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "다음 질문", uuid4()
+    )
+    assert next_accepted.generation.status == "queued"

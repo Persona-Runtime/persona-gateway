@@ -15,7 +15,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from ..indexing.embedding_client import embed
-from ..repository import NotIndexed, PersonaNotFound, require_draft_schema
+from ..repository import NotIndexed, PersonaNotFound, require_draft_pointer_schema
 from .metrics import RETRIEVAL_SECONDS
 
 # §8 Q5 확정 — 골든셋 전 변경 금지.
@@ -73,27 +73,63 @@ def search(
 def load_indexed_version(
     pool: ConnectionPool, owner_subject: str, persona_id: UUID
 ) -> tuple[UUID, int]:
-    """소유자 범위로 version_id·indexed_revision만 읽는다(FOR UPDATE 없이) — 검색은
-    쓰기가 아니라 잠글 이유가 없다. `retrieve_context`와 `/retrieve` 디버그 엔드포인트가
-    함께 쓴다(디버그 엔드포인트는 k를 호출자가 고르므로 k가 고정된 `retrieve_context`를
-    그대로 재사용할 수 없다).
+    """호출자가 version을 고르지 않았을 때 검색할 version과 그 indexed_revision을 고른다.
+
+    적용본이 있으면 적용본을, 없으면 초안을 고른다 — 캐릭터에 version이 여럿일 수
+    있게 되면서 "그 캐릭터의 version"만으로는 대상이 정해지지 않기 때문이다. 적용본을
+    먼저 보는 이유는 대화가 쓰는 것이 적용본이라서다. 초안까지 보는 이유는 활성화
+    전에도 색인 결과를 확인할 수 있어야 하기 때문이다(/retrieve 디버그 엔드포인트).
+
+    잠그지 않는다(FOR UPDATE 없이) — 검색은 쓰기가 아니다.
     """
     with pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cur:
-            require_draft_schema(cur)
+            require_draft_pointer_schema(cur)
             cur.execute(
                 "SELECT mv.version_id, mv.indexed_revision "
+                "FROM persona_minimal.personas AS p "
+                "LEFT JOIN persona_minimal.material_versions AS mv "
+                "  ON mv.version_id = COALESCE(p.active_version_id, p.draft_version_id) "
+                "WHERE p.id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL",
+                (persona_id, owner_subject),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise PersonaNotFound
+    # 캐릭터는 있는데 가리키는 version이 없다(자료를 아직 안 넣었다). LEFT JOIN이라
+    # 행은 오고 값만 NULL이다.
+    if row["version_id"] is None or row["indexed_revision"] is None:
+        raise NotIndexed
+    return row["version_id"], row["indexed_revision"]
+
+
+def load_indexed_revision(
+    pool: ConnectionPool, owner_subject: str, persona_id: UUID, version_id: UUID
+) -> int:
+    """호출자가 이미 고른 version의 indexed_revision을 읽는다.
+
+    version을 다시 고르지 않는다 — 채팅 생성은 접수 시점의 적용본(generations.
+    version_id)으로 답해야 하는데, 그 사이 재활성화가 일어나면 캐릭터의 "지금 적용본"은
+    다른 version이다. 소유자 조건은 그대로 건다(version_id만으로 남의 자료를 읽을 수
+    있으면 안 된다).
+    """
+    with pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cur:
+            require_draft_pointer_schema(cur)
+            cur.execute(
+                "SELECT mv.indexed_revision "
                 "FROM persona_minimal.material_versions AS mv "
                 "JOIN persona_minimal.personas AS p ON p.id = mv.persona_id "
-                "WHERE mv.persona_id = %s AND p.owner_subject = %s AND p.deleted_at IS NULL",
-                (persona_id, owner_subject),
+                "WHERE mv.version_id = %s AND mv.persona_id = %s "
+                "  AND p.owner_subject = %s AND p.deleted_at IS NULL",
+                (version_id, persona_id, owner_subject),
             )
             row = cur.fetchone()
     if row is None:
         raise PersonaNotFound
     if row["indexed_revision"] is None:
         raise NotIndexed
-    return row["version_id"], row["indexed_revision"]
+    return row["indexed_revision"]
 
 
 @dataclass(frozen=True)
@@ -123,8 +159,9 @@ def retrieve_context(
     if version_id is None:
         version_id, indexed_revision = load_indexed_version(pool, owner_subject, persona_id)
     else:
-        # 호출자가 이미 버전을 골랐다 — indexed_revision은 표시용 정보라 함께 읽는다.
-        _, indexed_revision = load_indexed_version(pool, owner_subject, persona_id)
+        # 호출자가 이미 버전을 골랐다 — indexed_revision은 표시용 정보라 함께 읽되,
+        # **그 버전의** 값을 읽는다(캐릭터의 지금 적용본이 아니다).
+        indexed_revision = load_indexed_revision(pool, owner_subject, persona_id, version_id)
     result = embed(embedding_base_url, [question], "query")
     query_vector = result.vectors[0]
     with pool.connection() as connection:

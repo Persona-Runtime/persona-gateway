@@ -46,9 +46,11 @@ from .cursor import (
 from .indexing.embedding_client import EmbeddingError, embed
 from .indexing.runner import run_indexing
 from .repository import (
+    BaseVersionNotFound,
     Draft,
     DraftAlreadyExists,
     DraftNotFound,
+    DraftNotStarted,
     DraftSettings,
     DraftValidationError,
     DuplicatePersonaName,
@@ -194,10 +196,10 @@ def persona_detail_response(persona: Persona) -> dict[str, object]:
     """계약의 PersonaDetail. 목록 응답에 active_version을 더한 모양이다."""
     detail = persona_response(persona)
     # active_version_id(포인터)는 위에서 채웠지만 active_version(상세)은 계속 null이다.
-    # 계약의 Version은 id·settings·sources·activated_at을 모두 요구하는데, 지금 스키마엔
-    # 적용 시점의 설정·자료를 고정해 둔 불변 묶음도 activated_at 컬럼도 없다(계약 §6).
-    # 일부만 채워 내보내면 additionalProperties:false·required를 어기므로, 묶음이
-    # 생길 때까지 null을 유지한다.
+    # 계약의 Version은 id·settings·sources·activated_at을 모두 요구한다. 앞의 셋은
+    # 이제 적용본 version 행에 고정돼 있지만(활성화 뒤 그 행으로 가는 수정 경로가
+    # 없다) activated_at 컬럼이 없다. 일부만 채워 내보내면 additionalProperties:false·
+    # required를 어기므로, 그 컬럼이 생길 때까지 null을 유지한다.
     detail["active_version"] = None
     return detail
 
@@ -545,6 +547,16 @@ def create_app(
             return ApiError(404, "draft_not_found", "초안이 없습니다.")
         if isinstance(error, DraftAlreadyExists):
             return ApiError(409, "draft_exists", "이미 초안이 있습니다.")
+        if isinstance(error, DraftNotStarted):
+            # 404가 아니라 409인 이유: 활성화 뒤 초안 슬롯이 빈 것은 정상 상태이고,
+            # POST /draft 한 번으로 이어갈 수 있다(DraftNotStarted docstring 참고).
+            return ApiError(
+                409,
+                "draft_not_started",
+                "적용된 자료는 수정할 수 없습니다. 새 초안을 시작한 뒤 수정해주세요.",
+            )
+        if isinstance(error, BaseVersionNotFound):
+            return ApiError(404, "version_not_found", "파생할 적용본을 찾을 수 없습니다.")
         if isinstance(error, RevisionConflict):
             return ApiError(
                 409,
@@ -601,24 +613,24 @@ def create_app(
                 "invalid_request",
                 "settings 또는 base_version_id 중 하나만 보내주세요.",
             )
-        if body.base_version_id is not None:
-            # 적용본이 아직 없다. 있지도 않은 version에서 파생시키는 대신 분명히 알린다.
-            raise ApiError(404, "version_not_found", "파생할 적용본이 없습니다.")
-
         settings = body.settings
-        assert settings is not None  # 위 분기가 보장한다
-        if not settings.name.strip() or not settings.profile.strip():
+        if settings is not None and (not settings.name.strip() or not settings.profile.strip()):
             raise ApiError(422, "invalid_settings", "이름과 소개는 비어 있을 수 없습니다.")
         try:
             draft = request.app.state.store.create_draft(
                 user[0],
                 persona_id,
-                DraftSettings(
-                    name=settings.name,
-                    profile=settings.profile,
-                    speech_examples=settings.speech_examples,
+                (
+                    DraftSettings(
+                        name=settings.name,
+                        profile=settings.profile,
+                        speech_examples=settings.speech_examples,
+                    )
+                    if settings is not None
+                    else None
                 ),
                 key,
+                base_version_id=body.base_version_id,
             )
         except Exception as error:
             raise draft_error(error) from error
