@@ -91,9 +91,9 @@ rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `faile
 | PATCH | `/v1/personas/{persona_id}/draft` | 200 Draft | expected_revision, 실행 중 수정 금지 |
 | DELETE | `/v1/personas/{persona_id}/draft` | 204 | query expected_revision, 실행 종료 확인 |
 | POST | `/v1/personas/{persona_id}/draft/process` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
-| POST | `/v1/personas/{persona_id}/draft/activate` | — | **미구현·대체됨** — `draft/apply`가 처리+적용을 한 번에 한다 |
+| POST | `/v1/personas/{persona_id}/draft/activate` | 200 Activated | 색인이 끝난 초안(can_activate)을 적용본으로. revision 불일치 409 `revision_mismatch`, 색인 미완 409 `not_activatable` |
 | POST | `/v1/personas/{persona_id}/draft/apply` | 202 `{version_id, status}` | expected_revision 불일치 409 `revision_mismatch`, 진행 중 409 `indexing_in_progress`, 자료 없음 422 `no_content` |
-| POST | `/v1/personas/{persona_id}/conversations` | 201 Conversation | 적용본 필요, GPU 가용성은 생성 조건 아님 |
+| POST | `/v1/personas/{persona_id}/conversations` | 201 Conversation | 적용본 필요(없으면 409 `no_active_version`), GPU 가용성은 생성 조건 아님 |
 | GET | `/v1/personas/{persona_id}/conversations` | 200 ConversationPage | 캐릭터별 소유자 목록 |
 | GET | `/v1/conversations/{conversation_id}/messages` | 200 MessagePage | 질문별 생성 시도·저장된 부분 답변 |
 | POST | `/v1/chat/completions` | 200 SSE 또는 replay JSON | conversation_id + message, 사용자당 활성 생성 1개 |
@@ -211,11 +211,13 @@ index가 없을 수 있는 profile-only 구성은 검색을 생략한다. 공유
 materialization은 job/attempt/revision으로 격리하고 dispatcher가 최신 결과만 publish한다.
 Postgres+Qdrant의 원자 트랜잭션을 가정하지 않는다. 검증된 결과만 참조한 뒤 활성 포인터를 CAS로 전환한다.
 `activate`는 expected_revision, base version, can_activate, 삭제 여부를 확인한다. 성공 후 초안 슬롯은 비워 다음 수정을 허용한다.
+**현재 구현(2026-09-23)은 슬롯을 비우지 않는다** — `material_sources`가 `material_versions(persona_id)`를, `material_chunks`가 `material_sources(id)`를 참조해 초안 행을 지우면 방금 적용한 색인 조각까지 사라진다. 위 문단이 전제하는 "immutable settings + immutable index reference 묶음"을 별도 테이블로 두기 전에는 포인터(`personas.active_version_id`)만 세우고 초안은 남긴다. 같은 이유로 그 포인터가 가리키는 version_id는 불변 스냅샷이 아니다(재색인하면 같은 id 아래 조각이 바뀐다). 불변 묶음은 후속 과제다.
 이전 답변이 사용하는 version/input snapshot은 종료되기 전에 정리하지 않는다.
 
 ## 7. 대화·질문·재시도
 
-새 대화는 적용본이 있어야 한다. GPU가 꺼져도 빈 대화와 기존 기록 조회는 가능하다.
+새 대화는 적용본이 있어야 한다 — 없으면 409 `no_active_version`이다(색인만 끝나고 아직 활성화하지 않은 상태와, 색인 자체가 없어 검색이 불가능한 `not_indexed`를 구분한다). GPU가 꺼져도 빈 대화와 기존 기록 조회는 가능하다.
+질문마다 서버가 그 시점의 적용본을 골라 `generations.version_id`에 기록한다 — 대화 도중 새 적용본이 생기면 이후 질문은 새 적용본으로 답하고, 이미 접수된 생성은 기록된 적용본으로 끝낸다.
 대화 목록 title은 최초 질문의 짧은 표시용 일부 등 결정적 방식으로 만들며 LLM 제목 생성은 하지 않는다. 구체 길이는 UI 규칙으로 정한다.
 `material_changed`는 initial_version_id와 현재 적용본이 다른지 표시한다. 새 대화 권장 안내일 뿐 기존 기록을 변경하지 않는다.
 메시지 조회는 질문마다 user_message와 generations 배열을 반환한다. 중단·실패 기록이 완성 답변처럼 섞이지 않는다.

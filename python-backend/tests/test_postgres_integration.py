@@ -358,7 +358,8 @@ def test_draft_starts_without_a_job_and_persona_becomes_review_required(
     assert draft.status == "editing"
     assert draft.job_id is None
     assert draft.sources == ()
-    # 처리기가 없으므로 적용할 수 없다. 여기서 True를 돌려주면 웹이 잘못 안내한다.
+    # 방금 만든 초안은 색인이 없다 — 색인이 끝나고 그 색인이 지금 revision의 것일 때만
+    # 활성화할 수 있다. 여기서 True를 돌려주면 웹이 "바로 적용 가능"으로 잘못 안내한다.
     assert draft.can_activate is False
     assert draft.requires_processing is True
     assert store.get_persona(owner, persona.id).status == "review_required"
@@ -1339,6 +1340,9 @@ def _index_character(
     )
     handle = store.start_indexing(owner, persona.id, patched.revision)
     run_indexing(handle, "http://unused")  # embed가 monkeypatch돼 있어 URL은 안 쓰인다
+    # 대화는 적용본 위에서만 시작한다(계약 §7) — 색인만으로는 부족하고 활성화까지
+    # 끝나야 한다. 채팅 테스트 대부분이 이 헬퍼로 준비하므로 여기서 함께 한다.
+    store.activate_draft(owner, persona.id, patched.revision)
     return persona, patched
 
 
@@ -1630,9 +1634,104 @@ def _chat_client(store: PostgresPersonaStore, owner: str, inference_client=None)
     )
 
 
-def test_create_conversation_requires_an_indexed_version(
+def test_activate_sets_active_version_and_opens_conversations(
     store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """색인 → can_activate → activate 200 → active_version_id 채워짐 → 대화 201."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    persona = store.create_persona(owner, "합성 사용자", "활성화 캐릭터", uuid4())
+    draft = store.create_draft(
+        owner, persona.id, DraftSettings(name="모루", profile="합성", speech_examples=""), uuid4()
+    )
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "합성 사건"}], []
+    )
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+    run_indexing(handle, "http://unused")
+
+    indexed = store.get_draft(owner, persona.id)
+    assert indexed.status == "ready"
+    assert indexed.indexed_revision == indexed.revision
+    assert indexed.can_activate is True
+    assert indexed.requires_processing is False
+    # 활성화 전에는 적용본이 없다.
+    assert store.get_persona(owner, persona.id).active_version_id is None
+
+    api = _chat_client(store, owner)
+    response = api.post(
+        f"/v1/personas/{persona.id}/draft/activate",
+        json={"expected_revision": patched.revision},
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["persona_id"] == str(persona.id)
+    assert body["version_id"] == str(indexed.version_id)
+    assert body["activated_at"]
+
+    activated = store.get_persona(owner, persona.id)
+    assert activated.active_version_id == indexed.version_id
+    # 적용본이 있으면 초안 처리 여부와 무관하게 ready다(계약 §2).
+    assert activated.status == "ready"
+
+    created = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["initial_version_id"] == str(indexed.version_id)
+
+
+def test_activate_rejects_stale_revision_and_unindexed_edit(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """revision 불일치는 409 revision_mismatch, 색인 뒤 편집분은 409 not_activatable.
+
+    후자를 막지 않으면 방금 고친 내용이 빠진 색인이 적용본이 된다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    persona = store.create_persona(owner, "합성 사용자", "경합 캐릭터", uuid4())
+    draft = store.create_draft(
+        owner, persona.id, DraftSettings(name="모루", profile="합성", speech_examples=""), uuid4()
+    )
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "합성 사건"}], []
+    )
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+    run_indexing(handle, "http://unused")
+    api = _chat_client(store, owner)
+
+    stale = api.post(
+        f"/v1/personas/{persona.id}/draft/activate",
+        json={"expected_revision": patched.revision + 5},
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["code"] == "revision_mismatch"
+
+    # 색인 뒤 자료를 더 고치면 indexed_revision이 뒤처진다.
+    edited = store.patch_draft(
+        owner, persona.id, patched.revision, None, [{"kind": "events", "content": "고친 사건"}], []
+    )
+    assert edited.can_activate is False
+    assert edited.requires_processing is True
+
+    rejected = api.post(
+        f"/v1/personas/{persona.id}/draft/activate",
+        json={"expected_revision": edited.revision},
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["error"]["code"] == "not_activatable"
+    assert store.get_persona(owner, persona.id).active_version_id is None
+
+
+def test_create_conversation_requires_an_active_version(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """계약 §7 "새 대화는 적용본이 있어야 한다" — 자료도 색인도 없는 캐릭터."""
     owner = f"owner-{uuid4()}"
     persona = store.create_persona(owner, "합성 사용자", "미색인 캐릭터", uuid4())
     api = _chat_client(store, owner)
@@ -1642,7 +1741,38 @@ def test_create_conversation_requires_an_indexed_version(
         headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
     )
     assert response.status_code == 409, response.text
-    assert response.json()["error"]["code"] == "not_indexed"
+    assert response.json()["error"]["code"] == "no_active_version"
+
+
+def test_create_conversation_rejects_indexed_but_not_activated_draft(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """색인만 끝나고 활성화는 안 한 상태 — 이 경계가 이번 변경의 핵심이다.
+
+    예전에는 색인(indexed_revision)만 있으면 대화가 열렸다. 색인은 "검색 재료가
+    준비됐다"는 뜻일 뿐이고, 그것을 실제로 쓸지는 활성화가 정한다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    persona = store.create_persona(owner, "합성 사용자", "색인만 한 캐릭터", uuid4())
+    draft = store.create_draft(
+        owner, persona.id, DraftSettings(name="모루", profile="합성", speech_examples=""), uuid4()
+    )
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "합성 사건"}], []
+    )
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+    run_indexing(handle, "http://unused")
+    # 여기까지가 색인. activate는 일부러 하지 않는다.
+    assert store.get_draft(owner, persona.id).can_activate is True
+
+    api = _chat_client(store, owner)
+    response = api.post(
+        f"/v1/personas/{persona.id}/conversations",
+        headers={"Authorization": "Bearer integration-token", "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "no_active_version"
 
 
 def test_chat_completions_streams_meta_citations_delta_done_in_order_and_persists(
