@@ -7,6 +7,7 @@ DB 처리·응답 변환을 역할로 나눈다). 저수준 SQL은 `chat/reposit
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -31,6 +32,8 @@ from .repository import (
     InputSnapshot,
 )
 from .sse import format_citations, format_delta, format_done, format_error, format_meta
+
+logger = logging.getLogger(__name__)
 
 MIN_QUESTION_CHARS = 1
 MAX_QUESTION_CHARS = 2000
@@ -192,6 +195,24 @@ def stream_generation(
     except GeneratorExit:
         chat_store.mark_generation_reconciling(generation.id)
         raise
+    except Exception as error:
+        # 마지막 안전망이다 — `_run_generation` 내부의 구체적인 except들(검색
+        # 단계 예외, UpstreamError)이 예상하지 못한 나머지 전부를 잡는다. 이게
+        # 없으면 버그 하나가 그대로 generation을 queued/running에 방치해 슬롯을
+        # 영구히 막는다(이전 P1들과 같은 종류의 결함을 원천 차단). 원문 예외
+        # 메시지는 로그에 남기지 않는다 — SQL·질문 원문이 섞여 나올 수 있어
+        # 타입 이름만 남긴다(계약: "사용자 입력이 포함될 수 있는 raw exception은
+        # 전달하지 않는다").
+        logger.error(
+            "generation %s 처리 중 예기치 않은 오류(%s)", generation.id, type(error).__name__
+        )
+        persisted = chat_store.finish_generation(
+            generation.id, status="failed", content="", failure_code="internal_error"
+        )
+        metrics.GENERATIONS_FINISHED.labels(
+            mode=generation.mode, terminal_reason=persisted.status
+        ).inc()
+        yield _terminal_event(persisted, fallback_finish_reason="stop")
 
 
 def _run_generation(
