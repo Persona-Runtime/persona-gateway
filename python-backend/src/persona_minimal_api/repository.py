@@ -55,21 +55,25 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 릴리스가 잠깐 0001까지 넓혔던 것을 원래대로 되돌린 것 — 다음 migration(0004)을
 # 낼 때 같은 패턴(호환 릴리스로 구·신 둘 다 잠깐 허용했다가, 적용 확인 후 새
 # revision 하나로 좁히기)을 또 쓴다.
-# 2026-09-22 호환 릴리스: 0004(채팅 테이블)를 새로 낸다. docs/migrations.md의 배포
-# 순서(호환 릴리스 → migration Job → grants → 기능 릴리스)대로, 이 이미지는 새 기능
-# 코드(chat/*)가 이미 있지만 0003 DB에서도 계속 Ready이게 구·신 둘 다 허용한다.
-# migration Job이 실제로 적용되고 확인된 뒤 ("0004_chat",) 하나로 좁히는 건 이후
-# 별도 커밋(기능 릴리스)이다 — 이 PR이 아니다.
-SUPPORTED_ALEMBIC_REVISIONS = ("0003_material_chunks", "0004_chat")
-# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 호환 창을
-# 다시 열면서(위 SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용) 이 목록도
-# "0003까지는 있다"는 뜻을 유지하도록 그대로 둔다 — 0004 DB에도 초안 스키마는
+# 호환 창을 닫았다(2026-09-23) — migration 0004_chat이 운영에 실제로 적용·검증되고
+# (persona-platform PR #29: migration Job Complete, grants 적용, §7-b 권한 확인,
+# activate 200, 대화 생성 201, SSE mock 종단, 복원 리허설 0.16초) 0003은 더 이상
+# 지원하지 않는다. 2026-09-22 호환 릴리스가 잠깐 0003·0004 둘 다 넓혔던 것을 다시
+# 하나로 좁힌 것 — 다음 migration을 낼 때 같은 패턴(호환 릴리스로 구·신 둘 다 잠깐
+# 허용했다가, 적용 확인 후 새 revision 하나로 좁히기)을 또 쓴다.
+SUPPORTED_ALEMBIC_REVISIONS = ("0004_chat",)
+# 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 호환 창이
+# 열려 있었을 때(위 SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용하던 동안)
+# 이 목록도 "0003까지는 있다"는 뜻으로 넓혀 뒀다 — 지금은 창이 닫혔지만, 다음 호환
+# 릴리스에서 또 넓힐 "호환 창 도구"로 그대로 남긴다. 0004 DB에도 초안 스키마는
 # 당연히 있다(0002에서 만들어진 뒤 한 번도 지워지지 않았다).
 DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks", "0004_chat")
 # 채팅 스키마(conversations·user_messages·generations)는 0004에서 생겼다. 호환 창이
-# 열려 있는 동안(SUPPORTED_ALEMBIC_REVISIONS가 0003도 허용) 0003 DB엔 이 테이블들이
-# 없을 수 있다 — chat_schema_ready/require_chat_schema가 draft_schema_ready와 같은
-# "호환 창 도구" 패턴으로 이걸 가른다.
+# 열려 있었을 때(SUPPORTED_ALEMBIC_REVISIONS가 0003도 허용하던 동안) 0003 DB엔 이
+# 테이블들이 없을 수 있었다 — chat_schema_ready/require_chat_schema가
+# draft_schema_ready와 같은 "호환 창 도구" 패턴으로 이걸 가른다. 지금은 SUPPORTED_
+# ALEMBIC_REVISIONS가 0004 하나뿐이라 이 튜플이 사실상 단일값과 같지만, 다음 호환
+# 릴리스에서 다시 넓혀 쓴다.
 CHAT_SCHEMA_REVISIONS = ("0004_chat",)
 
 
@@ -83,9 +87,9 @@ def draft_schema_ready(cur) -> bool:
 
     이건 "호환 창 도구"다 — SUPPORTED_ALEMBIC_REVISIONS가 여러 revision을 허용하는
     호환 릴리스 기간에만 이 판정이 실제로 갈린다(그중 일부는 초안 스키마가 없을 수
-    있으므로). 지금(2026-09-21, 호환 창을 닫은 뒤)은 SUPPORTED_ALEMBIC_REVISIONS가
-    "0003_material_chunks" 하나뿐이라 이 함수가 항상 True를 돌려주는 죽은 분기지만,
-    지우지 않는다 — 다음 호환 릴리스(예: 0004)에서 그대로 재사용한다. 호출자는
+    있으므로). 지금(2026-09-23, 0004 호환 창을 닫은 뒤)은 SUPPORTED_ALEMBIC_
+    REVISIONS가 "0004_chat" 하나뿐이라 이 함수가 항상 True를 돌려주는 죽은
+    분기지만, 지우지 않는다 — 다음 호환 릴리스에서 그대로 재사용한다. 호출자는
     dict_row cursor를 넘겨야 한다.
     """
     cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
@@ -111,7 +115,10 @@ def chat_schema_ready(cur) -> bool:
     """alembic_version 마커만 읽어 채팅 스키마(conversations 등) 존재 여부를 판정한다.
 
     draft_schema_ready와 같은 이유·같은 방식의 "호환 창 도구"다 — 0004 호환 릴리스
-    기간에만 실제로 갈린다. 호출자는 dict_row cursor를 넘겨야 한다.
+    기간에만 실제로 갈렸다. 지금(2026-09-23, 0004 호환 창을 닫은 뒤)은
+    SUPPORTED_ALEMBIC_REVISIONS가 "0004_chat" 하나뿐이라 이 함수가 항상 True를
+    돌려주는 죽은 분기지만, 다음 호환 릴리스에서 재사용한다. 호출자는 dict_row
+    cursor를 넘겨야 한다.
     """
     cur.execute("SELECT version_num FROM persona_minimal.alembic_version")
     row = cur.fetchone()
@@ -124,6 +131,8 @@ def require_chat_schema(cur) -> None:
 
     require_draft_schema와 같은 이유 — 호출자가 뒤이어 conversations 등을 SELECT/
     INSERT할 것이므로, "구 revision인데 채팅 API를 불렀다"는 409를 먼저 낸다.
+    지금은 호출돼도 항상 통과만 하지만 다음 호환 릴리스에서 다시 실제로 거절하게
+    된다.
     """
     if not chat_schema_ready(cur):
         raise SchemaNotReady
@@ -137,11 +146,12 @@ def require_draft_pointer_schema(cur) -> None:
     초안 질의가 컬럼 자체를 찾지 못해 500으로 끝나므로, 여기서 먼저 409
     schema_not_ready로 끊는다.
 
-    호환 창(SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용) 동안 DB가 아직
-    0003이면 초안 화면 전체가 잠시 409가 된다 — 호환 릴리스 배포부터 migration Job
+    호환 창(SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용하던 동안) DB가 아직
+    0003이면 초안 화면 전체가 잠시 409였다 — 호환 릴리스 배포부터 migration Job
     완료까지의 몇 분이다(docs/migrations.md의 배포 순서). 목록·상세(list_personas·
     get_persona)는 그 사이에도 200이어야 해서 이 검사를 받지 않고, 대신 컬럼이 없는
-    revision에서는 상수 NULL로 대신하는 이중 쿼리를 쓴다.
+    revision에서는 상수 NULL로 대신하는 이중 쿼리를 쓴다. 지금(호환 창을 닫은 뒤)은
+    SUPPORTED_ALEMBIC_REVISIONS가 "0004_chat" 하나뿐이라 이 409가 나올 일이 없다.
     """
     require_draft_schema(cur)
     require_chat_schema(cur)
@@ -533,6 +543,9 @@ class PostgresPersonaStore:
                     # 캐릭터당 version이 한 행이라 persona_id로 조인해야 하고,
                     # 적용본이라는 개념 자체가 없어 active_version_id는 상수 NULL이다.
                     # 컬럼을 그냥 쓰면 UndefinedColumn으로 죽으므로 질의를 통째로 가른다.
+                    # 지금은 chat_schema_ready가 항상 True라(SUPPORTED_ALEMBIC_
+                    # REVISIONS가 "0004_chat" 하나뿐) 이 분기는 실행되지 않는 죽은
+                    # 경로다.
                     query = """
                         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
                                NULL AS active_version_id,
@@ -694,6 +707,8 @@ class PostgresPersonaStore:
 
     # 호환 창 도구(list_personas와 같은 이유) — 초안 포인터 컬럼이 없는 0003 DB에서
     # 쓴다. 그 시절 스키마대로 persona_id로 조인하고 적용본은 상수 NULL로 둔다.
+    # 지금은 chat_schema_ready가 항상 True라(SUPPORTED_ALEMBIC_REVISIONS가
+    # "0004_chat" 하나뿐) 이 분기는 실행되지 않는 죽은 경로다.
     _PERSONA_WITH_DRAFT = """
         SELECT p.id, p.name, p.created_at, p.deletion_id, p.deleted_at,
                NULL AS active_version_id,

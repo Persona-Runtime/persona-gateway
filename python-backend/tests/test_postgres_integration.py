@@ -235,17 +235,17 @@ def test_readyz_requires_the_revision_this_release_supports(
 ) -> None:
     """이 릴리스가 요구하는 revision에서만 Ready다.
 
-    2026-09-22 — 0004(채팅 테이블) 호환 릴리스를 다시 연다. docs/migrations.md:
-    "호환 릴리스는 자신의 테스트를 따로 쓴다. 구·신 둘 다 200이어야 한다." — 그래서
-    이번엔 0003·0004 둘 다 200이고, 그보다 옛 revision(0001·0002)과 알 수 없는
-    값은 503이어야 한다.
+    2026-09-23 — 0004(채팅 테이블) 호환 창을 닫았다. docs/migrations.md의 배포
+    순서대로 migration Job이 운영에 실제로 적용·검증된 뒤라 이번엔 0004만 200이고,
+    호환 릴리스 동안 잠깐 함께 허용했던 0003을 포함해 그보다 옛 revision(0001·0002)과
+    알 수 없는 값 모두 503이어야 한다.
 
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0003_material_chunks", "0004_chat")
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0004_chat",)
     assert _readyz_with_revision(store, "0004_chat") == 200
-    assert _readyz_with_revision(store, "0003_material_chunks") == 200
+    assert _readyz_with_revision(store, "0003_material_chunks") == 503
     assert _readyz_with_revision(store, "0002_persona_draft") == 503
     assert _readyz_with_revision(store, "0001_persona_minimal") == 503
 
@@ -262,18 +262,18 @@ def test_readyz_rejects_unknown_revision(store: PostgresPersonaStore) -> None:
 def test_list_personas_and_get_persona_still_work_when_revision_unsupported(
     store: PostgresPersonaStore,
 ) -> None:
-    """호환 창이 닫힌 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0003 하나)에도, 그 밖의
+    """호환 창이 닫힌 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0004 하나)에도, 그 밖의
     revision에서 readyz는 정확히 503을 내면서 캐릭터 조회는 계속 통과하고 초안만
     409로 막히는지 확인한다.
 
     2026-09-19 호환 릴리스 때는 0001도 SUPPORTED_ALEMBIC_REVISIONS에 있어 readyz가
     200이었다(migration이 늦게 도착해도 롤아웃이 막히지 않게 하려는 목적). 호환
-    창을 닫은 지금은 0001·0002가 더 이상 지원 revision이 아니므로 readyz는 503이
-    맞다 — 하지만 list_personas·get_persona는 SUPPORTED_ALEMBIC_REVISIONS가 아니라
-    draft_schema_ready(DRAFT_SCHEMA_REVISIONS 기준, 더 넓다)로만 분기하므로 이번
-    좁히기의 영향을 받지 않는다. 이 "호환 창 도구"들이 창이 닫힌 뒤에도 여전히
-    정확하게 동작하는지가 이 테스트의 요점이다 — 다음 호환 릴리스(0004)에서 같은
-    코드를 다시 쓸 것이므로.
+    창을 닫은 지금은 0001·0002·0003이 더 이상 지원 revision이 아니므로 readyz는
+    503이 맞다 — 하지만 list_personas·get_persona는 SUPPORTED_ALEMBIC_REVISIONS가
+    아니라 draft_schema_ready(DRAFT_SCHEMA_REVISIONS 기준, 더 넓다)로만 분기하므로
+    이번 좁히기의 영향을 받지 않는다. 이 "호환 창 도구"들이 창이 닫힌 뒤에도 여전히
+    정확하게 동작하는지가 이 테스트의 요점이다 — 다음 호환 릴리스에서 같은 코드를
+    다시 쓸 것이므로.
 
     _set_revision은 alembic_version 마커만 바꾸고 물리 스키마는 head 그대로 둔다 —
     여기서 `/v1/personas` 200이 진짜 0001 물리 스키마(테이블이 실제로 없는 상태)에서도
@@ -734,7 +734,7 @@ def test_list_personas_and_get_persona_still_work_on_physically_downgraded_0001(
 ) -> None:
     """0001까지만 물리적으로 내려간 DB(마커가 아니라 테이블 자체가 없는 상태)에서도
     list_personas·get_persona가 500이 아니라 200을 내는지 확인한다. 호환 창을
-    닫은 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0003 하나)에는 이 상태에서 readyz가
+    닫은 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0004 하나)에는 이 상태에서 readyz가
     200이 아니라 503이어야 정확하다 — 0001은 더 이상 지원 revision이 아니다.
 
     다른 테스트들이 쓰는 `_set_revision`은 alembic_version 마커만 바꾸고 물리 스키마는
