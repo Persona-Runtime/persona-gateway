@@ -15,8 +15,9 @@ ServiceMonitor/PodMonitor·대시보드는 persona-platform 쪽 별도 작업이
 - persona_chat_generations_finished_total{mode,terminal_reason}: terminal 도달 수.
   terminal_reason은 generations.status의 terminal 값(completed/cancelled/failed)과
   같다.
-- persona_chat_time_to_first_token_seconds: 접수부터 첫 delta까지.
-- persona_chat_generation_seconds: 접수부터 terminal까지 전체 소요.
+- persona_chat_time_to_first_token_seconds: 스트림 시작부터 사용자 텍스트가 담긴 첫
+  delta까지. meta·citations 이벤트는 TTFT가 아니다(검색 시간은 포함된다).
+- persona_chat_generation_seconds: 스트림 시작부터 terminal까지 전체 소요.
 """
 
 from __future__ import annotations
@@ -35,12 +36,34 @@ GENERATIONS_FINISHED = Counter(
     ["mode", "terminal_reason"],
 )
 
+# prometheus_client 기본 버킷은 10초가 상한이라, 첫 토큰 한도(60초)와 전체 한도(180초)
+# 근처에서 무슨 일이 일어나는지 구분할 수 없었다. 두 한도를 경계로 넣어 "한도에 걸려
+# 끊긴 것"과 "한도 안에서 느렸던 것"이 다른 버킷에 떨어지게 한다.
+GENERATION_BUCKETS_SECONDS = (
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    30.0,
+    45.0,
+    60.0,
+    90.0,
+    120.0,
+    180.0,
+)
+
 TIME_TO_FIRST_TOKEN_SECONDS = Histogram(
     "persona_chat_time_to_first_token_seconds",
-    "접수부터 첫 delta 이벤트까지 걸린 시간",
+    "스트림 시작부터 첫 delta 이벤트까지 걸린 시간(meta·citations 제외)",
+    buckets=GENERATION_BUCKETS_SECONDS,
 )
 
 TOTAL_GENERATION_SECONDS = Histogram(
     "persona_chat_generation_seconds",
-    "접수부터 terminal 상태까지 걸린 전체 시간",
+    "스트림 시작부터 terminal 상태까지 걸린 전체 시간",
+    buckets=GENERATION_BUCKETS_SECONDS,
 )

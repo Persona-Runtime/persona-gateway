@@ -95,6 +95,52 @@ scripts/local-stack.sh down
 경우는 취소가 아니라 `reconciling`으로 남으므로, 시간 예산이 만료될 때까지 업스트림
 연결이 유지된다.
 
+## 메트릭
+
+`/metrics`가 Prometheus 형식으로 노출한다(인증 없음, 운영 엔드포인트).
+label에는 route 템플릿·method·상태 코드·결과처럼 가짓수가 작은 값만 넣는다.
+사용자·대화 ID, Idempotency-Key, 본문, 토큰, 예외 메시지는 넣지 않는다.
+
+| 이름 | type | label | 단위 |
+| --- | --- | --- | --- |
+| `persona_http_requests_total` | Counter | method, route, status, outcome | 건 |
+| `persona_http_request_duration_seconds` | Histogram | method, route, status_class, outcome | 초 |
+| `persona_http_requests_in_flight` | Gauge | 없음 | 건 |
+| `persona_gateway_build_info` | Info(gauge=1) | version, revision | — |
+| `persona_chat_generations_started_total` | Counter | mode | 건 |
+| `persona_chat_generations_finished_total` | Counter | mode, terminal_reason | 건 |
+| `persona_chat_time_to_first_token_seconds` | Histogram | 없음 | 초 |
+| `persona_chat_generation_seconds` | Histogram | 없음 | 초 |
+| `persona_retrieval_seconds` | Histogram | kind_group | 초 |
+
+- `route`는 `/v1/generations/{generation_id}/cancel` 같은 템플릿이고, 매칭된 라우트가
+  없으면 `unmatched`다.
+- `outcome`은 `completed`·`client_disconnected`·`exception` 세 값뿐이며 counter와
+  histogram 모두에 붙는다. **일반 API 지연은 반드시 `outcome="completed"`로 조회한다.**
+  끊긴 요청의 지연은 끊긴 시점까지의 시간이라 `outcome="client_disconnected"`로 따로 본다.
+
+  ```promql
+  # 정상 완료 요청의 route별 p99
+  histogram_quantile(0.99, sum by (le, route) (
+    rate(persona_http_request_duration_seconds_bucket{outcome="completed"}[5m])))
+  ```
+- 응답 전에 끊기면 status를 `499`, 응답 전 예외면 `500`으로 적는다.
+- `/metrics` 요청 자체는 세지 않는다.
+- HTTP 지연 버킷은 짧은 API와 채팅 한도(60·180초)를 구분하도록 0.005초에서 300초까지다.
+- 채팅 histogram은 기본 버킷(상한 10초)에서 0.1~180초 버킷으로 바꿨다. 버킷 경계가
+  달라졌으므로 이 변경 이전 수집분과 `_bucket`을 섞어 비교하지 않는다.
+- TTFT는 스트림 시작부터 사용자 텍스트가 담긴 첫 `delta`까지다. meta·citations는 TTFT가
+  아니며, 검색 시간은 포함된다.
+- `revision`은 이미지 빌드 인자로 넣는다. Git hash 형식이 아니면 `unknown`이다.
+
+  ```sh
+  docker build --build-arg GIT_REVISION="$(git rev-parse HEAD)" \
+    -t persona-minimal-api:local ./python-backend
+  ```
+
+- Prometheus는 30초 간격으로 수집한다(persona-platform PodMonitor). 롤아웃 순간의
+  짧은 오류는 카운터 증가로는 남지만 in-flight 같은 gauge는 30초 해상도로만 보인다.
+
 ## 검증
 
 계약 검사는 저장소 루트에서, Python 검사는 `python-backend`에서 실행한다.

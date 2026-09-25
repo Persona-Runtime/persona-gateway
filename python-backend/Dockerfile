@@ -24,6 +24,12 @@ COPY alembic.ini ./
 RUN uv sync --locked --no-dev && \
     chown -R persona:persona /app
 
+# 빌드한 Git commit을 persona_gateway_build_info의 revision label로 노출한다. 롤아웃 중
+# 어느 버전이 트래픽을 받는지 요청 지표와 겹쳐 보기 위해서다. 레이어 캐시를 덜 깨려고
+# 소스 복사 뒤에 둔다. 인자를 주지 않거나 hash 형식이 아니면 앱이 "unknown"으로 기록한다.
+ARG GIT_REVISION=unknown
+ENV PERSONA_BUILD_REVISION=$GIT_REVISION
+
 USER 10001:10001
 EXPOSE 8080
 
