@@ -24,7 +24,7 @@ from prometheus_client import REGISTRY
 
 from persona_minimal_api.chat import service as chat_service
 from persona_minimal_api.chat.fake_inference import FakeInferenceClient, UpstreamError
-from persona_minimal_api.chat.repository import ChatStore
+from persona_minimal_api.chat.repository import ChatStore, GenerationInProgress
 from persona_minimal_api.config import Settings
 from persona_minimal_api.indexing.embedding_client import EmbeddingError, EmbeddingResult
 from persona_minimal_api.indexing.runner import run_indexing
@@ -242,15 +242,16 @@ def test_readyz_requires_the_revision_this_release_supports(
 ) -> None:
     """이 릴리스가 요구하는 revision에서만 Ready다.
 
-    2026-09-23 — 0004(채팅 테이블) 호환 창을 닫았다. docs/migrations.md의 배포
-    순서대로 migration Job이 운영에 실제로 적용·검증된 뒤라 이번엔 0004만 200이고,
-    호환 릴리스 동안 잠깐 함께 허용했던 0003을 포함해 그보다 옛 revision(0001·0002)과
-    알 수 없는 값 모두 503이어야 한다.
+    2026-09-25 bridge 릴리스(G-1 generation 소유권 lease) — 이 이미지는 lease 컬럼 존재를
+    스스로 판정해 0004에서는 lease 없이, 0005에서는 lease로 동작하므로 두 revision 모두
+    200이다. 0003 이하와 알 수 없는 값은 503이다. 0005만 허용하도록 좁히는 것은 migration
+    적용·검증 뒤의 기능 릴리스(별도 커밋)의 몫이다(api/generation-ownership-lease-design.md 3절).
 
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0004_chat",)
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0004_chat", "0005_generation_lease")
+    assert _readyz_with_revision(store, "0005_generation_lease") == 200
     assert _readyz_with_revision(store, "0004_chat") == 200
     assert _readyz_with_revision(store, "0003_material_chunks") == 503
     assert _readyz_with_revision(store, "0002_persona_draft") == 503
@@ -1550,7 +1551,7 @@ def test_retrieve_endpoint_returns_body_and_speech_chunks_when_enabled(
 
 def test_migration_0004_upgrade_and_downgrade_round_trip(round_trip_database_url: str) -> None:
     """feedback.md가 요구한 두 경로를 한 테스트로 함께 본다: 깨끗한 컨테이너에서
-    바로 head(0004)까지 올리는 것(이전 revision에서 0004), 그리고 -1(0003)로
+    바로 head까지 올리는 것(이전 revision에서 0004), 그리고 -1(0003)로
     내렸다가 다시 head로 올리는 것(0003 DB에서 0004). 0004는 pgvector 확장을 새로
     만들지 않으므로(테이블만 추가) §2-14/§2-15류의 확장 잔재·권한 문제는 이
     migration엔 해당 없다 — 그래서 그 부분(DROP EXTENSION 등)은 재현하지 않는다.
@@ -1579,7 +1580,7 @@ def test_migration_0004_upgrade_and_downgrade_round_trip(round_trip_database_url
         finally:
             pool.close()
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, "0003_material_chunks")  # head가 0005라 "-1"이 아니다
 
         pool = create_pool(round_trip_database_url, 2)
         try:
@@ -1675,7 +1676,7 @@ def test_migration_0004_downgrade_with_real_data_preserves_material_and_drops_on
         finally:
             pool.close()
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, "0003_material_chunks")  # head가 0005라 "-1"이 아니다
 
         pool = create_pool(round_trip_database_url, 2)
         try:
@@ -2474,58 +2475,6 @@ def test_reconciling_generation_still_blocks_new_requests_before_timeout(
     assert response.json()["error"]["code"] == "generation_in_progress"
 
 
-def test_startup_reconciles_stale_running_generation_into_reconciling(
-    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Gateway 재시작 시뮬레이션 — 이전 프로세스가 running으로 남긴 generation이
-    유령 슬롯(영원히 활성)이 되지 않고 reconciling으로 전환되는지 본다.
-    "프로세스가 죽었으니 failed로 슬롯 해제"는 하지 않는다(feedback.md 명시 금지) —
-    그래서 여기서 최종 상태를 completed/failed가 아니라 reconciling으로 확인한다.
-    """
-    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
-    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
-
-    owner = f"owner-{uuid4()}"
-    persona, _ = _index_character(
-        store,
-        owner,
-        "재시작대상",
-        "재시작대상은 침착한 안내자다.",
-        "재시작대상은 소포를 발견했다.",
-        "재시작대상: 안녕",
-    )
-    with store.pool.connection() as connection:
-        conversation_id = connection.execute(
-            "INSERT INTO persona_minimal.conversations(id, persona_id, owner_subject, initial_version_id, title) "
-            "VALUES (%s, %s, %s, "
-            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), %s) "
-            "RETURNING id",
-            (uuid4(), persona.id, owner, persona.id, "재시작 대화"),
-        ).fetchone()[0]
-        user_message_id = connection.execute(
-            "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
-            "VALUES (%s, %s, %s) RETURNING id",
-            (uuid4(), conversation_id, "죽기 전 질문"),
-        ).fetchone()[0]
-        stuck_generation_id = uuid4()
-        connection.execute(
-            "INSERT INTO persona_minimal.generations("
-            "id, conversation_id, user_message_id, version_id, mode, status"
-            ") VALUES (%s, %s, %s, "
-            "(SELECT active_version_id FROM persona_minimal.personas WHERE id = %s), "
-            "'mock', 'running')",
-            (stuck_generation_id, conversation_id, user_message_id, persona.id),
-        )
-        connection.commit()
-
-    # create_app() 호출 자체가 lifespan을 태운다(TestClient를 with로 열 때).
-    with _chat_client(store, owner):
-        pass
-
-    reconciled = chat_store.get_generation(owner, stuck_generation_id)
-    assert reconciled.status == "reconciling"
-
-
 def test_first_token_timeout_actually_fires_for_slow_upstream(
     store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2885,15 +2834,16 @@ def _http_count(route: str, status: str, outcome: str) -> float:
 
 
 @contextmanager
-def _running_uvicorn(app) -> Iterator[str]:
+def _running_uvicorn(app, *, lifespan: str = "off") -> Iterator[str]:
     """localhost의 실제 uvicorn으로 app을 띄우고 base URL을 돌려준다.
 
     TestClient는 응답을 끝까지 읽으므로 "도중에 끊긴 연결"을 만들 수 없다. 실제 소켓을
-    닫아야 Starlette·uvicorn의 연결 종료 경로를 그대로 탄다. lifespan은 끈다 — 기동 시
-    reconcile이 같은 DB의 다른 테스트 행을 건드리지 않게 한다.
+    닫아야 Starlette·uvicorn의 연결 종료 경로를 그대로 탄다. lifespan은 기본으로 끈다 —
+    기동 시 회수가 같은 DB의 다른 테스트 행을 건드리지 않게 한다. lease(heartbeat)가 필요한
+    테스트만 lifespan="on"으로 켠다.
     """
     server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=0, lifespan="off", log_level="warning")
+        uvicorn.Config(app, host="127.0.0.1", port=0, lifespan=lifespan, log_level="warning")
     )
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -3496,3 +3446,1023 @@ def test_unexpected_error_from_inference_adapter_is_recorded_failed_and_releases
         chat_store, owner, conversation.id, "다음 질문", uuid4()
     )
     assert next_accepted.generation.status == "queued"
+
+
+# --- G-1 generation 소유권 lease ------------------------------------------------------
+#
+# 여기서 "인스턴스"는 **같은 테스트 프로세스 안의 별도 앱**이다(각자 create_app·instance_id·
+# heartbeat 스레드, 필요하면 별도 uvicorn 서버). 실제 OS 프로세스 종료는 SIGKILL subprocess
+# 테스트 하나만 다룬다 — 같은 프로세스의 앱 재생성을 "프로세스 재시작"이라 부르지 않는다.
+#
+# lease 값은 검증을 빠르게 하려는 테스트 전용 값이다(heartbeat 0.2초, lease 1초). 설정 검증
+# (lease >= 2 × heartbeat + DB timeout)을 통과하도록 DB timeout도 함께 줄인다.
+
+LEASE_TEST_HEARTBEAT_SECONDS = 0.2
+LEASE_TEST_SECONDS = 1.0
+
+
+def _lease_settings(owner: str) -> Settings:
+    return Settings(
+        DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
+        PERSONA_STATIC_BEARER_TOKEN="integration-token",
+        PERSONA_STATIC_USER_ID=owner,
+        PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
+        PERSONA_CURSOR_SIGNING_KEY="integration-cursor-key",
+        PERSONA_DB_TIMEOUT_SECONDS="0.5",
+        PERSONA_GENERATION_HEARTBEAT_SECONDS=str(LEASE_TEST_HEARTBEAT_SECONDS),
+        PERSONA_GENERATION_LEASE_SECONDS=str(LEASE_TEST_SECONDS),
+    )
+
+
+def _reclaimed(reason: str) -> float:
+    return (
+        REGISTRY.get_sample_value("persona_chat_generations_reclaimed_total", {"reason": reason})
+        or 0.0
+    )
+
+
+def _quiesce_other_active_generations(store: PostgresPersonaStore) -> None:
+    """앞선 테스트가 남긴 활성 행을 닫는다.
+
+    모듈 DB를 공유하므로, 다른 테스트가 끝내지 않고 남긴 행이 이 테스트 도중 lease 만료로
+    회수되면 회수 메트릭의 증가량이 흔들린다. lease 테스트 시작 전에만 부른다.
+    """
+    with store.pool.connection() as connection:
+        connection.execute(
+            "UPDATE persona_minimal.generations "
+            "SET status = 'failed', failure_code = 'test_quiesced', finished_at = now() "
+            "WHERE status IN ('queued', 'running', 'cancel_requested')"
+        )
+        connection.commit()
+
+
+def _insert_generation(
+    store: PostgresPersonaStore,
+    conversation_id: UUID,
+    *,
+    status: str,
+    owner_instance_id: UUID | None,
+    lease_offset_seconds: float | None,
+    heartbeat_offset_seconds: float = 0.0,
+) -> UUID:
+    """소유자·lease·heartbeat를 지정한 generation 행을 직접 만든다(다른 인스턴스 모사)."""
+    generation_id = uuid4()
+    with store.pool.connection() as connection:
+        user_message_id = connection.execute(
+            "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (uuid4(), conversation_id, "합성 질문"),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO persona_minimal.generations(
+                id, conversation_id, user_message_id, version_id, mode, status,
+                owner_instance_id, lease_expires_at, heartbeat_at
+            ) VALUES (
+                %(id)s, %(conversation)s, %(message)s,
+                (SELECT initial_version_id FROM persona_minimal.conversations
+                 WHERE id = %(conversation)s),
+                'mock', %(status)s, %(owner)s,
+                CASE WHEN %(lease)s::float8 IS NULL THEN NULL
+                     ELSE now() + make_interval(secs => %(lease)s::float8) END,
+                now() + make_interval(secs => %(heartbeat)s::float8)
+            )
+            """,
+            {
+                "id": generation_id,
+                "conversation": conversation_id,
+                "message": user_message_id,
+                "status": status,
+                "owner": owner_instance_id,
+                "lease": lease_offset_seconds,
+                "heartbeat": heartbeat_offset_seconds,
+            },
+        )
+        connection.commit()
+    return generation_id
+
+
+def _generation_row(store: PostgresPersonaStore, generation_id: UUID) -> dict:
+    with store.pool.connection() as connection:
+        row = connection.execute(
+            "SELECT status, owner_instance_id, lease_expires_at, heartbeat_at, failure_code "
+            "FROM persona_minimal.generations WHERE id = %s",
+            (generation_id,),
+        ).fetchone()
+    return {
+        "status": row[0],
+        "owner": row[1],
+        "lease_expires_at": row[2],
+        "heartbeat_at": row[3],
+        "failure_code": row[4],
+    }
+
+
+def _start_lifespans_together(apps: list) -> None:
+    """여러 앱의 lifespan(기동 회수)을 동시에 시작했다가 닫는다(동시 기동 모사)."""
+    barrier = threading.Barrier(len(apps))
+
+    def boot(app) -> None:
+        barrier.wait()
+        with TestClient(app):
+            pass
+
+    with ThreadPoolExecutor(max_workers=len(apps)) as pool:
+        for future in [pool.submit(boot, app) for app in apps]:
+            future.result()
+
+
+def _slow_client(fragments: int = 30, interval: float = 0.1) -> FakeInferenceClient:
+    return FakeInferenceClient(chunks=("합성 ",) * fragments, delay_between_chunks=interval)
+
+
+def test_live_owner_stream_survives_new_instance_startup_and_completes(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A가 긴 SSE(30조각 × 0.1초, lease 1초보다 길다)를 보내는 중에 B가 기동한다. A의
+    heartbeat가 lease를 늘리고 있으므로 B는 그 행을 회수하지 않고, A는 done으로 끝낸다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "살아있는소유자")
+    app_a = create_app(_lease_settings(owner), store, inference_client=_slow_client())
+    app_b = create_app(_lease_settings(owner), store, inference_client=FakeInferenceClient())
+    startup_before = _reclaimed("startup_lease_expired")
+
+    with _running_uvicorn(app_a, lifespan="on") as base_url:
+        events: list[str] = []
+        with (
+            httpx.Client(base_url=base_url, timeout=10) as client,
+            client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+                json={"conversation_id": str(conversation_id), "message": "안녕"},
+            ) as response,
+        ):
+            b_started = False
+            for line in response.iter_lines():
+                if line.startswith("event: "):
+                    events.append(line.removeprefix("event: "))
+                    if events[-1] == "delta" and not b_started:
+                        # A가 스트리밍 중이다. lease(1초)보다 오래 기다린 뒤 B를 기동한다 —
+                        # heartbeat가 없었다면 이 시점에 A의 lease는 이미 만료됐다.
+                        time.sleep(LEASE_TEST_SECONDS * 1.5)
+                        with TestClient(app_b):
+                            pass
+                        b_started = True
+
+    assert events[-1] == "done"
+    assert _reclaimed("startup_lease_expired") == startup_before
+    with store.pool.connection() as connection:
+        status = connection.execute(
+            "SELECT g.status FROM persona_minimal.generations g "
+            "WHERE g.conversation_id = %s ORDER BY g.created_at DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()[0]
+    assert status == "completed"
+
+
+def test_startup_reclaims_only_expired_or_old_ownerless_generations(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """기동 회수 대상은 (a) lease 만료 소유자 행, (b) 유예(240초)가 지난 소유자 없는 행뿐이다.
+    lease가 유효한 행과 최근의 소유자 없는 행(호환 창 구버전 Pod가 아직 스트리밍 중일 수
+    있음)은 건드리지 않는다. 회수 행의 heartbeat_at은 마지막 생존 확인 시각을 남긴다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "기동회수범위")
+    dead_owner = uuid4()
+    expired = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=dead_owner,
+        lease_offset_seconds=-5,
+    )
+    live = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=uuid4(),
+        lease_offset_seconds=60,
+    )
+    recent_ownerless = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=None,
+        lease_offset_seconds=None,
+        heartbeat_offset_seconds=-10,
+    )
+    old_ownerless = _insert_generation(
+        store,
+        conversation_id,
+        status="cancel_requested",
+        owner_instance_id=None,
+        lease_offset_seconds=None,
+        heartbeat_offset_seconds=-241,
+    )
+    expired_lease_at = _generation_row(store, expired)["lease_expires_at"]
+    old_heartbeat = _generation_row(store, old_ownerless)["heartbeat_at"]
+    startup_before = _reclaimed("startup_lease_expired")
+    disconnects_before = _disconnects("mock")
+
+    with TestClient(create_app(_lease_settings(owner), store)):
+        pass
+
+    assert _generation_row(store, expired)["status"] == "reconciling"
+    assert _generation_row(store, expired)["heartbeat_at"] == expired_lease_at
+    assert _generation_row(store, live)["status"] == "running"
+    assert _generation_row(store, recent_ownerless)["status"] == "running"
+    assert _generation_row(store, old_ownerless)["status"] == "reconciling"
+    assert _generation_row(store, old_ownerless)["heartbeat_at"] == old_heartbeat
+    assert _reclaimed("startup_lease_expired") == startup_before + 2
+    # 기동 회수는 클라이언트 연결 종료가 아니다 — 두 지표를 섞지 않는다.
+    assert _disconnects("mock") == disconnects_before
+
+
+def test_concurrent_startups_do_not_reclaim_a_live_lease(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "동시기동유효")
+    live = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=uuid4(),
+        lease_offset_seconds=30,
+    )
+    startup_before = _reclaimed("startup_lease_expired")
+
+    _start_lifespans_together(
+        [create_app(_lease_settings(owner), store), create_app(_lease_settings(owner), store)]
+    )
+
+    assert _generation_row(store, live)["status"] == "running"
+    assert _reclaimed("startup_lease_expired") == startup_before
+
+
+def test_concurrent_startups_reclaim_an_expired_row_exactly_once(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """두 인스턴스가 동시에 같은 만료 행을 회수해도 상태 변경·메트릭은 한 번이다 — 판정과
+    전환이 한 UPDATE 문장이라 Postgres가 행 잠금 뒤 조건을 다시 평가한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "동시기동만료")
+    expired = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=uuid4(),
+        lease_offset_seconds=-1,
+    )
+    startup_before = _reclaimed("startup_lease_expired")
+
+    _start_lifespans_together(
+        [create_app(_lease_settings(owner), store), create_app(_lease_settings(owner), store)]
+    )
+
+    assert _generation_row(store, expired)["status"] == "reconciling"
+    assert _reclaimed("startup_lease_expired") == startup_before + 1
+
+
+def test_graceful_shutdown_releases_only_own_active_rows(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "정상종료반납")
+    app = create_app(_lease_settings(owner), store)
+    shutdown_before = _reclaimed("shutdown")
+
+    with TestClient(app):
+        own = _insert_generation(
+            store,
+            conversation_id,
+            status="running",
+            owner_instance_id=app.state.chat_store.instance_id,
+            lease_offset_seconds=30,
+        )
+        others = _insert_generation(
+            store,
+            conversation_id,
+            status="running",
+            owner_instance_id=uuid4(),
+            lease_offset_seconds=30,
+        )
+
+    assert _generation_row(store, own)["status"] == "reconciling"
+    assert _generation_row(store, others)["status"] == "running"
+    assert _reclaimed("shutdown") == shutdown_before + 1
+    thread = app.state.lease_keeper._thread
+    assert thread is not None and not thread.is_alive()
+
+
+def test_owner_without_heartbeat_is_reclaimed_only_after_lease_expiry(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """같은 프로세스 안에서 heartbeat 없이 사라진 인스턴스(종료 코드가 실행되지 않음)를
+    모사한다. lease 만료 전 기동은 회수하지 않고, 만료 뒤 기동만 회수한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "하트비트없음")
+    vanished = ChatStore(store.pool, lease_seconds=LEASE_TEST_SECONDS)
+    accepted = chat_service.accept_chat_completion(
+        vanished, owner, conversation_id, "안녕", uuid4()
+    )
+
+    with TestClient(create_app(_lease_settings(owner), store)):
+        pass
+    assert _generation_row(store, accepted.generation.id)["status"] == "queued"
+
+    time.sleep(LEASE_TEST_SECONDS + 0.3)
+    with TestClient(create_app(_lease_settings(owner), store)):
+        pass
+    assert _generation_row(store, accepted.generation.id)["status"] == "reconciling"
+
+
+def test_browser_disconnect_is_counted_apart_from_lease_reclaim(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "연결종료구분")
+    app = create_app(_lease_settings(owner), store, inference_client=_slow_client())
+    disconnects_before = _disconnects("mock")
+    reclaimed_before = {
+        reason: _reclaimed(reason)
+        for reason in ("startup_lease_expired", "request_lease_expired", "shutdown")
+    }
+
+    with _gc_disabled(), _running_uvicorn(app, lifespan="on") as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "delta",
+        )
+        status, _ = _wait_for_status(
+            chat_store, owner, generation_id, "reconciling", RECONCILE_WITHIN_SECONDS
+        )
+
+    assert status == "reconciling"
+    assert _disconnects("mock") == disconnects_before + 1
+    # 연결 종료로 이미 reconciling이 된 행은 종료 반납 대상도 아니다.
+    for reason, before in reclaimed_before.items():
+        assert _reclaimed(reason) == before, reason
+
+
+def test_one_active_generation_per_user_holds_across_two_instances(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "두인스턴스슬롯")
+    store_a = ChatStore(store.pool)
+    store_b = ChatStore(store.pool)
+    barrier = threading.Barrier(2)
+
+    def accept(target: ChatStore) -> str:
+        barrier.wait()
+        try:
+            chat_service.accept_chat_completion(target, owner, conversation_id, "안녕", uuid4())
+            return "accepted"
+        except GenerationInProgress:
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = sorted(
+            future.result() for future in [pool.submit(accept, s) for s in (store_a, store_b)]
+        )
+
+    assert results == ["accepted", "rejected"]
+
+
+def test_cancel_arriving_at_another_instance_stops_the_owner_stream(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cancel은 B에 도착하고 스트림은 A가 돌린다. B는 DB를 cancel_requested로만 바꿀 수
+    있고, A의 heartbeat가 그 상태를 읽어 로컬 업스트림을 취소한다(지연은 heartbeat 간격
+    이하). 스트림은 끝까지(약 3초) 가지 않고 cancelled error로 일찍 끝나야 한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "교차취소")
+    app_a = create_app(_lease_settings(owner), store, inference_client=_slow_client())
+    app_b = create_app(_lease_settings(owner), store, inference_client=FakeInferenceClient())
+
+    last_event = ""
+    last_data: dict = {}
+    with (
+        _running_uvicorn(app_a, lifespan="on") as base_url,
+        TestClient(app_b) as api_b,
+        httpx.Client(base_url=base_url, timeout=10) as client,
+        client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+            json={"conversation_id": str(conversation_id), "message": "안녕"},
+        ) as response,
+    ):
+        generation_id: str | None = None
+        cancelled_at: float | None = None
+        current = ""
+        for line in response.iter_lines():
+            if line.startswith("event: "):
+                current = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+                last_event, last_data = current, data
+                if current == "meta":
+                    generation_id = data["generation_id"]
+                if current == "delta" and cancelled_at is None:
+                    cancel = api_b.post(
+                        f"/v1/generations/{generation_id}/cancel",
+                        headers={"Authorization": "Bearer integration-token"},
+                    )
+                    assert cancel.status_code == 200, cancel.text
+                    cancelled_at = time.monotonic()
+        ended_after_cancel = time.monotonic() - (cancelled_at or 0)
+
+    assert last_event == "error"
+    assert last_data["status"] == "cancelled"
+    # 전달 지연 상한: heartbeat 간격 + 조각 간격 + 여유. 취소가 안 닿았다면 약 3초가 걸린다.
+    assert ended_after_cancel < 1.5
+    assert chat_store.get_generation(owner, UUID(generation_id)).status == "cancelled"
+
+
+def test_retry_on_another_instance_is_owned_by_that_instance(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "교차재시도")
+    app_a = create_app(
+        _lease_settings(owner),
+        store,
+        inference_client=FakeInferenceClient(raise_before_start=UpstreamError("upstream_503")),
+    )
+    app_b = create_app(_lease_settings(owner), store, inference_client=FakeInferenceClient())
+
+    with TestClient(app_a) as api_a, TestClient(app_b) as api_b:
+        failed = _parse_sse(
+            api_a.post(
+                "/v1/chat/completions",
+                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+                json={"conversation_id": str(conversation_id), "message": "안녕"},
+            ).text
+        )
+        failed_id = failed[0][1]["generation_id"]
+        retried = _parse_sse(
+            api_b.post(
+                f"/v1/generations/{failed_id}/retry",
+                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+            ).text
+        )
+        retry_id = UUID(retried[0][1]["generation_id"])
+        b_instance = app_b.state.chat_store.instance_id
+
+    assert retried[-1][0] == "done"
+    assert _generation_row(store, retry_id)["owner"] == b_instance
+
+
+def test_next_request_reclaims_expired_row_but_keeps_the_300_second_rule(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """모든 Pod가 살아 있어 기동 회수가 없을 때도, 죽은 소유자의 행은 그 사용자의 다음 요청이
+    회수한다. 회수는 슬롯 해제가 아니다: 마지막 생존 시각이 최근이면 409, 300초가 지났으면
+    기존 규칙대로 failed(reconciliation_timeout)로 닫고 새 요청을 받는다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "요청시회수")
+    api = TestClient(create_app(_lease_settings(owner), store))
+    request_before = _reclaimed("request_lease_expired")
+
+    recent = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=uuid4(),
+        lease_offset_seconds=-2,
+    )
+    blocked = api.post(
+        "/v1/chat/completions",
+        headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": str(conversation_id), "message": "안녕"},
+    )
+    assert blocked.status_code == 409
+    assert _generation_row(store, recent)["status"] == "reconciling"
+    assert _reclaimed("request_lease_expired") == request_before + 1
+
+    # 같은 사용자 슬롯을 비운 뒤, 마지막 생존이 301초 전인 죽은 소유자 행으로 다시 본다.
+    with store.pool.connection() as connection:
+        connection.execute(
+            "UPDATE persona_minimal.generations SET status = 'failed', finished_at = now() "
+            "WHERE id = %s",
+            (recent,),
+        )
+        connection.commit()
+    old = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=uuid4(),
+        lease_offset_seconds=-301,
+    )
+    allowed = api.post(
+        "/v1/chat/completions",
+        headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+        json={"conversation_id": str(conversation_id), "message": "안녕"},
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert _generation_row(store, old)["status"] == "failed"
+    assert _generation_row(store, old)["failure_code"] == "reconciliation_timeout"
+
+
+def test_migration_0005_round_trip_keeps_generation_rows(round_trip_database_url: str) -> None:
+    """0005는 컬럼·인덱스만 더한다. 0004로 내렸다 올려도 generation 행은 남고, 올린 뒤
+    기존 행의 소유자·lease는 NULL(=구버전 행)이다."""
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                for column in ("owner_instance_id", "lease_expires_at"):
+                    assert _column_exists(connection, "persona_minimal", "generations", column)
+                count_before = connection.execute(
+                    "SELECT count(*) FROM persona_minimal.generations"
+                ).fetchone()[0]
+        finally:
+            pool.close()
+
+        command.downgrade(config, "0004_chat")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                for column in ("owner_instance_id", "lease_expires_at"):
+                    assert not _column_exists(connection, "persona_minimal", "generations", column)
+                assert (
+                    connection.execute(
+                        "SELECT count(*) FROM persona_minimal.generations"
+                    ).fetchone()[0]
+                    == count_before
+                )
+        finally:
+            pool.close()
+
+        command.upgrade(config, "head")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                owned = connection.execute(
+                    "SELECT count(*) FROM persona_minimal.generations "
+                    "WHERE owner_instance_id IS NOT NULL OR lease_expires_at IS NOT NULL"
+                ).fetchone()[0]
+                assert owned == 0
+        finally:
+            pool.close()
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+
+
+@contextmanager
+def _fake_embedding_server() -> Iterator[str]:
+    """subprocess Gateway가 부를 합성 embedding HTTP 서버(POST /embed). 결정적 벡터만 낸다."""
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # 메서드 이름은 http.server가 정한다
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            result = _fake_embed("", payload["texts"], payload["input_type"])
+            body = json.dumps({"model": result.model, "vectors": result.vectors}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:  # 요청 본문을 로그에 남기지 않는다
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+# subprocess 인스턴스의 lease. SIGKILL 직후 기동하는 B가 "아직 유효" 구간에 들어가도록 테스트
+# 전용 lease(1초)보다 약간 길게 둔다(heartbeat 0.2초 + DB timeout 0.5초 × 2 규칙도 만족).
+SUBPROCESS_LEASE_SECONDS = 1.5
+
+
+def test_sigkilled_process_generation_is_reclaimed_only_after_lease_expiry(
+    database_url: str,
+    store: PostgresPersonaStore,
+    chat_store: ChatStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**실제 OS 프로세스**로 띄운 Gateway A가 스트리밍하는 도중 SIGKILL로 죽인다(OOM·노드
+    장애처럼 종료 코드가 실행되지 않음). A의 lease가 유효한 동안 기동한 B는 회수하지 않고,
+    lease가 만료된 뒤 기동한 B만 reconciling으로 회수한다."""
+    import signal
+    import subprocess
+    import sys
+
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "실프로세스종료")
+    backend_root = Path(__file__).resolve().parents[1]
+    port = _free_port()
+
+    with _fake_embedding_server() as embedding_url:
+        env = {
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join([str(backend_root / "src"), str(backend_root / "tests")]),
+            "DATABASE_URL": database_url,
+            "PERSONA_EMBEDDING_URL": embedding_url,
+            "PERSONA_STATIC_BEARER_TOKEN": "integration-token",
+            "PERSONA_STATIC_USER_ID": owner,
+            "PERSONA_STATIC_DISPLAY_NAME": "통합 사용자",
+            "PERSONA_CURSOR_SIGNING_KEY": "integration-cursor-key",
+            "PERSONA_DB_TIMEOUT_SECONDS": "0.5",
+            "PERSONA_GENERATION_HEARTBEAT_SECONDS": str(LEASE_TEST_HEARTBEAT_SECONDS),
+            "PERSONA_GENERATION_LEASE_SECONDS": str(SUBPROCESS_LEASE_SECONDS),
+        }
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "--factory",
+                "lease_subprocess_app:create",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--log-level",
+                "warning",
+            ],
+            cwd=backend_root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            base_url = f"http://127.0.0.1:{port}"
+            deadline = time.monotonic() + 20
+            while True:
+                assert process.poll() is None, "Gateway 프로세스가 기동 중 종료됐다"
+                try:
+                    if httpx.get(f"{base_url}/healthz", timeout=0.5).status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                assert time.monotonic() < deadline, "Gateway 프로세스가 20초 안에 뜨지 않았다"
+                time.sleep(0.1)
+
+            generation_id: UUID | None = None
+            with (
+                httpx.Client(base_url=base_url, timeout=10) as client,
+                client.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+                    json={"conversation_id": str(conversation_id), "message": "안녕"},
+                ) as response,
+            ):
+                current = ""
+                for line in response.iter_lines():
+                    if line.startswith("event: "):
+                        current = line.removeprefix("event: ")
+                    elif line.startswith("data: ") and current == "meta":
+                        generation_id = UUID(
+                            json.loads(line.removeprefix("data: "))["generation_id"]
+                        )
+                    elif line.startswith("data: ") and current == "delta":
+                        break
+                # 스트리밍 중에 죽인다 — lifespan 종료(반납)가 실행되지 않는다.
+                process.send_signal(signal.SIGKILL)
+                process.wait(timeout=10)
+            killed_at = time.monotonic()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+
+    assert process.returncode == -signal.SIGKILL
+    assert generation_id is not None
+    assert _generation_row(store, generation_id)["status"] == "running"
+    startup_before = _reclaimed("startup_lease_expired")
+
+    # lease 유효 구간: 기동한 B는 죽은 A의 행을 아직 회수하지 않는다.
+    with TestClient(create_app(_lease_settings(owner), store)):
+        pass
+    assert time.monotonic() - killed_at < SUBPROCESS_LEASE_SECONDS, "검증 전제(유효 구간) 실패"
+    assert _generation_row(store, generation_id)["status"] == "running"
+
+    # lease 만료 뒤: 기동한 B가 회수한다.
+    time.sleep(SUBPROCESS_LEASE_SECONDS + 0.3)
+    with TestClient(create_app(_lease_settings(owner), store)):
+        pass
+    assert _generation_row(store, generation_id)["status"] == "reconciling"
+    assert _reclaimed("startup_lease_expired") == startup_before + 1
+
+
+# --- G-1 P1: replay·충돌은 회수보다 먼저 --------------------------------------------
+
+
+def test_same_key_replay_and_conflict_do_not_reclaim_other_rows(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """같은 Idempotency-Key 재전송(replay)과 같은 키·다른 본문(409)은 응답 전에 다른 활성
+    행을 바꾸지 않는다 — "replay는 한도 검사보다 먼저"라는 계약. 새 키 요청만 회수한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "재전송회수금지")
+    api = TestClient(create_app(_lease_settings(owner), store))
+    key = str(uuid4())
+    body = {"conversation_id": str(conversation_id), "message": "안녕"}
+
+    first = api.post(
+        "/v1/chat/completions", headers={**_SSE_HEADERS, "Idempotency-Key": key}, json=body
+    )
+    assert _parse_sse(first.text)[-1][0] == "done"
+    expired = _insert_generation(
+        store,
+        conversation_id,
+        status="running",
+        owner_instance_id=uuid4(),
+        lease_offset_seconds=-5,
+    )
+    request_before = _reclaimed("request_lease_expired")
+
+    replay = api.post(
+        "/v1/chat/completions", headers={**_SSE_HEADERS, "Idempotency-Key": key}, json=body
+    )
+    assert replay.status_code == 200
+    assert replay.headers["content-type"].startswith("application/json")
+    assert replay.json()["replayed"] is True
+
+    conflict = api.post(
+        "/v1/chat/completions",
+        headers={**_SSE_HEADERS, "Idempotency-Key": key},
+        json={**body, "message": "다른 질문"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "idempotency_conflict"
+
+    assert _generation_row(store, expired)["status"] == "running"
+    assert _reclaimed("request_lease_expired") == request_before
+
+    # 대조군: 새 키 요청은 회수한다(그리고 300초 규칙대로 409).
+    fresh = api.post(
+        "/v1/chat/completions",
+        headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+        json=body,
+    )
+    assert fresh.status_code == 409
+    assert _generation_row(store, expired)["status"] == "reconciling"
+    assert _reclaimed("request_lease_expired") == request_before + 1
+
+
+def test_retry_replay_does_not_reclaim_other_rows(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retry 경로도 같은 순서다. (retry의 키 충돌은 scope에 원본 generation ID가 들어가고
+    fingerprint도 그 ID라 같은 scope에서 다른 fingerprint가 나올 수 없다 — replay만 본다.)"""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    _quiesce_other_active_generations(store)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "재시도재전송")
+    app = create_app(
+        _lease_settings(owner),
+        store,
+        inference_client=FakeInferenceClient(raise_before_start=UpstreamError("upstream_503")),
+    )
+    with TestClient(app) as api:
+        failed_id = _parse_sse(
+            api.post(
+                "/v1/chat/completions",
+                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+                json={"conversation_id": str(conversation_id), "message": "안녕"},
+            ).text
+        )[0][1]["generation_id"]
+        app.state.inference_client = FakeInferenceClient()
+        retry_key = str(uuid4())
+        first_retry = api.post(
+            f"/v1/generations/{failed_id}/retry",
+            headers={**_SSE_HEADERS, "Idempotency-Key": retry_key},
+        )
+        assert _parse_sse(first_retry.text)[-1][0] == "done"
+
+        expired = _insert_generation(
+            store,
+            conversation_id,
+            status="running",
+            owner_instance_id=uuid4(),
+            lease_offset_seconds=-5,
+        )
+        request_before = _reclaimed("request_lease_expired")
+        replay = api.post(
+            f"/v1/generations/{failed_id}/retry",
+            headers={**_SSE_HEADERS, "Idempotency-Key": retry_key},
+        )
+
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert _generation_row(store, expired)["status"] == "running"
+    assert _reclaimed("request_lease_expired") == request_before
+
+
+def test_concurrent_same_key_requests_create_one_generation_and_replay_the_other(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """두 요청이 모두 사전 확인에서 "새 요청"으로 보고 회수까지 가도, 본 트랜잭션이 사용자
+    잠금 안에서 idempotency를 다시 보므로 하나만 생성하고 다른 하나는 replay한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "같은키경쟁")
+    key = uuid4()
+    barrier = threading.Barrier(2)
+
+    def accept(target: ChatStore) -> tuple[UUID, bool]:
+        barrier.wait()
+        accepted = chat_service.accept_chat_completion(target, owner, conversation_id, "안녕", key)
+        return accepted.generation.id, accepted.replay
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            future.result()
+            for future in [
+                pool.submit(accept, ChatStore(store.pool)),
+                pool.submit(accept, ChatStore(store.pool)),
+            ]
+        ]
+
+    assert sorted(replay for _, replay in results) == [False, True]
+    assert results[0][0] == results[1][0]
+    with store.pool.connection() as connection:
+        created = connection.execute(
+            "SELECT count(*) FROM persona_minimal.generations WHERE conversation_id = %s",
+            (conversation_id,),
+        ).fetchone()[0]
+    assert created == 1
+
+
+# --- G-1 P1: bridge 릴리스는 lease 스키마를 인식한다 --------------------------------
+
+
+def test_bridge_release_on_physical_0004_then_switches_to_lease_after_upgrade(
+    round_trip_database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """물리적으로 0004인 DB(lease 컬럼 없음)에서 bridge 이미지가:
+    - 기동하고 Ready가 되며, lease 없이 동작한다(heartbeat 실패 0).
+    - 전역 reconcile을 하지 않는다 — 최근 소유자 없는 running 행은 그대로, 240초 지난 행만 회수.
+    - 앱이 켜진 채로 0005가 적용되면 재시작 없이 다음 접수부터 소유자·lease를 기록한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    root = Path(__file__).resolve().parents[1]
+    old_env = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    config = Config(str(root / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.downgrade(config, "0004_chat")
+    pool = create_pool(round_trip_database_url, 2)
+    try:
+        bridge_store = PostgresPersonaStore(pool)
+        owner, conversation_id = _prepare_conversation(bridge_store, ChatStore(pool), "브릿지")
+
+        def ownerless_running(heartbeat_offset_seconds: float) -> UUID:
+            generation_id = uuid4()
+            with pool.connection() as connection:
+                message_id = connection.execute(
+                    "INSERT INTO persona_minimal.user_messages(id, conversation_id, content) "
+                    "VALUES (%s, %s, %s) RETURNING id",
+                    (uuid4(), conversation_id, "합성 질문"),
+                ).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO persona_minimal.generations("
+                    "id, conversation_id, user_message_id, version_id, mode, status, heartbeat_at"
+                    ") VALUES (%s, %s, %s, (SELECT initial_version_id FROM "
+                    "persona_minimal.conversations WHERE id = %s), 'mock', 'running', "
+                    "now() + make_interval(secs => %s))",
+                    (
+                        generation_id,
+                        conversation_id,
+                        message_id,
+                        conversation_id,
+                        heartbeat_offset_seconds,
+                    ),
+                )
+                connection.commit()
+            return generation_id
+
+        def status_of(generation_id: UUID) -> str:
+            with pool.connection() as connection:
+                return connection.execute(
+                    "SELECT status FROM persona_minimal.generations WHERE id = %s",
+                    (generation_id,),
+                ).fetchone()[0]
+
+        recent = ownerless_running(-10)
+        old = ownerless_running(-241)
+        failures_before = (
+            REGISTRY.get_sample_value("persona_chat_lease_heartbeat_failures_total") or 0.0
+        )
+        app = create_app(_lease_settings(owner), bridge_store)
+        with TestClient(app) as api:
+            assert api.get("/readyz").status_code == 200
+            assert status_of(recent) == "running"  # 전역 reconcile 없음
+            assert status_of(old) == "reconciling"  # 소유자 없는 행 규칙(240초)
+            time.sleep(LEASE_TEST_HEARTBEAT_SECONDS * 3)  # heartbeat가 몇 번 돈다
+            assert (
+                REGISTRY.get_sample_value("persona_chat_lease_heartbeat_failures_total") or 0.0
+            ) == failures_before
+
+            # 슬롯을 비우고(회수된 old 행도 300초 규칙상 아직 슬롯을 쥔다) 0004에서 새 접수:
+            # lease 컬럼 없이 성공한다.
+            with pool.connection() as connection:
+                connection.execute(
+                    "UPDATE persona_minimal.generations SET status = 'failed', "
+                    "finished_at = now() WHERE id = ANY(%s)",
+                    ([recent, old],),
+                )
+                connection.commit()
+            on_0004 = api.post(
+                "/v1/chat/completions",
+                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+                json={"conversation_id": str(conversation_id), "message": "안녕"},
+            )
+            assert on_0004.status_code == 200, (on_0004.status_code, on_0004.text[:300])
+            assert _parse_sse(on_0004.text)[-1][0] == "done"
+
+            # 앱을 켠 채로 0005 적용 → 다음 접수부터 소유자·lease 기록.
+            command.upgrade(config, "head")
+            on_0005 = api.post(
+                "/v1/chat/completions",
+                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
+                json={"conversation_id": str(conversation_id), "message": "안녕"},
+            )
+            new_id = UUID(_parse_sse(on_0005.text)[0][1]["generation_id"])
+            assert api.get("/readyz").status_code == 200
+            with pool.connection() as connection:
+                owner_id, lease = connection.execute(
+                    "SELECT owner_instance_id, lease_expires_at FROM persona_minimal.generations "
+                    "WHERE id = %s",
+                    (new_id,),
+                ).fetchone()
+            assert owner_id == app.state.chat_store.instance_id
+            assert lease is not None
+    finally:
+        pool.close()
+        command.upgrade(config, "head")
+        if old_env is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old_env
+
+
+@pytest.mark.parametrize("dropped", ["owner_instance_id", "lease_expires_at"])
+def test_lease_schema_requires_every_lease_column(
+    store: PostgresPersonaStore, dropped: str
+) -> None:
+    """수동 DDL·부분 복구·스키마 drift로 lease 컬럼이 하나만 남으면 lease 모드로 들어가지 않는다
+    — 하나만 보고 "준비됨"으로 판단하면 이후 쿼리가 없는 컬럼을 써서 500이 된다. DDL은
+    트랜잭션이라 같은 트랜잭션 안에서 컬럼을 지우고 판정한 뒤 ROLLBACK으로 되돌린다."""
+    from psycopg.rows import dict_row
+
+    from persona_minimal_api.repository import lease_schema_ready
+
+    with store.pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cur:
+            assert lease_schema_ready(cur) is True
+            cur.execute(f"ALTER TABLE persona_minimal.generations DROP COLUMN {dropped}")
+            assert lease_schema_ready(cur) is False
+        connection.rollback()
+        with connection.cursor(row_factory=dict_row) as cur:
+            assert lease_schema_ready(cur) is True

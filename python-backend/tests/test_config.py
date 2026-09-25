@@ -78,3 +78,33 @@ def test_vllm_timeouts_must_be_positive() -> None:
             PERSONA_VLLM_MODEL="synthetic-model",
             PERSONA_VLLM_IDLE_TIMEOUT_SECONDS="0",
         )
+
+
+def test_generation_lease_defaults_keep_the_safety_margin() -> None:
+    settings = Settings(**BASE_ENV)
+
+    assert settings.generation_heartbeat_seconds == 10.0
+    assert settings.generation_lease_seconds == 30.0
+    assert settings.generation_lease_seconds >= (
+        2 * settings.generation_heartbeat_seconds + settings.database_timeout_seconds
+    )
+
+
+def test_lease_shorter_than_two_heartbeats_plus_db_timeout_fails_at_startup() -> None:
+    # 10 × 2 + 2 = 22 > 20 — 연장 한 번이 늦으면 살아 있는 소유자의 lease가 만료될 수 있다.
+    with pytest.raises(ValueError) as raised:
+        Settings(
+            **BASE_ENV,
+            PERSONA_GENERATION_HEARTBEAT_SECONDS="10",
+            PERSONA_GENERATION_LEASE_SECONDS="20",
+        )
+
+    assert "PERSONA_GENERATION_LEASE_SECONDS" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "env_name", ["PERSONA_GENERATION_HEARTBEAT_SECONDS", "PERSONA_GENERATION_LEASE_SECONDS"]
+)
+def test_lease_settings_must_be_positive(env_name: str) -> None:
+    with pytest.raises(ValueError):
+        Settings(**BASE_ENV, **{env_name: "0"})

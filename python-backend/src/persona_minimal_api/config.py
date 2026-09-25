@@ -66,6 +66,18 @@ class Settings(BaseSettings):
     vllm_idle_timeout_seconds: float = Field(
         default=30.0, validation_alias="PERSONA_VLLM_IDLE_TIMEOUT_SECONDS"
     )
+    # generation 소유권 lease(G-1). 살아 있는 인스턴스는 heartbeat 간격마다 자기 활성
+    # generation의 lease를 lease 길이만큼 늘리고, 다른 인스턴스는 lease가 지난 행만 회수한다.
+    # 두 값의 관계는 generation_lease_is_safe가 검사한다. 기본값 10초·30초의 의미: 연장이
+    # 한 번 실패하고 DB가 timeout까지 느려도(10 + 10 + 2 < 30) 살아 있는 소유자의 행이
+    # 만료되지 않는다. OOM·노드 장애 뒤 회수까지는 최대 lease 길이(30초)가 걸린다. graceful
+    # shutdown(uvicorn 25초) 동안에도 heartbeat는 계속 돌고, lifespan 종료에서 멈춘다.
+    generation_heartbeat_seconds: float = Field(
+        default=10.0, validation_alias="PERSONA_GENERATION_HEARTBEAT_SECONDS"
+    )
+    generation_lease_seconds: float = Field(
+        default=30.0, validation_alias="PERSONA_GENERATION_LEASE_SECONDS"
+    )
 
     @field_validator("static_user_id", "static_display_name")
     @classmethod
@@ -86,12 +98,29 @@ class Settings(BaseSettings):
         "vllm_connect_timeout_seconds",
         "vllm_first_token_timeout_seconds",
         "vllm_idle_timeout_seconds",
+        "generation_heartbeat_seconds",
+        "generation_lease_seconds",
     )
     @classmethod
     def timeout_is_positive(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be positive")
         return value
+
+    @model_validator(mode="after")
+    def generation_lease_is_safe(self) -> Settings:
+        """lease는 heartbeat 두 번과 DB timeout을 합한 것보다 길어야 한다.
+
+        짧으면 연장 한 번이 늦거나 실패하는 것만으로 살아 있는 소유자의 lease가 만료되고,
+        다른 인스턴스가 정상 스트림을 reconciling으로 회수한다 — G-1이 막으려던 바로 그 문제다.
+        """
+        minimum = 2 * self.generation_heartbeat_seconds + self.database_timeout_seconds
+        if self.generation_lease_seconds < minimum:
+            raise ValueError(
+                "PERSONA_GENERATION_LEASE_SECONDS must be >= 2 * "
+                "PERSONA_GENERATION_HEARTBEAT_SECONDS + PERSONA_DB_TIMEOUT_SECONDS"
+            )
+        return self
 
     @model_validator(mode="after")
     def llm_settings_are_complete(self) -> Settings:
