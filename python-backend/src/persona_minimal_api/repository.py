@@ -68,7 +68,12 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 소유자 없는 행 규칙(240초 유예)만 쓰며, 0005가 적용되면 재시작 없이 lease를 켠다
 # (lease_schema_ready). 배포 순서: 이 bridge → migration 0005 Job → 기능 릴리스(0005만 허용하도록
 # 좁히기) → replica 2(api/generation-ownership-lease-design.md 3절).
-SUPPORTED_ALEMBIC_REVISIONS = ("0004_chat", "0005_generation_lease")
+# bridge 창을 닫았다(2026-09-25) — migration 0005_generation_lease Job이 운영에서 Complete되고
+# 운영 DB가 0005임을 확인한 뒤의 기능 릴리스다. 0004는 더 이상 지원하지 않는다: 0004 DB에서
+# 이 이미지는 기동은 하지만 readyz가 503이라 트래픽을 받지 않는다(롤아웃이 NotReady에서 멈춘다).
+# 0004 모드 코드(lease_schema_ready와 lease 없는 회수 분기)는 다음 스키마 전환 때 재사용할
+# "호환 창 도구"로 남긴다.
+SUPPORTED_ALEMBIC_REVISIONS = ("0005_generation_lease",)
 # 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 호환 창이
 # 열려 있었을 때(위 SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용하던 동안)
 # 이 목록도 "0003까지는 있다"는 뜻으로 넓혀 뒀다 — 지금은 창이 닫혔지만, 다음 호환
@@ -149,8 +154,9 @@ def lease_schema_ready(cur) -> bool:
     복구·스키마 drift로 하나만 남은 DB에서 "준비됨"으로 오판하면 이후 쿼리가 없는 컬럼을 써서
     500이 된다. 둘 다 있을 때만 lease 모드, 아니면 0004 모드(lease 없이)로 동작한다.
 
-    bridge 릴리스(0004·0005 허용) 동안에만 실제로 갈리는 "호환 창 도구"이며, 창을 닫은 뒤에도
-    지우지 않는다. alembic_version 마커가 아니라 시스템 카탈로그로 컬럼 실재를 본다 — 쓰려는
+    bridge 릴리스(0004·0005 허용) 동안에만 실제로 갈렸던 "호환 창 도구"다. 지금(2026-09-25,
+    bridge 창을 닫은 뒤)은 SUPPORTED_ALEMBIC_REVISIONS가 0005 하나뿐이라 Ready인 Pod에서는
+    항상 True지만, 다음 스키마 전환에서 재사용하려고 지우지 않는다. alembic_version 마커가 아니라 시스템 카탈로그로 컬럼 실재를 본다 — 쓰려는
     것이 바로 그 컬럼이고, 카탈로그 조회는 MVCC라 alembic_version이나 generations에 걸린
     테이블 잠금(migration 중 등)을 기다리지 않는다. 마커를 읽으면 그 잠금 동안 기동 회수·종료
     반납이 DB timeout만큼 멈춘다(readyz 잠금 테스트가 이를 잡았다). 호출자는 dict_row cursor를

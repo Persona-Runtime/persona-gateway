@@ -114,13 +114,14 @@ lease 기한(`lease_expires_at`)을 가진다. 인스턴스는 `PERSONA_GENERATI
 롤링 배포에서 새 Pod가 기동해도 살아 있는 이전 Pod의 스트림은 끝까지 간다. 정상 종료 때는 자기
 소유의 남은 행을 reconciling으로 넘긴다. 다른 인스턴스로 들어온 cancel은 소유자의 heartbeat가 DB에서
 읽어 로컬 업스트림을 취소한다(최대 heartbeat 간격 지연). 두 설정은 `lease >= 2 × heartbeat + DB
-timeout`이어야 하며 아니면 기동이 실패한다. 이 코드는 lease 컬럼 존재를 스스로 판정하는 **bridge 릴리스**라 0004·0005 둘 다에서
-Ready이고, 0004에서는 lease 없이(전역 reconcile 없이) 동작하다가 migration이 적용되면 재시작 없이
-lease를 켠다. 설계·종료 유형별 전이·배포 순서(bridge → migration `0005_generation_lease` → 0005만
-허용하는 기능 릴리스 → replica 2)는
+timeout`이어야 하며 아니면 기동이 실패한다. 이 코드는 `0005_generation_lease`만 허용하는 **기능
+릴리스**다(bridge 창 종료, 2026-09-25) — 0004 DB에서는 기동은 하지만 readyz가 503이라 트래픽을 받지
+않는다. 0004 모드 코드(lease 컬럼 판정, lease 없는 회수)는 호환 창 도구로 남아 있어 NotReady인
+동안에도 전역 reconcile을 하지 않는다. 설계·종료 유형별 전이·배포 순서(bridge → migration
+`0005_generation_lease` → 이 기능 릴리스 → replica 2)는
 [api/generation-ownership-lease-design.md](api/generation-ownership-lease-design.md). 이 순서는 필수이며,
 **0005 컬럼을 지우는 DB downgrade는 lease-aware Gateway가 실행 중일 때 하지 않는다**(설계 문서 3절 —
-bridge는 확장 방향만 운영 중 전환을 보장한다). 실제 두 Pod와 migration 적용은 아직 검증하지 않았다.
+bridge는 확장 방향만 운영 중 전환을 보장한다). 실제 두 Pod 동작은 아직 검증하지 않았다.
 
 설계 판단(2026-09-25): 연결 종료는 vLLM 취소가 아니므로 브라우저가 사라져도 GPU 생성은
 계속될 수 있다. DB는 `reconciling`으로 남고 사용자 슬롯은 300초 뒤 다음 요청에서야 정리된다.

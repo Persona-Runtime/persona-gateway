@@ -80,10 +80,11 @@ _RECLAIMABLE_CONDITION = """
     )
 """
 
-# bridge 릴리스가 0004 DB(lease 컬럼 없음)에서 쓰는 회수 규칙. 모든 행이 소유자를 모르므로
+# bridge 릴리스가 0004 DB(lease 컬럼 없음)에서 썼던 회수 규칙. 모든 행이 소유자를 모르므로
 # "소유자 없는 행" 규칙 하나만 남는다 — 전역 reconcile은 하지 않는다. 살아 있는 스트림은 생성
 # 전체 한도(180초) 안에 끝나므로 240초 유예에 걸리지 않는다. 컬럼을 참조하지 않아야 0004에서
-# 실행된다.
+# 실행된다. bridge 창을 닫은 뒤(0005만 허용)에는 0004 DB에서 readyz가 503이라, 트래픽을 받지
+# 않는 Pod의 기동 회수에서만 닿는다 — 다음 스키마 전환에서 재사용할 호환 창 도구로 남긴다.
 _RECLAIM_SET_WITHOUT_LEASE = "status = 'reconciling'"
 _RECLAIMABLE_CONDITION_WITHOUT_LEASE = """
     status IN ('queued', 'running', 'cancel_requested')
@@ -305,7 +306,7 @@ class ChatStore:
         self.lease_seconds = lease_seconds
         # lease 컬럼(0005)이 있음을 한 번 확인하면 True로 고정한다. False인 동안은 매번 다시 본다 —
         # bridge 릴리스가 떠 있는 중에 migration이 적용되면 재시작 없이 다음 요청부터 lease를
-        # 쓰게 하려는 것이다. 운영 중 downgrade는 정책상 하지 않으므로 True를 되돌리지 않는다.
+        # 쓰게 하려는 것이었다(0005 전용인 지금도 NotReady Pod가 0005 적용 뒤 바로 lease를 쓴다). 운영 중 downgrade는 정책상 하지 않으므로 True를 되돌리지 않는다.
         self._lease_schema_confirmed = False
 
     # --- lease 스키마 인식(bridge) ----------------------------------------
