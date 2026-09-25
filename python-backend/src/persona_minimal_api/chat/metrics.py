@@ -18,6 +18,9 @@ ServiceMonitor/PodMonitor·대시보드는 persona-platform 쪽 별도 작업이
 - persona_chat_time_to_first_token_seconds: 스트림 시작부터 사용자 텍스트가 담긴 첫
   delta까지. meta·citations 이벤트는 TTFT가 아니다(검색 시간은 포함된다).
 - persona_chat_generation_seconds: 스트림 시작부터 terminal까지 전체 소요.
+- persona_chat_stream_disconnects_total{mode}: 클라이언트 연결 종료로 generation이
+  **실제로** reconciling으로 전환된 수(UPDATE가 행을 바꾼 경우만). 이미 terminal인 뒤
+  닫힌 스트림은 세지 않는다. finished와 겹치지 않는다(terminal이 아니다).
 """
 
 from __future__ import annotations
@@ -66,4 +69,10 @@ TOTAL_GENERATION_SECONDS = Histogram(
     "persona_chat_generation_seconds",
     "스트림 시작부터 terminal 상태까지 걸린 전체 시간",
     buckets=GENERATION_BUCKETS_SECONDS,
+)
+
+STREAM_DISCONNECTS = Counter(
+    "persona_chat_stream_disconnects_total",
+    "클라이언트 연결 종료로 실제 reconciling으로 전환된 generation 수",
+    ["mode"],
 )

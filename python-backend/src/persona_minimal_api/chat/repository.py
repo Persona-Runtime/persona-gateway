@@ -728,11 +728,18 @@ class ChatStore:
                     return self._generation_by_id(cur, generation_id)
                 return _generation(row)
 
-    def mark_generation_reconciling(self, generation_id: UUID) -> None:
+    def mark_generation_reconciling(self, generation_id: UUID) -> bool:
         """연결이 끊기거나 Gateway가 재시작될 때 호출한다 — 성공도 실패도 아니라고
-        정직하게 표시한다. "프로세스가 죽었으니 failed로 슬롯 해제"는 하지 않는다."""
+        정직하게 표시한다. "프로세스가 죽었으니 failed로 슬롯 해제"는 하지 않는다.
+
+        반환값은 **이 호출이 실제로 상태를 reconciling으로 바꿨는지**다. 이미 terminal
+        (completed/failed/cancelled)이면 WHERE 조건에 걸리지 않아 False다. 판단을 선행
+        SELECT가 아니라 같은 UPDATE의 rowcount로 하는 이유: 조회와 갱신 사이에
+        finish_generation이 끼어들면 "조회 땐 running, 실제로는 이미 completed"가 되어
+        바뀌지 않은 상태를 바뀐 것으로 셀 수 있다. 한 문장의 결과는 그 경쟁이 없다.
+        """
         with self.pool.connection() as connection, connection.transaction():
-            connection.execute(
+            cur = connection.execute(
                 """
                 UPDATE persona_minimal.generations
                 SET status = 'reconciling', heartbeat_at = now()
@@ -740,6 +747,7 @@ class ChatStore:
                 """,
                 (generation_id,),
             )
+            return cur.rowcount == 1
 
     def reconcile_stale_generations_on_startup(self) -> int:
         """Gateway 기동 시 이전 프로세스가 남긴 running/cancel_requested/queued

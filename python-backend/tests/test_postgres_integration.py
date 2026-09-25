@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -2700,12 +2703,33 @@ def test_disconnect_immediately_after_meta_becomes_reconciling(
         question="안녕",
         inference_client=FakeInferenceClient(),
     )
+    disconnect_labels = {"mode": accepted.generation.mode}
+    disconnects_before = (
+        REGISTRY.get_sample_value("persona_chat_stream_disconnects_total", disconnect_labels) or 0.0
+    )
+    finished_before = _finished_total(accepted.generation.mode)
     first = next(generator)
     assert first.startswith("event: meta")
     generator.close()  # Starlette가 클라이언트 연결 종료 시 하는 것과 같다.
 
     reconciled = chat_store.get_generation(owner, accepted.generation.id)
     assert reconciled.status == "reconciling"
+    # 연결 종료는 별도 카운터로만 센다 — terminal이 아니므로 finished는 늘지 않는다.
+    assert (
+        REGISTRY.get_sample_value("persona_chat_stream_disconnects_total", disconnect_labels)
+        == disconnects_before + 1
+    )
+    assert _finished_total(accepted.generation.mode) == finished_before
+
+
+def _finished_total(mode: str) -> float:
+    return sum(
+        REGISTRY.get_sample_value(
+            "persona_chat_generations_finished_total", {"mode": mode, "terminal_reason": reason}
+        )
+        or 0.0
+        for reason in ("completed", "failed", "cancelled")
+    )
 
 
 def _ttft_observations() -> tuple[float, float]:
@@ -2756,26 +2780,15 @@ def test_ttft_is_measured_at_first_delta_not_at_meta_or_citations(
     assert sum_after - sum_before >= first_delta_delay_seconds
 
 
-def _http_count(route: str, status: str, outcome: str) -> float:
-    labels = {"method": "POST", "route": route, "status": status, "outcome": outcome}
-    return REGISTRY.get_sample_value("persona_http_requests_total", labels) or 0.0
+def _disconnects(mode: str) -> float:
+    return REGISTRY.get_sample_value("persona_chat_stream_disconnects_total", {"mode": mode}) or 0.0
 
 
-def test_real_uvicorn_client_close_on_chat_stream_is_recorded_as_client_disconnected(
+def test_close_after_done_is_persisted_keeps_completed_and_does_not_count_disconnect(
     store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TestClient가 아니라 localhost의 실제 uvicorn에 SSE로 붙었다가 meta를 받은 직후
-    클라이언트 연결을 닫는다. 실제 앱의 미들웨어 구성(헤더 BaseHTTPMiddleware 포함)에서
-    HTTP 요청이 completed가 아니라 client_disconnected로 기록되는지 확인한다.
-
-    이 테스트가 **확인하지 않는 것**: generation이 reconciling으로 바뀌는지와
-    persona_chat_stream_disconnects_total 증가. 2026-09-25 실측에서 연결 종료 뒤에도
-    stream_generation 제너레이터는 곧바로 닫히지 않았다 — Starlette가 sync 제너레이터의
-    반복만 멈추고 close()를 부르지 않아, 가비지 컬렉션이 돌 때에야 GeneratorExit가
-    발생했다(gc.collect() 뒤 닫힘, 그 전에는 running 유지). 시점이 GC에 달려 있어
-    검증 조건으로 쓰면 우연히 통과하거나 실패한다. 연결 종료 시 제너레이터를 명시적으로
-    닫는 설계가 후속 과제다.
-    """
+    """done을 DB에 저장하고 내보낸 뒤 제너레이터가 닫히면(마지막 yield 지점에서
+    GeneratorExit) 상태는 completed 그대로이고 disconnect로 세지 않는다."""
     monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
     monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
 
@@ -2783,18 +2796,102 @@ def test_real_uvicorn_client_close_on_chat_stream_is_recorded_as_client_disconne
     persona, _ = _index_character(
         store,
         owner,
-        "실연결대상",
-        "실연결대상은 침착한 안내자다.",
-        "실연결대상은 소포를 발견했다.",
-        "실연결대상: 안녕",
+        "완료후닫힘",
+        "완료후닫힘은 침착한 안내자다.",
+        "완료후닫힘은 소포를 발견했다.",
+        "완료후닫힘: 안녕",
     )
     conversation = chat_store.create_conversation(owner, persona.id, uuid4())
-    # 첫 delta를 늦게 보내 meta 직후 끊을 시간을 확보한다.
-    slow_client = FakeInferenceClient(
-        chunks=("가", "나", "다"), delay_before_first_chunk=1.0, delay_between_chunks=1.0
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
     )
-    app = create_app(_chat_settings(owner), store, inference_client=slow_client)
-    # lifespan은 끈다 — 기동 시 reconcile이 같은 DB의 다른 테스트 행을 건드리지 않게 한다.
+    mode = accepted.generation.mode
+    disconnects_before = _disconnects(mode)
+    completed_before = (
+        REGISTRY.get_sample_value(
+            "persona_chat_generations_finished_total",
+            {"mode": mode, "terminal_reason": "completed"},
+        )
+        or 0.0
+    )
+
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=FakeInferenceClient(),
+    )
+    # done을 받을 때까지 읽는다 — 제너레이터는 이제 마지막 yield에 멈춰 있다.
+    for frame in generator:
+        if frame.startswith("event: done"):
+            break
+    generator.close()
+
+    generation = chat_store.get_generation(owner, accepted.generation.id)
+    assert generation.status == "completed"
+    assert _disconnects(mode) == disconnects_before
+    assert (
+        REGISTRY.get_sample_value(
+            "persona_chat_generations_finished_total",
+            {"mode": mode, "terminal_reason": "completed"},
+        )
+        == completed_before + 1
+    )
+
+
+def test_mark_reconciling_returns_false_and_keeps_terminal_status(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """이미 terminal인 generation에는 UPDATE가 행을 바꾸지 않는다 — False를 돌려주고
+    상태도 그대로다. 두 번째 호출도 같다(이미 reconciling이면 조건에 걸리지 않는다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "전환반환값",
+        "전환반환값은 침착한 안내자다.",
+        "전환반환값은 소포를 발견했다.",
+        "전환반환값: 안녕",
+    )
+    # 같은 사용자의 활성 generation은 1개뿐이라(reconciling도 슬롯을 쥔다) terminal
+    # 사례를 먼저 끝내고, 그다음 실제 전환 사례를 만든다.
+    first = chat_store.create_conversation(owner, persona.id, uuid4())
+    terminal = chat_service.accept_chat_completion(chat_store, owner, first.id, "안녕", uuid4())
+    chat_store.finish_generation(
+        terminal.generation.id, status="failed", content="", failure_code="internal_error"
+    )
+    # terminal(failed)에는 전환이 일어나지 않는다.
+    assert chat_store.mark_generation_reconciling(terminal.generation.id) is False
+    assert chat_store.get_generation(owner, terminal.generation.id).status == "failed"
+
+    second = chat_store.create_conversation(owner, persona.id, uuid4())
+    active = chat_service.accept_chat_completion(chat_store, owner, second.id, "안녕", uuid4())
+    # queued → reconciling: 실제 전환이라 True, 다시 부르면 이미 reconciling이라 False.
+    assert chat_store.mark_generation_reconciling(active.generation.id) is True
+    assert chat_store.mark_generation_reconciling(active.generation.id) is False
+    assert chat_store.get_generation(owner, active.generation.id).status == "reconciling"
+
+
+def _http_count(route: str, status: str, outcome: str) -> float:
+    labels = {"method": "POST", "route": route, "status": status, "outcome": outcome}
+    return REGISTRY.get_sample_value("persona_http_requests_total", labels) or 0.0
+
+
+@contextmanager
+def _running_uvicorn(app) -> Iterator[str]:
+    """localhost의 실제 uvicorn으로 app을 띄우고 base URL을 돌려준다.
+
+    TestClient는 응답을 끝까지 읽으므로 "도중에 끊긴 연결"을 만들 수 없다. 실제 소켓을
+    닫아야 Starlette·uvicorn의 연결 종료 경로를 그대로 탄다. lifespan은 끈다 — 기동 시
+    reconcile이 같은 DB의 다른 테스트 행을 건드리지 않게 한다.
+    """
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, lifespan="off", log_level="warning")
     )
@@ -2806,43 +2903,272 @@ def test_real_uvicorn_client_close_on_chat_stream_is_recorded_as_client_disconne
             assert time.monotonic() < deadline, "uvicorn이 5초 안에 기동하지 않았다"
             time.sleep(0.02)
         port = server.servers[0].sockets[0].getsockname()[1]
-
-        route = "/v1/chat/completions"
-        disconnected_before = _http_count(route, "200", "client_disconnected")
-        completed_before = _http_count(route, "200", "completed")
-
-        received_meta = False
-        with (
-            httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as client,
-            client.stream(
-                "POST",
-                route,
-                headers={
-                    "Authorization": "Bearer integration-token",
-                    "Idempotency-Key": str(uuid4()),
-                    "Accept": "text/event-stream",
-                },
-                json={"conversation_id": str(conversation.id), "message": "안녕"},
-            ) as response,
-        ):
-            assert response.status_code == 200
-            for line in response.iter_lines():
-                if line == "event: meta":
-                    received_meta = True
-                    break
-        # with 블록을 나오면 응답과 연결이 닫힌다(클라이언트 쪽 연결 종료).
-        assert received_meta
-
-        # 요청 처리 코루틴이 연결 종료를 감지하고 끝나야 기록된다 — 짧게 기다린다.
-        deadline = time.monotonic() + 5
-        while _http_count(route, "200", "client_disconnected") == disconnected_before:
-            assert time.monotonic() < deadline, "HTTP client_disconnected가 기록되지 않았다"
-            time.sleep(0.05)
-        assert _http_count(route, "200", "client_disconnected") == disconnected_before + 1
-        assert _http_count(route, "200", "completed") == completed_before
+        yield f"http://127.0.0.1:{port}"
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+
+
+@contextmanager
+def _gc_disabled() -> Iterator[None]:
+    """테스트 동안 가비지 컬렉션을 끈다 — 제너레이터 정리가 GC가 아니라 응답 소유자의
+    명시적 close로 일어난다는 것을 증명하려는 목적이다."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+_SSE_HEADERS = {"Authorization": "Bearer integration-token", "Accept": "text/event-stream"}
+
+
+def _read_until_then_close(
+    base_url: str, path: str, body: dict | None, stop_after_event: str, stop_count: int = 1
+) -> UUID:
+    """SSE를 읽다가 stop_after_event 이벤트를 stop_count번 받으면 연결을 닫는다.
+    meta의 generation_id를 돌려준다."""
+    generation_id: UUID | None = None
+    seen = 0
+    current_event = ""
+    with (
+        httpx.Client(base_url=base_url, timeout=10) as client,
+        client.stream(
+            "POST", path, headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())}, json=body
+        ) as response,
+    ):
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith("event: "):
+                current_event = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                if current_event == "meta":
+                    generation_id = UUID(json.loads(line.removeprefix("data: "))["generation_id"])
+                if current_event == stop_after_event:
+                    seen += 1
+                    if seen >= stop_count:
+                        break
+    # with 블록을 나오면 응답과 연결이 닫힌다(클라이언트 쪽 연결 종료).
+    assert generation_id is not None
+    return generation_id
+
+
+def _wait_for_status(
+    chat_store: ChatStore, owner: str, generation_id: UUID, expected: str, within: float
+) -> tuple[str, float]:
+    """expected 상태가 될 때까지 기다린다. (마지막 상태, 걸린 초)를 돌려준다."""
+    started = time.monotonic()
+    status = ""
+    while time.monotonic() - started < within:
+        status = chat_store.get_generation(owner, generation_id).status
+        if status == expected:
+            break
+        time.sleep(0.02)
+    return status, time.monotonic() - started
+
+
+def _prepare_conversation(
+    store: PostgresPersonaStore, chat_store: ChatStore, name: str
+) -> tuple[str, UUID]:
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        name,
+        f"{name}은 침착한 안내자다.",
+        f"{name}은 소포를 발견했다.",
+        f"{name}: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    return owner, conversation.id
+
+
+# 연결 종료 뒤 reconciling 전환까지 허용하는 시간. 대기 루프의 폴링 간격(0.1초)에 스레드
+# 전환·DB 왕복 여유를 더한 값이다. GC에 기대면 이 안에 끝나지 않는다(실측 6초 이상).
+RECONCILE_WITHIN_SECONDS = 1.0
+
+
+def test_real_uvicorn_close_after_citations_before_first_delta_reconciles_without_gc(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """citations를 받은 뒤, 첫 delta 전에 끊는다(첫 조각 5초 지연). 이때 제너레이터의
+    next()는 업스트림 조각을 기다리는 대기 루프 안에 있다. client_gone 신호로 깨어나 GC
+    없이 1초 안에 reconciling이 되어야 하고, disconnect 카운터 +1, finished +0, HTTP는
+    client_disconnected로 남는다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "첫토큰대기")
+    app = create_app(
+        _chat_settings(owner),
+        store,
+        inference_client=FakeInferenceClient(chunks=("가",), delay_before_first_chunk=5.0),
+    )
+    route = "/v1/chat/completions"
+    disconnects_before = _disconnects("mock")
+    finished_before = _finished_total("mock")
+    http_disconnected_before = _http_count(route, "200", "client_disconnected")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            route,
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "citations",
+        )
+        status, elapsed = _wait_for_status(
+            chat_store, owner, generation_id, "reconciling", RECONCILE_WITHIN_SECONDS
+        )
+        assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
+        assert _disconnects("mock") == disconnects_before + 1
+        assert _finished_total("mock") == finished_before
+        deadline = time.monotonic() + 2
+        while _http_count(route, "200", "client_disconnected") == http_disconnected_before:
+            assert time.monotonic() < deadline, "HTTP client_disconnected가 기록되지 않았다"
+            time.sleep(0.02)
+
+
+# 검색 중 연결 종료 테스트에서 query embedding 호출이 걸리는 시간(초). 끊은 뒤 이 시간의
+# 절반 시점에 "아직 전환 전"을 확인할 수 있을 만큼 길고, 테스트가 느려지지 않을 만큼 짧다.
+RETRIEVAL_DELAY_SECONDS = 1.5
+
+
+def test_real_uvicorn_close_during_retrieval_waits_for_call_to_return(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """meta를 받은 직후 끊는다. 이때 next()는 검색(query embedding) 호출 안에 있다.
+
+    즉시 전환을 보장하지 않는다는 현재 계약을 고정한다. 검색·embedding 같은 동기 선행
+    호출은 client_gone을 확인하지 않으므로, 호출이 반환한 뒤에야 reconciling이 된다. 이
+    동작을 바꾸면 README "채팅 업스트림"과 이 테스트를 함께 고친다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "검색중종료")
+
+    def slow_query_embed(base_url: str, texts: list[str], input_type: str) -> EmbeddingResult:
+        time.sleep(RETRIEVAL_DELAY_SECONDS)
+        return _fake_embed(base_url, texts, input_type)
+
+    # 색인이 끝난 뒤에 검색 쪽만 느리게 만든다.
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", slow_query_embed)
+    app = create_app(
+        _chat_settings(owner),
+        store,
+        inference_client=FakeInferenceClient(chunks=("가",), delay_before_first_chunk=5.0),
+    )
+    disconnects_before = _disconnects("mock")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "meta",
+        )
+        closed_at = time.monotonic()
+
+        # 검색 호출 중에는 전환되지 않는다(검색 전이라 아직 queued).
+        time.sleep(RETRIEVAL_DELAY_SECONDS / 2)
+        assert chat_store.get_generation(owner, generation_id).status == "queued"
+        assert _disconnects("mock") == disconnects_before
+
+        # 검색이 반환한 뒤에는 전환된다.
+        status, _ = _wait_for_status(
+            chat_store, owner, generation_id, "reconciling", RETRIEVAL_DELAY_SECONDS + 1.0
+        )
+        elapsed = time.monotonic() - closed_at
+        assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
+        assert _disconnects("mock") == disconnects_before + 1
+
+
+def test_real_uvicorn_close_between_deltas_reconciles_without_gc(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """delta 하나를 받은 뒤 끊는다. 다음 조각은 5초 뒤에 오므로 next()는 대기 루프에 있다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "조각사이")
+    app = create_app(
+        _chat_settings(owner),
+        store,
+        inference_client=FakeInferenceClient(chunks=("가", "나"), delay_between_chunks=5.0),
+    )
+    disconnects_before = _disconnects("mock")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "delta",
+        )
+        status, elapsed = _wait_for_status(
+            chat_store, owner, generation_id, "reconciling", RECONCILE_WITHIN_SECONDS
+        )
+        assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
+        assert _disconnects("mock") == disconnects_before + 1
+
+
+def test_real_uvicorn_close_after_done_keeps_completed_and_does_not_count(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """done까지 받은 뒤 닫으면 완료 기록을 바꾸지 않고 disconnect로 세지 않는다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "완료뒤종료")
+    app = create_app(_chat_settings(owner), store, inference_client=FakeInferenceClient())
+    disconnects_before = _disconnects("mock")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "done",
+        )
+        # 정리가 끝날 시간을 준 뒤에도 completed 그대로여야 한다.
+        time.sleep(RECONCILE_WITHIN_SECONDS)
+        assert chat_store.get_generation(owner, generation_id).status == "completed"
+        assert _disconnects("mock") == disconnects_before
+
+
+def test_real_uvicorn_close_during_retry_stream_reconciles_without_gc(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retry route도 같은 응답 소유 규칙을 쓰는지 확인한다. 업스트림 실패로 끝난 생성을
+    재시도하고, 재시도 스트림의 citations를 받은 뒤(첫 delta 전) 끊는다. retry는 저장된
+    입력을 쓰므로 검색 단계가 없다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "재시도종료")
+    app = create_app(
+        _chat_settings(owner),
+        store,
+        inference_client=FakeInferenceClient(raise_before_start=UpstreamError("upstream_503")),
+    )
+    disconnects_before = _disconnects("mock")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        failed_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "error",
+        )
+        assert chat_store.get_generation(owner, failed_id).status == "failed"
+
+        app.state.inference_client = FakeInferenceClient(
+            chunks=("가",), delay_before_first_chunk=5.0
+        )
+        retry_id = _read_until_then_close(
+            base_url, f"/v1/generations/{failed_id}/retry", None, "citations"
+        )
+        status, elapsed = _wait_for_status(
+            chat_store, owner, retry_id, "reconciling", RECONCILE_WITHIN_SECONDS
+        )
+        assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
+        assert _disconnects("mock") == disconnects_before + 1
 
 
 def test_disconnect_mid_stream_after_some_deltas_becomes_reconciling(
