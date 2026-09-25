@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     chat_inference_mode: Literal["mock", "llm"] = Field(
         default="mock", validation_alias="PERSONA_CHAT_INFERENCE_MODE"
     )
+    # mock 모드의 응답 모양(chat/fake_inference.MOCK_WORKLOAD_PROFILES). 서버 설정으로만
+    # 고른다 — 요청 body·query·header로 바꾸는 경로는 없다(사용자가 스트림 길이를 조작해
+    # 슬롯을 오래 쥐거나 실험 결과를 흔들 수 없게). llm 모드에서는 읽지 않는다. 기본값
+    # short는 기존 기본 mock과 같은 응답이다. Literal이라 다른 값이면 기동이 실패한다.
+    chat_mock_profile: Literal["short", "medium", "long"] = Field(
+        default="short", validation_alias="PERSONA_CHAT_MOCK_PROFILE"
+    )
     # 아래 vLLM 설정은 llm 모드에서만 쓴다. mock 모드 기동·테스트에 새 연결 설정을
     # 강제하지 않으려고 모두 선택값으로 두고, llm일 때의 필수 여부는
     # llm_settings_are_complete가 검사한다.

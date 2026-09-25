@@ -108,3 +108,50 @@ def test_lease_shorter_than_two_heartbeats_plus_db_timeout_fails_at_startup() ->
 def test_lease_settings_must_be_positive(env_name: str) -> None:
     with pytest.raises(ValueError):
         Settings(**BASE_ENV, **{env_name: "0"})
+
+
+def test_mock_profile_defaults_to_short() -> None:
+    assert Settings(**BASE_ENV).chat_mock_profile == "short"
+
+
+def test_unknown_mock_profile_fails_at_startup_without_echoing_input() -> None:
+    with pytest.raises(ValueError) as raised:
+        Settings(**BASE_ENV, PERSONA_CHAT_MOCK_PROFILE="synthetic-unknown-profile")
+
+    assert "PERSONA_CHAT_MOCK_PROFILE" in str(raised.value)
+    assert "synthetic-unknown-profile" not in str(raised.value)
+
+
+def _recorded_mock_profile() -> str | None:
+    from prometheus_client import REGISTRY
+
+    for metric in REGISTRY.collect():
+        if metric.name == "persona_chat_mock_workload":
+            return metric.samples[0].labels["profile"]
+    return None
+
+
+def test_mock_profile_selects_fake_client_shape_only_in_mock_mode() -> None:
+    from persona_minimal_api.chat.fake_inference import FakeInferenceClient
+    from persona_minimal_api.chat.vllm_client import VllmInferenceClient
+    from persona_minimal_api.main import build_inference_client
+
+    # mock: 설정한 profile이 적용·기록된다(조각을 실제로 흘려 보내지 않는다 — 시간 의존 회피).
+    mock_client = build_inference_client(Settings(**BASE_ENV, PERSONA_CHAT_MOCK_PROFILE="medium"))
+    assert isinstance(mock_client, FakeInferenceClient)
+    assert _recorded_mock_profile() == "medium"
+
+    llm_settings = Settings(
+        **BASE_ENV,
+        PERSONA_CHAT_INFERENCE_MODE="llm",
+        PERSONA_VLLM_BASE_URL="http://vllm.invalid",
+        PERSONA_VLLM_MODEL="synthetic-model",
+        PERSONA_CHAT_MOCK_PROFILE="long",
+    )
+    llm_client = build_inference_client(llm_settings)
+    try:
+        # llm 모드는 profile을 읽지 않는다 — vLLM adapter를 쓰고, mock profile 기록도 바꾸지 않는다.
+        assert isinstance(llm_client, VllmInferenceClient)
+        assert _recorded_mock_profile() == "medium"
+    finally:
+        llm_client.close()

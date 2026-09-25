@@ -23,7 +23,12 @@ from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 from persona_minimal_api.chat import service as chat_service
-from persona_minimal_api.chat.fake_inference import FakeInferenceClient, UpstreamError
+from persona_minimal_api.chat.fake_inference import (
+    DEFAULT_CHUNKS,
+    FakeInferenceClient,
+    MockWorkloadProfile,
+    UpstreamError,
+)
 from persona_minimal_api.chat.repository import ChatStore, GenerationInProgress
 from persona_minimal_api.config import Settings
 from persona_minimal_api.indexing.embedding_client import EmbeddingError, EmbeddingResult
@@ -242,17 +247,17 @@ def test_readyz_requires_the_revision_this_release_supports(
 ) -> None:
     """이 릴리스가 요구하는 revision에서만 Ready다.
 
-    2026-09-25 bridge 릴리스(G-1 generation 소유권 lease) — 이 이미지는 lease 컬럼 존재를
-    스스로 판정해 0004에서는 lease 없이, 0005에서는 lease로 동작하므로 두 revision 모두
-    200이다. 0003 이하와 알 수 없는 값은 503이다. 0005만 허용하도록 좁히는 것은 migration
-    적용·검증 뒤의 기능 릴리스(별도 커밋)의 몫이다(api/generation-ownership-lease-design.md 3절).
+    2026-09-25 기능 릴리스(bridge 창 종료) — migration 0005_generation_lease가 운영에 적용된
+    뒤라 0005만 200이다. bridge 이미지가 허용하던 0004는 이제 503이다: 0004 DB로 되돌아간
+    환경에 이 이미지가 롤아웃되면 새 Pod가 Ready가 되지 않아 트래픽을 받지 않는다. 0003 이하와
+    알 수 없는 값도 503이다(api/generation-ownership-lease-design.md 3절).
 
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0004_chat", "0005_generation_lease")
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0005_generation_lease",)
     assert _readyz_with_revision(store, "0005_generation_lease") == 200
-    assert _readyz_with_revision(store, "0004_chat") == 200
+    assert _readyz_with_revision(store, "0004_chat") == 503
     assert _readyz_with_revision(store, "0003_material_chunks") == 503
     assert _readyz_with_revision(store, "0002_persona_draft") == 503
     assert _readyz_with_revision(store, "0001_persona_minimal") == 503
@@ -270,7 +275,7 @@ def test_readyz_rejects_unknown_revision(store: PostgresPersonaStore) -> None:
 def test_list_personas_and_get_persona_still_work_when_revision_unsupported(
     store: PostgresPersonaStore,
 ) -> None:
-    """호환 창이 닫힌 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0004 하나)에도, 그 밖의
+    """호환 창이 닫힌 뒤(SUPPORTED_ALEMBIC_REVISIONS가 단일 revision)에도, 그 밖의
     revision에서 readyz는 정확히 503을 내면서 캐릭터 조회는 계속 통과하고 초안만
     409로 막히는지 확인한다.
 
@@ -742,7 +747,7 @@ def test_list_personas_and_get_persona_still_work_on_physically_downgraded_0001(
 ) -> None:
     """0001까지만 물리적으로 내려간 DB(마커가 아니라 테이블 자체가 없는 상태)에서도
     list_personas·get_persona가 500이 아니라 200을 내는지 확인한다. 호환 창을
-    닫은 뒤(SUPPORTED_ALEMBIC_REVISIONS가 0004 하나)에는 이 상태에서 readyz가
+    닫은 뒤(SUPPORTED_ALEMBIC_REVISIONS가 단일 revision)에는 이 상태에서 readyz가
     200이 아니라 503이어야 정확하다 — 0001은 더 이상 지원 revision이 아니다.
 
     다른 테스트들이 쓰는 `_set_revision`은 alembic_version 마커만 바꾸고 물리 스키마는
@@ -4334,16 +4339,26 @@ def test_concurrent_same_key_requests_create_one_generation_and_replay_the_other
     assert created == 1
 
 
-# --- G-1 P1: bridge 릴리스는 lease 스키마를 인식한다 --------------------------------
+# --- G-1 기능 릴리스: 0004에서는 NotReady, 0005에서 lease로 동작한다 ------------------
 
 
-def test_bridge_release_on_physical_0004_then_switches_to_lease_after_upgrade(
+def test_feature_release_on_physical_0004_is_not_ready_until_0005(
     round_trip_database_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """물리적으로 0004인 DB(lease 컬럼 없음)에서 bridge 이미지가:
-    - 기동하고 Ready가 되며, lease 없이 동작한다(heartbeat 실패 0).
-    - 전역 reconcile을 하지 않는다 — 최근 소유자 없는 running 행은 그대로, 240초 지난 행만 회수.
-    - 앱이 켜진 채로 0005가 적용되면 재시작 없이 다음 접수부터 소유자·lease를 기록한다."""
+    """물리적으로 0004인 DB(lease 컬럼 없음)에서 0005 전용 기능 릴리스가:
+    - 기동은 한다(lifespan이 lease 컬럼 부재로 crash하지 않는다) — 하지만 readyz는 503이라
+      트래픽을 받지 않는다. 실패는 CrashLoop가 아니라 명시적인 NotReady로 드러난다.
+    - NotReady인 동안에도 전역 reconcile을 하지 않는다 — 다른 Pod의 살아 있는 스트림일 수 있는
+      최근 소유자 없는 running 행은 그대로, 240초 지난 행만 회수한다. heartbeat도 실패하지 않는다.
+    - 앱이 켜진 채로 0005가 적용되면 재시작 없이 Ready가 되고, 다음 접수부터 소유자·lease를
+      기록한다.
+
+    마커만 바꾸는 _set_revision이 아니라 실제 downgrade로 lease 컬럼을 지운다 — 기동 회수와
+    heartbeat가 없는 컬럼을 참조하지 않는지는 물리 스키마에서만 확인된다."""
+    from psycopg.rows import dict_row
+
+    from persona_minimal_api.repository import lease_schema_ready
+
     monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
     monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
     root = Path(__file__).resolve().parents[1]
@@ -4354,8 +4369,8 @@ def test_bridge_release_on_physical_0004_then_switches_to_lease_after_upgrade(
     command.downgrade(config, "0004_chat")
     pool = create_pool(round_trip_database_url, 2)
     try:
-        bridge_store = PostgresPersonaStore(pool)
-        owner, conversation_id = _prepare_conversation(bridge_store, ChatStore(pool), "브릿지")
+        feature_store = PostgresPersonaStore(pool)
+        owner, conversation_id = _prepare_conversation(feature_store, ChatStore(pool), "기능")
 
         def ownerless_running(heartbeat_offset_seconds: float) -> UUID:
             generation_id = uuid4()
@@ -4389,14 +4404,19 @@ def test_bridge_release_on_physical_0004_then_switches_to_lease_after_upgrade(
                     (generation_id,),
                 ).fetchone()[0]
 
+        def lease_schema_ready_now() -> bool:
+            with pool.connection() as connection, connection.cursor(row_factory=dict_row) as cur:
+                return lease_schema_ready(cur)
+
         recent = ownerless_running(-10)
         old = ownerless_running(-241)
         failures_before = (
             REGISTRY.get_sample_value("persona_chat_lease_heartbeat_failures_total") or 0.0
         )
-        app = create_app(_lease_settings(owner), bridge_store)
+        app = create_app(_lease_settings(owner), feature_store)
         with TestClient(app) as api:
-            assert api.get("/readyz").status_code == 200
+            assert api.get("/readyz").status_code == 503  # 0004는 더 이상 지원하지 않는다
+            assert lease_schema_ready_now() is False
             assert status_of(recent) == "running"  # 전역 reconcile 없음
             assert status_of(old) == "reconciling"  # 소유자 없는 행 규칙(240초)
             time.sleep(LEASE_TEST_HEARTBEAT_SECONDS * 3)  # heartbeat가 몇 번 돈다
@@ -4404,8 +4424,7 @@ def test_bridge_release_on_physical_0004_then_switches_to_lease_after_upgrade(
                 REGISTRY.get_sample_value("persona_chat_lease_heartbeat_failures_total") or 0.0
             ) == failures_before
 
-            # 슬롯을 비우고(회수된 old 행도 300초 규칙상 아직 슬롯을 쥔다) 0004에서 새 접수:
-            # lease 컬럼 없이 성공한다.
+            # 슬롯을 비운다 — 회수된 old 행도 300초 규칙상 아직 사용자 슬롯을 쥔다.
             with pool.connection() as connection:
                 connection.execute(
                     "UPDATE persona_minimal.generations SET status = 'failed', "
@@ -4413,23 +4432,19 @@ def test_bridge_release_on_physical_0004_then_switches_to_lease_after_upgrade(
                     ([recent, old],),
                 )
                 connection.commit()
-            on_0004 = api.post(
-                "/v1/chat/completions",
-                headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
-                json={"conversation_id": str(conversation_id), "message": "안녕"},
-            )
-            assert on_0004.status_code == 200, (on_0004.status_code, on_0004.text[:300])
-            assert _parse_sse(on_0004.text)[-1][0] == "done"
 
-            # 앱을 켠 채로 0005 적용 → 다음 접수부터 소유자·lease 기록.
+            # 앱을 켠 채로 0005 적용 → 재시작 없이 Ready, 다음 접수부터 소유자·lease 기록.
             command.upgrade(config, "head")
+            assert api.get("/readyz").status_code == 200
+            assert lease_schema_ready_now() is True
             on_0005 = api.post(
                 "/v1/chat/completions",
                 headers={**_SSE_HEADERS, "Idempotency-Key": str(uuid4())},
                 json={"conversation_id": str(conversation_id), "message": "안녕"},
             )
+            assert on_0005.status_code == 200, (on_0005.status_code, on_0005.text[:300])
+            assert _parse_sse(on_0005.text)[-1][0] == "done"
             new_id = UUID(_parse_sse(on_0005.text)[0][1]["generation_id"])
-            assert api.get("/readyz").status_code == 200
             with pool.connection() as connection:
                 owner_id, lease = connection.execute(
                     "SELECT owner_instance_id, lease_expires_at FROM persona_minimal.generations "
@@ -4466,3 +4481,122 @@ def test_lease_schema_requires_every_lease_column(
         connection.rollback()
         with connection.cursor(row_factory=dict_row) as cur:
             assert lease_schema_ready(cur) is True
+
+
+# --- mock workload profile (G-2) -------------------------------------------------------
+
+
+def _post_chat(
+    api: TestClient,
+    conversation_id: UUID,
+    *,
+    query: str = "",
+    extra_headers: dict[str, str] | None = None,
+    extra_body: dict[str, str] | None = None,
+):
+    """합성 질문으로 채팅을 요청한다. query·extra_*는 mock profile 조작 시도를 흉내 낸다."""
+    return api.post(
+        f"/v1/chat/completions{query}",
+        headers={
+            "Authorization": "Bearer integration-token",
+            "Idempotency-Key": str(uuid4()),
+            "Accept": "text/event-stream",
+            **(extra_headers or {}),
+        },
+        json={"conversation_id": str(conversation_id), "message": "안녕", **(extra_body or {})},
+    )
+
+
+def _delta_texts(events: list[tuple[str, dict]]) -> list[str]:
+    return [data["text"] for name, data in events if name == "delta"]
+
+
+def test_default_mock_profile_from_settings_streams_existing_short_shape(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """inference_client를 주입하지 않으면 설정(기본 short)대로 고른다 — 기존 기본 mock과 같은
+    3조각 뒤 done이어야 한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "기본프로필")
+    api = TestClient(create_app(_chat_settings(owner), store))
+
+    events = _parse_sse(_post_chat(api, conversation_id).text)
+
+    assert [name for name, _ in events] == ["meta", "citations", "delta", "delta", "delta", "done"]
+    assert _delta_texts(events) == list(DEFAULT_CHUNKS)
+
+
+def test_scaled_profile_streams_every_fragment_in_order_then_done(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """medium/long과 같은 규칙을 시간만 줄인 profile로 본다(실제 40초를 기다리지 않는다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "줄인프로필")
+    profile = MockWorkloadProfile("scaled-test", 6, 0.02)
+    api = TestClient(
+        create_app(
+            _chat_settings(owner), store, inference_client=FakeInferenceClient.from_profile(profile)
+        )
+    )
+
+    events = _parse_sse(_post_chat(api, conversation_id).text)
+
+    assert [name for name, _ in events][:2] == ["meta", "citations"]
+    assert events[-1][0] == "done"
+    assert _delta_texts(events) == list(profile.fragments())
+    assert [data["index"] for name, data in events if name == "delta"] == list(range(6))
+
+
+def test_mock_profile_cannot_be_changed_by_request(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """query·header로 profile을 바꾸려 해도 설정(short)대로 3조각이다. body의 추가 필드는
+    ChatRequest(extra=forbid)가 422로 거절하고 generation을 만들지 않는다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "조작불가")
+    api = TestClient(create_app(_chat_settings(owner), store))
+
+    via_query = _parse_sse(_post_chat(api, conversation_id, query="?profile=long").text)
+    assert len(_delta_texts(via_query)) == 3
+
+    via_header = _parse_sse(
+        _post_chat(api, conversation_id, extra_headers={"X-Mock-Profile": "long"}).text
+    )
+    assert len(_delta_texts(via_header)) == 3
+
+    via_body = _post_chat(api, conversation_id, extra_body={"profile": "long"})
+    assert via_body.status_code == 422
+    # 거절된 요청이 활성 generation을 남기지 않았다 — 다음 정상 요청이 409 없이 스트리밍된다.
+    after = _parse_sse(_post_chat(api, conversation_id).text)
+    assert after[-1][0] == "done"
+
+
+def test_real_uvicorn_close_during_long_profile_reconciles_without_gc(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """long형 profile(시간만 줄임: 50조각 × 0.1초)에서 첫 delta를 받은 뒤 끊어도 기존 규칙대로
+    1초 안에 reconciling이 되고 연결 종료 카운터가 1 오른다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "긴프로필종료")
+    profile = MockWorkloadProfile("scaled-long", 50, 0.1)
+    app = create_app(
+        _chat_settings(owner), store, inference_client=FakeInferenceClient.from_profile(profile)
+    )
+    disconnects_before = _disconnects("mock")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "delta",
+        )
+        status, elapsed = _wait_for_status(
+            chat_store, owner, generation_id, "reconciling", RECONCILE_WITHIN_SECONDS
+        )
+        assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
+        assert _disconnects("mock") == disconnects_before + 1

@@ -80,6 +80,23 @@ scripts/local-stack.sh down
 | `mock`(기본) | `FakeInferenceClient` — 모델을 부르지 않는 합성 응답 | 없음 |
 | `llm` | `VllmInferenceClient` — vLLM OpenAI 호환 `/v1/chat/completions`(stream) | `PERSONA_VLLM_BASE_URL`, `PERSONA_VLLM_MODEL` |
 
+`mock` 모드의 응답 모양은 `PERSONA_CHAT_MOCK_PROFILE`로 고른다. 서버 설정으로만 정하며
+요청 body·query·header로는 바꿀 수 없다(body의 추가 필드는 422로 거절된다). `llm` 모드에서는
+이 값을 읽지 않는다. 잘못된 값이면 기동이 실패한다.
+
+| profile | 조각 수 | 조각 간격 | 예상 스트림 시간(검색 제외) | 용도 |
+| --- | ---: | ---: | ---: | --- |
+| `short`(기본) | 3 | 0초 | 약 0초 | 기존 기본 mock과 같은 응답. 신규 요청 기준선 |
+| `medium` | 10 | 0.5초 | 약 5초 | 배포와 겹칠 수 있는 수 초 단위 SSE |
+| `long` | 80 | 0.5초 | 약 40초 | graceful shutdown 25초·termination grace 30초를 넘는 SSE |
+
+조각은 고정 합성 문자열이고 **LLM token이 아니다.** 조각 간격과 스트림 시간은 모델 생성
+시간의 추정치가 아니다 — GPU 없이 "배포 중 진행 중인 스트림" 같은 생명주기 조건을 재현하려는
+용도다. mock에서 `persona_chat_time_to_first_token_seconds`는 첫 조각까지 걸린 시간(대부분 검색
+시간)이다. tokens/s·GPU 메모리·continuous batching·모델 품질은 GPU·vLLM 단계에서만 잴 수 있다.
+적용된 profile은 `persona_chat_mock_workload_info{profile,fragment_count,fragment_interval_seconds}`로
+확인한다.
+
 `llm`인데 위 두 값이 비어 있으면 앱이 **기동하지 못한다**. 선택값으로
 `PERSONA_VLLM_API_KEY`(vLLM을 `--api-key`로 띄웠을 때만),
 `PERSONA_VLLM_CONNECT_TIMEOUT_SECONDS`(기본 5),
@@ -114,13 +131,14 @@ lease 기한(`lease_expires_at`)을 가진다. 인스턴스는 `PERSONA_GENERATI
 롤링 배포에서 새 Pod가 기동해도 살아 있는 이전 Pod의 스트림은 끝까지 간다. 정상 종료 때는 자기
 소유의 남은 행을 reconciling으로 넘긴다. 다른 인스턴스로 들어온 cancel은 소유자의 heartbeat가 DB에서
 읽어 로컬 업스트림을 취소한다(최대 heartbeat 간격 지연). 두 설정은 `lease >= 2 × heartbeat + DB
-timeout`이어야 하며 아니면 기동이 실패한다. 이 코드는 lease 컬럼 존재를 스스로 판정하는 **bridge 릴리스**라 0004·0005 둘 다에서
-Ready이고, 0004에서는 lease 없이(전역 reconcile 없이) 동작하다가 migration이 적용되면 재시작 없이
-lease를 켠다. 설계·종료 유형별 전이·배포 순서(bridge → migration `0005_generation_lease` → 0005만
-허용하는 기능 릴리스 → replica 2)는
+timeout`이어야 하며 아니면 기동이 실패한다. 이 코드는 `0005_generation_lease`만 허용하는 **기능
+릴리스**다(bridge 창 종료, 2026-09-25) — 0004 DB에서는 기동은 하지만 readyz가 503이라 트래픽을 받지
+않는다. 0004 모드 코드(lease 컬럼 판정, lease 없는 회수)는 호환 창 도구로 남아 있어 NotReady인
+동안에도 전역 reconcile을 하지 않는다. 설계·종료 유형별 전이·배포 순서(bridge → migration
+`0005_generation_lease` → 이 기능 릴리스 → replica 2)는
 [api/generation-ownership-lease-design.md](api/generation-ownership-lease-design.md). 이 순서는 필수이며,
 **0005 컬럼을 지우는 DB downgrade는 lease-aware Gateway가 실행 중일 때 하지 않는다**(설계 문서 3절 —
-bridge는 확장 방향만 운영 중 전환을 보장한다). 실제 두 Pod와 migration 적용은 아직 검증하지 않았다.
+bridge는 확장 방향만 운영 중 전환을 보장한다). 실제 두 Pod 동작은 아직 검증하지 않았다.
 
 설계 판단(2026-09-25): 연결 종료는 vLLM 취소가 아니므로 브라우저가 사라져도 GPU 생성은
 계속될 수 있다. DB는 `reconciling`으로 남고 사용자 슬롯은 300초 뒤 다음 요청에서야 정리된다.
@@ -145,6 +163,7 @@ label에는 route 템플릿·method·상태 코드·결과처럼 가짓수가 �
 | `persona_chat_generations_reclaimed_total` | Counter | reason(startup_lease_expired·request_lease_expired·shutdown) | 건 |
 | `persona_chat_lease_heartbeat_failures_total` | Counter | 없음 | 건 |
 | `persona_chat_time_to_first_token_seconds` | Histogram | 없음 | 초 |
+| `persona_chat_mock_workload_info` | Info(gauge=1) | profile, fragment_count, fragment_interval_seconds | — |
 | `persona_chat_generation_seconds` | Histogram | 없음 | 초 |
 | `persona_retrieval_seconds` | Histogram | kind_group | 초 |
 

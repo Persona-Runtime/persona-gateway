@@ -28,7 +28,7 @@ ServiceMonitor/PodMonitor·대시보드는 persona-platform 쪽 별도 작업이
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Histogram, Info
 
 GENERATIONS_STARTED = Counter(
     "persona_chat_generations_started_total",
@@ -98,4 +98,11 @@ GENERATIONS_RECLAIMED = Counter(
 LEASE_HEARTBEAT_FAILURES = Counter(
     "persona_chat_lease_heartbeat_failures_total",
     "generation lease 연장(heartbeat)에 실패한 횟수",
+)
+
+# mock 모드에서 실제로 적용된 응답 모양. 실험 기록(loadgen --workload-profile)이 배포 설정과
+# 같은지 대조하는 용도다. 조각(fragment)은 LLM token이 아니다. llm 모드에서는 기록하지 않는다.
+MOCK_WORKLOAD = Info(
+    "persona_chat_mock_workload",
+    "mock 모드에 적용된 응답 profile(조각 수·조각 간격). LLM token 수가 아니다",
 )

@@ -1,9 +1,12 @@
 # generation 소유권 lease (G-1)
 
-상태(2026-09-25): **코드 구현과 로컬 검증까지 했다. 커밋·이미지·migration 적용·배포는 하지
-않았다.** 이 브랜치는 배포 순서의 1단계인 **bridge 릴리스**다(3절). 아래 "이전 동작"은
-develop(`b35c9b8`)까지의 동작이고, "적용된 동작"은 이 브랜치
-(`feat/generation-ownership-lease`)의 동작이다. "미구현"은 아직 없는 것이다.
+상태(2026-09-25): bridge 릴리스(PR #19, `6fe5200`)가 운영에 배포됐고 migration Job
+`0005_generation_lease`가 Complete됐다(운영 확인은 사용자 제공 사실). 이 브랜치
+(`release/gateway-0005-only`)는 배포 순서의 3단계인 **기능 릴리스**다 — 0005만 허용한다(3절).
+같은 브랜치에 mock workload profile(G-2, `PERSONA_CHAT_MOCK_PROFILE`)도 들어 있어 이 이미지 하나로
+노드 장애·롤아웃 실험의 긴 SSE를 재현할 수 있다(README "mock" 절). 이미지 게시·배포는 아직 하지
+않았다. 아래 "이전 동작"은 develop(`b35c9b8`)까지의 동작이고, "적용된
+동작"은 G-1 이후의 동작이다. "미구현"은 아직 없는 것이다.
 
 ## 1. 이전 동작과 문제
 
@@ -129,7 +132,7 @@ lease보다 길게 이어짐)에는 회수 뒤 그 소유자의 `finish_generati
 회수는 terminal이 아니므로 `generations_finished_total`에 넣지 않고, `stream_disconnects_total`과도
 섞지 않는다. 연장 실패 로그에는 예외 타입만 남긴다.
 
-## 3. migration·배포 순서 (아직 실행하지 않음)
+## 3. migration·배포 순서 (1·2단계 완료, 3단계 = 이 브랜치)
 
 "허용 revision만 넓힌 호환 이미지"는 안전하지 않다 — develop 코드에는 기동 시 전역 reconcile이
 남아 있어, 그 이미지를 롤링하는 순간 1절의 스트림 중단이 migration 단계에서 재발한다. 그래서 첫
@@ -139,19 +142,16 @@ lease보다 길게 이어짐)에는 회수 뒤 그 소유자의 `finish_generati
 
 | 단계 | 이미지·작업 | `SUPPORTED_ALEMBIC_REVISIONS` | 비고 | 순서를 어기면 |
 | --- | --- | --- | --- | --- |
-| 1 | **bridge 릴리스 = 이 브랜치** | `("0004_chat", "0005_generation_lease")` | 전역 reconcile 없음. lease 컬럼 존재를 스스로 판정 | develop 이미지로 곧장 migration하면 전역 reconcile이 남아 롤링 중 스트림이 끊긴다 |
-| 2 | migration Job `0005_generation_lease` | — | 컬럼·인덱스 추가. **grants 변경 없음** | — |
-| 3 | 기능 릴리스(후속 한 줄 커밋) | `("0005_generation_lease",)` | 0005 적용·검증 뒤 좁히기. 판정 함수는 호환 창 도구로 남긴다 | 2보다 먼저 배포하면 새 Pod가 NotReady라 롤아웃이 멈춘다 |
-| 4 | persona-platform: Gateway replica 2·PDB·worker 분산 | — | 구현하지 않음(ROLL-01B 전제) | G-1이 배포되기 전에 하면 새 Pod 기동마다 진행 중 스트림이 끊긴다 |
+| 1 | bridge 릴리스(PR #19, `6fe5200`) — **운영 배포됨** | `("0004_chat", "0005_generation_lease")` | 전역 reconcile 없음. lease 컬럼 존재를 스스로 판정 | develop 이미지로 곧장 migration하면 전역 reconcile이 남아 롤링 중 스트림이 끊긴다 |
+| 2 | migration Job `0005_generation_lease` — **Complete** | — | 컬럼·인덱스 추가. **grants 변경 없음** | — |
+| 3 | **기능 릴리스 = 이 브랜치** | `("0005_generation_lease",)` | 0005 적용·확인 뒤 좁히기. 판정 함수·0004 분기는 호환 창 도구로 남긴다 | 2보다 먼저 배포하면 새 Pod가 NotReady라 롤아웃이 멈춘다 |
+| 4 | persona-platform: Gateway replica 2·PDB·worker 분산 | — | platform 브랜치 `release/gateway-ha-after-0005`(미배포) | G-1이 배포되기 전에 하면 새 Pod 기동마다 진행 중 스트림이 끊긴다 |
 
-기능 릴리스의 diff(3단계, 아직 만들지 않음):
+3단계에서 바뀌는 것은 허용 목록뿐이다. 0004 DB에서 이 이미지는 기동은 하지만(lifespan은 lease 컬럼
+부재로 crash하지 않는다) readyz가 503이라 트래픽을 받지 않고, 롤링 업데이트는 새 Pod가 Ready가 되지
+않아 멈춘다(`maxUnavailable: 0`이므로 기존 Pod는 그대로 남는다).
 
-```diff
--SUPPORTED_ALEMBIC_REVISIONS = ("0004_chat", "0005_generation_lease")
-+SUPPORTED_ALEMBIC_REVISIONS = ("0005_generation_lease",)
-```
-
-### bridge의 두 모드
+### bridge의 두 모드 (창 종료 뒤에는 0004 = NotReady)
 
 lease 컬럼 판정(`repository.lease_schema_ready`)은 alembic 마커가 아니라 **시스템 카탈로그로 컬럼
 실재**를 본다 — 쓰려는 것이 그 컬럼이고, 카탈로그 조회는 MVCC라 migration 중의 테이블 잠금을
@@ -163,7 +163,7 @@ DDL은 트랜잭션이라 컬럼은 migration 커밋 순간 한꺼번에 보인�
 
 | 동작 | 0004(컬럼 없음) | 0005(컬럼 있음) |
 | --- | --- | --- |
-| Ready | 200 | 200 |
+| Ready | bridge: 200 / **기능 릴리스: 503** | 200 |
 | 소유자·lease 기록 | 하지 않음(INSERT는 이전과 같음) | 접수·running 전이·retry와 같은 트랜잭션에서 기록 |
 | heartbeat | DB를 건드리지 않음, 실패 메트릭 0 | lease 연장 + cancel 전달 |
 | 기동·요청 시 회수 | 소유자 없는 행 규칙만: `heartbeat_at` 240초 경과. **전역 reconcile 없음** | 만료 lease + 소유자 없는 행 규칙 |
@@ -176,8 +176,9 @@ DDL은 트랜잭션이라 컬럼은 migration 커밋 순간 한꺼번에 보인�
 
 ### 롤백 (이미지만, DB는 0005 유지)
 
-이미지 롤백의 목적지는 bridge 이미지다(DB가 0005여도 Ready이고 lease를 인식한다). 그래서 기능 →
-bridge 롤백 중에도 살아 있는 스트림은 끊기지 않는다. develop 이전 이미지(0004만 허용)는 0005 DB에서
+이미지 롤백의 목적지는 bridge 이미지(`sha256:26dcf9e0…`)다(DB가 0005여도 Ready이고 lease를
+인식한다). 그래서 기능 → bridge 롤백 중에도 살아 있는 스트림은 끊기지 않는다. 반대로 기능 릴리스는
+0004 DB에서 Ready가 되지 않으므로, DB를 0004로 되돌린 환경의 목적지가 될 수 없다. develop 이전 이미지(0004만 허용)는 0005 DB에서
 Ready가 되지 않으므로 이미지 롤백의 목적지가 될 수 없다. DB까지 되돌려야 하는 경우는 아래 절을 따른다.
 
 ### 0005 downgrade 금지 조건
@@ -214,9 +215,11 @@ DB 호환을 보장하는 장치가 아니다.
 - 다른 인스턴스로 온 cancel이 소유자 스트림을 조기 종료, retry 소유자 = 받은 인스턴스
 - 요청 시 회수 + 300초 규칙 유지(최근이면 409, 300초 지났으면 failed 후 접수)
 - migration 0005 왕복(행 보존, 올린 뒤 기존 행은 소유자 NULL)
-- **bridge**: 물리적으로 0004인 DB에서 기동·Ready, heartbeat 실패 0, 전역 reconcile 없음(최근 소유자
-  없는 행 유지, 240초 지난 행만 회수), lease 없이 접수 → 앱을 켠 채 0005 적용 → 다음 접수가
-  소유자·lease 기록, Ready 유지
+- **기능 릴리스 on 물리 0004**: 기동은 하되 readyz 503, lease 컬럼 판정 False, heartbeat 실패 0, 전역
+  reconcile 없음(최근 소유자 없는 행 유지, 240초 지난 행만 회수) → 앱을 켠 채 0005 적용 → 재시작 없이
+  readyz 200, 판정 True, 다음 접수가 소유자·lease 기록(bridge 기간의 "0004에서 Ready·lease 없이 접수"
+  검증은 PR #19에서 했고, 이 브랜치에서는 0004가 NotReady인 것으로 바뀌었다)
+- readiness: 0005만 200, 0004·0003 이하·모르는 값 503
 - **idempotency 순서**: 같은 키 replay·충돌이 만료 행과 회수 메트릭을 바꾸지 않음(completion·retry),
   새 키 요청만 회수, 같은 키 동시 두 요청은 생성 1건 + replay 1건
 - readyz가 alembic_version 잠금 중에도 제한 시간 안에 503(기동 회수가 잠금을 기다리지 않음)
@@ -226,7 +229,8 @@ DB 호환을 보장하는 장치가 아니다.
 
 미구현·미검증:
 
-- 실제 두 Pod, Argo 롤아웃, 실제 migration Job 적용, bridge·기능 릴리스 이미지
-- persona-platform replica 2·PDB·분산 변경(ROLL-01B 전제, 구현하지 않음)
+- 실제 두 Pod, Argo 롤아웃, 기능 릴리스 이미지 빌드·게시(migration Job 적용과 bridge 운영은 사용자
+  확인 사실이며 이 문서에서 재검증하지 않았다)
+- persona-platform replica 2·PDB·분산 변경의 실제 적용(platform 브랜치에 커밋만 있음)
 - 브라우저 재연결(Web)과 생성 이어받기 — 계약상 없음
 - 연결 종료·회수 시 GPU(vLLM) 생성 취소 — 연결 종료는 취소가 아니라는 결정을 유지
