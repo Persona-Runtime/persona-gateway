@@ -118,8 +118,9 @@ timeout`이어야 하며 아니면 기동이 실패한다. 이 코드는 lease �
 Ready이고, 0004에서는 lease 없이(전역 reconcile 없이) 동작하다가 migration이 적용되면 재시작 없이
 lease를 켠다. 설계·종료 유형별 전이·배포 순서(bridge → migration `0005_generation_lease` → 0005만
 허용하는 기능 릴리스 → replica 2)는
-[api/generation-ownership-lease-design.md](api/generation-ownership-lease-design.md). 실제 두 Pod와
-migration 적용은 아직 검증하지 않았다.
+[api/generation-ownership-lease-design.md](api/generation-ownership-lease-design.md). 이 순서는 필수이며,
+**0005 컬럼을 지우는 DB downgrade는 lease-aware Gateway가 실행 중일 때 하지 않는다**(설계 문서 3절 —
+bridge는 확장 방향만 운영 중 전환을 보장한다). 실제 두 Pod와 migration 적용은 아직 검증하지 않았다.
 
 설계 판단(2026-09-25): 연결 종료는 vLLM 취소가 아니므로 브라우저가 사라져도 GPU 생성은
 계속될 수 있다. DB는 `reconciling`으로 남고 사용자 슬롯은 300초 뒤 다음 요청에서야 정리된다.

@@ -135,12 +135,14 @@ lease보다 길게 이어짐)에는 회수 뒤 그 소유자의 `finish_generati
 남아 있어, 그 이미지를 롤링하는 순간 1절의 스트림 중단이 migration 단계에서 재발한다. 그래서 첫
 단계는 **lease 스키마를 인식하는 bridge 이미지**다.
 
-| 단계 | 이미지·작업 | `SUPPORTED_ALEMBIC_REVISIONS` | 비고 |
-| --- | --- | --- | --- |
-| 1 | **bridge 릴리스 = 이 브랜치** | `("0004_chat", "0005_generation_lease")` | 전역 reconcile 없음. lease 컬럼 존재를 스스로 판정 |
-| 2 | migration Job `0005_generation_lease` | — | 컬럼·인덱스 추가. **grants 변경 없음** |
-| 3 | 기능 릴리스(후속 한 줄 커밋) | `("0005_generation_lease",)` | 0005 적용·검증 뒤 좁히기. 판정 함수는 호환 창 도구로 남긴다 |
-| 4 | persona-platform: Gateway replica 2·PDB·분산 | — | 구현하지 않음(ROLL-01B 전제) |
+**아래 순서는 필수다. 단계를 건너뛰거나 바꾸지 않는다.**
+
+| 단계 | 이미지·작업 | `SUPPORTED_ALEMBIC_REVISIONS` | 비고 | 순서를 어기면 |
+| --- | --- | --- | --- | --- |
+| 1 | **bridge 릴리스 = 이 브랜치** | `("0004_chat", "0005_generation_lease")` | 전역 reconcile 없음. lease 컬럼 존재를 스스로 판정 | develop 이미지로 곧장 migration하면 전역 reconcile이 남아 롤링 중 스트림이 끊긴다 |
+| 2 | migration Job `0005_generation_lease` | — | 컬럼·인덱스 추가. **grants 변경 없음** | — |
+| 3 | 기능 릴리스(후속 한 줄 커밋) | `("0005_generation_lease",)` | 0005 적용·검증 뒤 좁히기. 판정 함수는 호환 창 도구로 남긴다 | 2보다 먼저 배포하면 새 Pod가 NotReady라 롤아웃이 멈춘다 |
+| 4 | persona-platform: Gateway replica 2·PDB·worker 분산 | — | 구현하지 않음(ROLL-01B 전제) | G-1이 배포되기 전에 하면 새 Pod 기동마다 진행 중 스트림이 끊긴다 |
 
 기능 릴리스의 diff(3단계, 아직 만들지 않음):
 
@@ -154,7 +156,8 @@ lease보다 길게 이어짐)에는 회수 뒤 그 소유자의 `finish_generati
 lease 컬럼 판정(`repository.lease_schema_ready`)은 alembic 마커가 아니라 **시스템 카탈로그로 컬럼
 실재**를 본다 — 쓰려는 것이 그 컬럼이고, 카탈로그 조회는 MVCC라 migration 중의 테이블 잠금을
 기다리지 않는다. `owner_instance_id`·`lease_expires_at` **둘 다** 있을 때만 준비됐다고 본다 — 수동
-DDL·부분 복구·스키마 drift로 하나만 남은 DB에서 lease 모드로 들어가면 없는 컬럼을 써서 500이 된다. `ChatStore`는 한 번 True를 확인하면 고정하고, False인 동안은 매번 다시 본다 —
+DDL·부분 복구·스키마 drift로 하나만 남은 DB에서 lease 모드로 들어가면 없는 컬럼을 써서 500이 된다.
+`ChatStore`는 한 번 True를 확인하면 고정하고, False인 동안은 매번 다시 본다 —
 bridge가 떠 있는 중에 migration이 적용되면 **재시작 없이** 다음 요청부터 lease를 쓴다(PostgreSQL
 DDL은 트랜잭션이라 컬럼은 migration 커밋 순간 한꺼번에 보인다).
 
@@ -171,12 +174,27 @@ DDL은 트랜잭션이라 컬럼은 migration 커밋 순간 한꺼번에 보인�
 0004 모드에서 살아 있는 스트림이 240초 규칙에 걸리지 않는 이유: 생성 전체 한도가 180초라 활성
 행의 `heartbeat_at`(접수 또는 running 전이 시각)은 그보다 오래될 수 없다.
 
-### 롤백
+### 롤백 (이미지만, DB는 0005 유지)
 
-롤백 목적지는 bridge 이미지다(DB가 0005여도 Ready이고 lease를 인식한다). 그래서 기능 → bridge
-롤백 중에도 살아 있는 스트림은 끊기지 않는다. bridge 자체를 develop 이전 이미지로 되돌리는 경우에만
-전역 reconcile이 돌아온다 — 그 이미지는 0005 DB에서 Ready가 되지 않으므로 DB를 먼저 0004로
-되돌려야 하고, 그 교체에서는 1절의 영향이 다시 생긴다.
+이미지 롤백의 목적지는 bridge 이미지다(DB가 0005여도 Ready이고 lease를 인식한다). 그래서 기능 →
+bridge 롤백 중에도 살아 있는 스트림은 끊기지 않는다. develop 이전 이미지(0004만 허용)는 0005 DB에서
+Ready가 되지 않으므로 이미지 롤백의 목적지가 될 수 없다. DB까지 되돌려야 하는 경우는 아래 절을 따른다.
+
+### 0005 downgrade 금지 조건
+
+**lease-aware Gateway(bridge·기능 릴리스)가 하나라도 실행 중일 때 `0005_generation_lease`를
+downgrade하지 않는다.** bridge는 확장 방향(0004 → 0005)을 운영 중에 안전하게 넘기는 장치이지, 역방향
+DB 호환을 보장하는 장치가 아니다.
+
+- 이유: `ChatStore`는 lease 컬럼을 한 번 확인하면 True로 고정한다(운영 중 downgrade는 지원 범위 밖이라
+  의도한 설계다). 실행 중에 컬럼이 사라지면 접수의 소유자 기록·heartbeat 연장·회수 쿼리가 없는 컬럼을
+  참조해 실패한다.
+- 부득이하게 DB를 0004로 되돌려야 하면 **서비스 중단을 감수하는** 순서로 한다(사람이 수행):
+  1. Gateway를 0개로 줄여 lease-aware 프로세스를 모두 멈춘다.
+  2. `0005_generation_lease` downgrade Job을 실행한다.
+  3. 0004를 허용하는 이미지로 다시 띄운다 — 새로 뜬 bridge는 0004 모드로 시작하고, develop 이전
+     이미지도 가능하다(이 경우 전역 기동 reconcile이 돌아온다).
+- 1을 건너뛰고 2를 하면 실행 중인 Pod의 채팅 요청이 실패한다. 이 순서의 실행 명령은 이 문서에 적지 않는다.
 
 기동 회수는 best-effort다 — DB가 느리거나 잠겨 있어 실패하면 기동은 계속하고(readyz가 상태를
 알린다), 회수는 그 사용자의 다음 요청이나 다음 기동이 이어받는다.
