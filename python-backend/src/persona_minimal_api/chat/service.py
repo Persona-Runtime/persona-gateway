@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Generator, Iterator
 from uuid import UUID
 
 from psycopg.rows import dict_row
@@ -41,6 +41,19 @@ MAX_ANSWER_TOKENS = 512
 # 작게(예: 0.05초) 오버라이드해 실제로 60~180초를 기다리지 않고 판정 로직을 검증한다.
 FIRST_TOKEN_DEADLINE_SECONDS = 60.0
 TOTAL_GENERATION_DEADLINE_SECONDS = 180.0
+# 클라이언트 연결 종료를 확인하는 간격(초). 대기 루프는 업스트림 조각을 큐에서 기다리는데,
+# 외부에서 그 큐에 "연결 종료" 표시를 밀어 넣으려면 큐 소유 구조를 크게 바꿔야 한다. 대신
+# 이 간격으로 깨어나 client_gone을 확인한다 — 연결 종료 뒤 reconciling 전환까지의 지연
+# 상한이 이 값이 된다. 깨어나는 비용은 큐 대기 한 번이라 무시할 만하다.
+CLIENT_GONE_POLL_SECONDS = 0.1
+
+
+class ClientGone(Exception):
+    """응답을 소유한 쪽(chat/sse_stream.py)이 클라이언트 연결 종료를 알렸다.
+
+    대기 루프에서 던지고 stream_generation이 받아 reconciling으로 남긴 뒤 제너레이터를
+    정상 종료한다. 실패가 아니므로 finished 카운터·failed 저장 경로를 타지 않는다.
+    """
 
 
 class InvalidQuestion(Exception):
@@ -155,15 +168,24 @@ def stream_generation(
     inference_client: InferenceClient,
     first_token_deadline_seconds: float = FIRST_TOKEN_DEADLINE_SECONDS,
     total_deadline_seconds: float = TOTAL_GENERATION_DEADLINE_SECONDS,
-) -> Iterator[str]:
+    client_gone: threading.Event | None = None,
+) -> Generator[str, None, None]:
     """6단계(검색 → citations → delta* → done/error)를 SSE 문자열로 돌린다.
 
     DB에 완료 상태를 먼저 저장하고 그다음 done/error를 보낸다(feedback.md 명시
     순서) — 클라이언트가 done을 본 시점엔 이미 DB에서도 같은 상태를 볼 수 있다.
 
-    클라이언트가 스트림 도중 연결을 끊으면 Starlette가 이 제너레이터에
-    `GeneratorExit`을 던진다 — "프로세스가 안 죽었어도 결과를 모른다"를 그대로
-    반영해 reconciling으로 남긴다(연결 종료만으로 슬롯을 즉시 해제하지 않는다).
+    클라이언트가 스트림 도중 연결을 끊으면 reconciling으로 남긴다 — "프로세스가 안
+    죽었어도 결과를 모른다"를 그대로 반영한다(연결 종료만으로 슬롯을 즉시 해제하지
+    않는다). 연결 종료는 두 경로로 들어온다.
+    - yield에 멈춰 있을 때: 응답 소유자가 `close()`를 불러 `GeneratorExit`.
+    - 업스트림 조각을 기다리는 중일 때: 응답 소유자가 `client_gone`을 세우면 대기 루프가
+      CLIENT_GONE_POLL_SECONDS 안에 알아채 `ClientGone`.
+    - 검색·embedding·DB 같은 동기 선행 호출 중일 때: 그 호출은 client_gone을 보지 않는다.
+      호출이 반환하거나 timeout된 뒤 다음 yield에서 위 첫 경로로 닫힌다(즉시가 아니다).
+    Starlette는 연결 종료 시 sync 제너레이터를 닫아 주지 않는다(GC 때에야 닫힌다). 그래서
+    실제 route는 chat/sse_stream.GenerationStreamResponse로 이 제너레이터를 소유해 닫는다.
+    client_gone이 None이면(직접 호출하는 테스트) 두 번째 경로만 없다.
     meta를 보내는 시점부터 이미 이 처리가 필요하다 — meta 직후(첫 delta조차 오기
     전에) 끊기는 것도 "결과를 모르는" 경우이므로, try는 meta yield까지 감싼다.
     """
@@ -190,10 +212,16 @@ def stream_generation(
             first_token_deadline_seconds=first_token_deadline_seconds,
             total_deadline_seconds=total_deadline_seconds,
             start=start,
+            client_gone=client_gone,
         )
     except GeneratorExit:
-        chat_store.mark_generation_reconciling(generation.id)
+        _record_client_disconnect(chat_store, generation)
         raise
+    except ClientGone:
+        # 업스트림을 기다리던 중 연결이 끊겼다. 업스트림 요청은 닫지 않는다 — 연결 종료는
+        # 취소가 아니며, 업스트림은 자연 종료나 adapter timeout으로 끝난다(README 채팅 업스트림).
+        _record_client_disconnect(chat_store, generation)
+        return
     except Exception as error:
         # 마지막 안전망이다 — `_run_generation` 내부의 구체적인 except들(검색
         # 단계 예외, UpstreamError)이 예상하지 못한 나머지 전부를 잡는다. 이게
@@ -214,6 +242,16 @@ def stream_generation(
         yield _terminal_event(persisted, fallback_finish_reason="stop")
 
 
+def _record_client_disconnect(chat_store: ChatStore, generation: Generation) -> None:
+    """연결 종료를 reconciling으로 남기고, 실제로 상태가 바뀐 경우에만 센다.
+
+    done/error를 이미 DB에 저장한 뒤 닫히면 UPDATE가 행을 바꾸지 않아 disconnect가 아니다.
+    finished 카운터에도 넣지 않는다 — 결과를 모르는 상태이지 terminal이 아니다.
+    """
+    if chat_store.mark_generation_reconciling(generation.id):
+        metrics.STREAM_DISCONNECTS.labels(mode=generation.mode).inc()
+
+
 def _run_generation(
     *,
     pool: ConnectionPool,
@@ -227,6 +265,7 @@ def _run_generation(
     first_token_deadline_seconds: float,
     total_deadline_seconds: float,
     start: float,
+    client_gone: threading.Event | None,
 ) -> Iterator[str]:
     try:
         if generation.input_snapshot is not None:
@@ -323,9 +362,18 @@ def _run_generation(
                 first_token_deadline_seconds if first_chunk_at is None else total_deadline_seconds
             )
             remaining = max(0.0, deadline - (now - start))
+            wait_seconds = (
+                remaining if client_gone is None else min(remaining, CLIENT_GONE_POLL_SECONDS)
+            )
             try:
-                kind, payload = chunk_queue.get(timeout=remaining)
+                kind, payload = chunk_queue.get(timeout=wait_seconds)
             except queue.Empty:
+                # 연결 종료를 deadline보다 먼저 본다 — 끊긴 뒤 한도에 걸린 것을 timeout
+                # 실패로 저장하면 "결과를 모른다"가 아니라 "실패했다"로 잘못 기록된다.
+                if client_gone is not None and client_gone.is_set():
+                    raise ClientGone from None
+                if time.monotonic() - start < deadline:
+                    continue  # 짧게 깨어난 것뿐이다. 아직 한도 안이다.
                 inference_client.cancel(generation.id)
                 terminal_status = "failed"
                 failure_code = (

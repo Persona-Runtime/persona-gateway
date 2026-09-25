@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import logging
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
@@ -10,7 +11,7 @@ from uuid import UUID, uuid4
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 from psycopg import Error as PsycopgError
@@ -32,6 +33,7 @@ from .chat.repository import (
     IdempotencyConflict as ChatIdempotencyConflict,
     RetryNotAllowed,
 )
+from .chat.sse_stream import GenerationStreamResponse
 from .config import Settings
 from .cursor import (
     ConversationCursor,
@@ -1127,6 +1129,7 @@ def create_app(
                 )
                 persona_id = cur.fetchone()[0]
 
+        client_gone = threading.Event()
         generator = chat_service.stream_generation(
             pool=request.app.state.store.pool,
             embedding_url=request.app.state.settings.embedding_url,
@@ -1136,9 +1139,12 @@ def create_app(
             generation=accepted.generation,
             question=question,
             inference_client=request.app.state.inference_client,
+            client_gone=client_gone,
         )
-        return StreamingResponse(
+        # 제너레이터를 응답이 소유해 연결이 끝나면 바로 닫는다(chat/sse_stream.py 참고).
+        return GenerationStreamResponse(
             generator,
+            client_gone,
             media_type="text/event-stream",
             headers=_stream_headers(request.state.request_id),
         )
@@ -1189,6 +1195,7 @@ def create_app(
                 persona_id = cur.fetchone()[0]
         question = accepted.generation.input_snapshot.question  # type: ignore[union-attr]
 
+        client_gone = threading.Event()
         generator = chat_service.stream_generation(
             pool=request.app.state.store.pool,
             embedding_url=request.app.state.settings.embedding_url,
@@ -1198,9 +1205,12 @@ def create_app(
             generation=accepted.generation,
             question=question,
             inference_client=request.app.state.inference_client,
+            client_gone=client_gone,
         )
-        return StreamingResponse(
+        # 제너레이터를 응답이 소유해 연결이 끝나면 바로 닫는다(chat/sse_stream.py 참고).
+        return GenerationStreamResponse(
             generator,
+            client_gone,
             media_type="text/event-stream",
             headers=_stream_headers(request.state.request_id),
         )

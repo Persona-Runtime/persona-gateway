@@ -92,8 +92,23 @@ scripts/local-stack.sh down
 
 취소가 보장하는 것은 **Gateway가 업스트림 응답 스트림을 닫고 generation 상태를 정리하는
 것**까지다. vLLM 쪽 모델 연산이 즉시 멈추는지는 보장하지 않는다. 브라우저가 연결을 끊는
-경우는 취소가 아니라 `reconciling`으로 남으므로, 시간 예산이 만료될 때까지 업스트림
-연결이 유지된다.
+경우는 취소가 아니라 `reconciling`으로 남으므로, 업스트림 요청은 닫지 않는다 — 업스트림이
+스스로 끝나거나 adapter timeout에 걸릴 때까지 이어진다.
+
+연결 종료를 generation 상태로 옮기는 것은 응답(`chat/sse_stream.py`)이 맡는다. 응답이 스트림
+제너레이터를 소유해 가비지 컬렉션을 기다리지 않고 직접 정리하며, 전환 시점은 연결이 끊긴
+순간 제너레이터가 어디에 있었는지에 따라 다르다.
+
+- 업스트림 스트림 대기 중 연결 종료는 0.1초 주기로 감지해 `reconciling`으로 전환한다.
+- 검색·embedding 등 동기 선행 호출 중 종료는 해당 호출이 반환하거나 timeout될 때 전환한다.
+- done/error를 이미 저장한 뒤의 종료는 상태를 바꾸지 않는다.
+
+슬롯 규칙(reconciling은 300초 뒤 다음 요청에서 정리)은 그대로다.
+
+설계 판단(2026-09-25): 연결 종료는 vLLM 취소가 아니므로 브라우저가 사라져도 GPU 생성은
+계속될 수 있다. DB는 `reconciling`으로 남고 사용자 슬롯은 300초 뒤 다음 요청에서야 정리된다.
+GPU 한 장 환경에서는 이 "보이지 않는 생성"이 GPU를 얼마나 점유하는지가 중요하므로,
+`client_disconnected` 이후의 업스트림 생성 시간과 토큰 수를 다음 계측 항목으로 둔다(미구현).
 
 ## 메트릭
 
@@ -109,6 +124,7 @@ label에는 route 템플릿·method·상태 코드·결과처럼 가짓수가 �
 | `persona_gateway_build_info` | Info(gauge=1) | version, revision | — |
 | `persona_chat_generations_started_total` | Counter | mode | 건 |
 | `persona_chat_generations_finished_total` | Counter | mode, terminal_reason | 건 |
+| `persona_chat_stream_disconnects_total` | Counter | mode | 건 |
 | `persona_chat_time_to_first_token_seconds` | Histogram | 없음 | 초 |
 | `persona_chat_generation_seconds` | Histogram | 없음 | 초 |
 | `persona_retrieval_seconds` | Histogram | kind_group | 초 |
@@ -129,6 +145,9 @@ label에는 route 템플릿·method·상태 코드·결과처럼 가짓수가 �
 - HTTP 지연 버킷은 짧은 API와 채팅 한도(60·180초)를 구분하도록 0.005초에서 300초까지다.
 - 채팅 histogram은 기본 버킷(상한 10초)에서 0.1~180초 버킷으로 바꿨다. 버킷 경계가
   달라졌으므로 이 변경 이전 수집분과 `_bucket`을 섞어 비교하지 않는다.
+- `persona_chat_stream_disconnects_total`은 연결 종료로 generation이 **실제로**
+  reconciling으로 바뀐 경우만 센다(UPDATE가 행을 바꾼 경우). 이미 완료·실패·취소가 저장된
+  뒤 닫힌 스트림은 세지 않는다. 전환 시점은 위 "채팅 업스트림"의 연결 종료 설명과 같다.
 - TTFT는 스트림 시작부터 사용자 텍스트가 담긴 첫 `delta`까지다. meta·citations는 TTFT가
   아니며, 검색 시간은 포함된다.
 - `revision`은 이미지 빌드 인자로 넣는다. Git hash 형식이 아니면 `unknown`이다.
