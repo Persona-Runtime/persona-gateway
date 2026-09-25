@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
 from collections.abc import Iterator
@@ -85,11 +86,14 @@ class VllmInferenceClient:
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._first_token_timeout = first_token_timeout_seconds
         self._idle_timeout = idle_timeout_seconds
-        # httpx의 read timeout은 "바이트가 오지 않는 시간"이다. 아래에서 직접 재는 두
-        # 한도는 "content 조각이 오지 않는 시간"이라 역할이 다르다 — keepalive가 계속
-        # 오면 직접 재는 쪽만 반응하고, 서버가 완전히 침묵하면 iter_lines()가 블록돼
-        # 직접 재는 쪽이 돌 기회조차 없으므로 httpx 쪽만 반응한다. 둘 다 필요하다.
-        # 값은 두 한도 중 큰 쪽으로 둬서 socket timeout이 먼저 터지지 않게 한다.
+        # 두 한도를 실제로 집행하는 것은 아래 _tokens의 queue 대기다(reader 스레드 구조).
+        # 이 socket read timeout은 그게 실패하는 경우의 **백스톱**이다 — 한도 초과 때
+        # response.close()로 reader를 풀어 주는데, 그 close가 읽기를 깨우지 못하면
+        # daemon 스레드가 소켓을 쥔 채 남기 때문이다.
+        #
+        # 값이 두 한도 중 **큰 쪽**이어야 한다. 작은 쪽으로 잡으면 첫 토큰을 기다리는
+        # 정상 상황(기본 60초)을 idle 값(기본 30초)이 먼저 끊어 버린다. 반대로 크게 잡아도
+        # 이제는 idle 한도가 늦어지지 않는다 — queue 대기가 그것을 따로 재기 때문이다.
         socket_read_timeout = max(first_token_timeout_seconds, idle_timeout_seconds)
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(
@@ -107,7 +111,25 @@ class VllmInferenceClient:
     def start(
         self, generation_id: UUID, messages: list[Message], *, max_tokens: int
     ) -> Iterator[str]:
+        """제너레이터가 아니라 보통 함수다 — 등록을 **호출 시점에** 끝내야 한다.
+
+        제너레이터로 두면 `_register()`가 첫 `next()`까지 밀린다. 서비스는 `start()`를 부른
+        뒤 워커 스레드에서 iteration하므로 그 사이에 취소·시간 초과가 올 수 있고, 그때
+        `cancel()`은 등록되지 않은 attempt를 찾지 못해 조용히 아무것도 하지 않는다.
+
+        전제 하나: 돌려준 이터레이터를 **한 번도 돌리지 않으면** 아래 `finally`가 실행되지
+        않아 `_attempts` 항목이 남는다. 서비스는 항상 돌리므로 실제 경로에는 없다.
+        """
         attempt = self._register(generation_id)
+        return self._iterate(generation_id, attempt, messages, max_tokens)
+
+    def _iterate(
+        self,
+        generation_id: UUID,
+        attempt: _Attempt,
+        messages: list[Message],
+        max_tokens: int,
+    ) -> Iterator[str]:
         try:
             yield from self._stream(attempt, messages, max_tokens)
         finally:
@@ -129,12 +151,10 @@ class VllmInferenceClient:
         attempt.cancelled.set()
         response = attempt.response
         if response is None:
+            # 아직 요청을 보내지 않았다 — 플래그만 세워 두면 _stream이 보내기 전에 멈춘다.
             return
-        try:
-            response.close()
-        except Exception as error:  # noqa: BLE001 - 닫기 실패가 취소를 막으면 안 된다
-            # 이미 닫혔거나 닫는 중일 수 있다. 취소는 멱등이므로 실패로 만들지 않는다.
-            logger.debug("upstream 응답 닫기 실패(%s)", type(error).__name__)
+        # 이미 닫혔거나 닫는 중일 수 있다. 취소는 멱등이므로 실패로 만들지 않는다.
+        self._close_quietly(response)
 
     def close(self) -> None:
         """앱 종료 시 HTTP 연결 풀을 정리한다."""
@@ -162,6 +182,9 @@ class VllmInferenceClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if attempt.cancelled.is_set():
+            # 요청을 보내기 전에 이미 취소됐다 — 헛 호출을 하지 않고 끝낸다(예외 아님).
+            return
         started = time.monotonic()
         try:
             with self._client.stream(
@@ -195,14 +218,61 @@ class VllmInferenceClient:
             raise UpstreamError(OUTCOME_UNAVAILABLE) from error
 
     def _tokens(self, attempt: _Attempt, response: httpx.Response, started: float) -> Iterator[str]:
-        """SSE 줄을 토큰으로 바꾼다. `[DONE]`이 정상 종료의 유일한 표시다."""
+        """SSE 줄을 토큰으로 바꾼다. `[DONE]`이 정상 종료의 유일한 표시다.
+
+        줄을 읽는 일은 **별도 daemon 스레드**가 하고, 이 함수는 queue에서 받는다.
+        `iter_lines()`를 직접 돌면 서버가 침묵할 때 그 안에서 블록돼 한도를 재는 코드가
+        돌 기회를 얻지 못한다(그래서 idle 30초가 socket timeout 60초까지 늘어졌다).
+        `queue.get(timeout=...)`은 읽기가 막혀 있어도 정확히 그 시각에 돌아온다 —
+        `chat/service.py`가 이 어댑터를 감싸는 방식과 같은 구조다.
+
+        스레드가 generation당 둘(서비스 워커 + 이 reader)로 늘어난다. Gateway replica 1·
+        사용자당 활성 생성 1개라는 현재 계약에서 감당 가능한 수이고, 둘 다 daemon이라
+        프로세스 종료를 막지 않는다.
+        """
+        lines: queue.Queue[tuple[str, object]] = queue.Queue()
+
+        def read_lines() -> None:
+            try:
+                for line in response.iter_lines():
+                    lines.put(("line", line))
+                lines.put(("end", None))
+            except BaseException as error:  # noqa: BLE001 - 소비 측에서 분류한다
+                lines.put(("error", error))
+
+        threading.Thread(target=read_lines, daemon=True).start()
+
         last_token_at = started
-        for line in response.iter_lines():
+        while True:
             if attempt.cancelled.is_set():
                 # 취소 — 남은 조각을 만들지 않고 조용히 끝낸다(예외 아님).
                 return
-            self._check_content_deadline(attempt, started, last_token_at)
-            token = self._token_from_line(line)
+            # 남은 시간을 경과 기준으로 계산한다. 매번 전체 한도를 다시 주면 keepalive가
+            # 쏟아질 때 한도가 영원히 리셋된다.
+            deadline = (
+                last_token_at + self._idle_timeout
+                if attempt.saw_token
+                else started + self._first_token_timeout
+            )
+            try:
+                kind, payload = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                if attempt.cancelled.is_set():
+                    return
+                # 읽기가 막혀 있으므로 응답을 닫아 reader 스레드를 풀어 준다.
+                self._close_quietly(response)
+                code = OUTCOME_IDLE_TIMEOUT if attempt.saw_token else OUTCOME_FIRST_TOKEN_TIMEOUT
+                raise UpstreamError(code) from None
+            if kind == "error":
+                # httpx 예외는 _stream의 except가 분류한다(취소로 닫은 경우도 거기서 걸러진다).
+                raise payload  # type: ignore[misc]  # 항상 예외 객체다(read_lines 참고)
+            if kind == "end":
+                if attempt.cancelled.is_set():
+                    return
+                # [DONE]을 못 본 채 스트림이 끝났다 — upstream이 중간에 끊겼다는 뜻이다.
+                # 여기서 조용히 return하면 서비스가 정상 완료로 기록한다(Protocol 계약).
+                raise UpstreamError(OUTCOME_DISCONNECTED)
+            token = self._token_from_line(str(payload))
             if isinstance(token, _StreamDone):
                 return
             if token is None:
@@ -211,23 +281,13 @@ class VllmInferenceClient:
             attempt.saw_token = True
             last_token_at = time.monotonic()
             yield token
-        if attempt.cancelled.is_set():
-            return
-        # 루프가 예외 없이 끝났는데 [DONE]을 못 봤다 — upstream이 중간에 끊겼다는 뜻이다.
-        # 여기서 조용히 return하면 서비스가 정상 완료로 기록한다(Protocol 계약).
-        raise UpstreamError(OUTCOME_DISCONNECTED)
 
-    def _check_content_deadline(
-        self, attempt: _Attempt, started: float, last_token_at: float
-    ) -> None:
-        """content 조각 기준의 두 한도. socket read timeout과 달리 keepalive로 늘어나지 않는다."""
-        now = time.monotonic()
-        if not attempt.saw_token:
-            if now - started > self._first_token_timeout:
-                raise UpstreamError(OUTCOME_FIRST_TOKEN_TIMEOUT)
-            return
-        if now - last_token_at > self._idle_timeout:
-            raise UpstreamError(OUTCOME_IDLE_TIMEOUT)
+    @staticmethod
+    def _close_quietly(response: httpx.Response) -> None:
+        try:
+            response.close()
+        except Exception as error:  # noqa: BLE001 - 닫기 실패가 원래 오류를 덮으면 안 된다
+            logger.debug("upstream 응답 닫기 실패(%s)", type(error).__name__)
 
     def _token_from_line(self, line: str) -> str | _StreamDone | None:
         """SSE 한 줄에서 토큰을 꺼낸다.

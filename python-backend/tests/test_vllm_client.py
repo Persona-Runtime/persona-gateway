@@ -290,6 +290,53 @@ def test_idle_timeout_between_tokens() -> None:
     assert raised.value.code == "upstream_idle_timeout"
 
 
+def test_idle_timeout_holds_when_the_stream_goes_completely_silent() -> None:
+    """keepalive조차 없는 경우. 분류가 아니라 **시각**을 단정하는 테스트다.
+
+    socket read timeout 하나로만 막으면 그 값이 첫 토큰 한도(여기서 5초)를 따라가므로,
+    idle 한도 0.3초가 아니라 5초 뒤에야 끊긴다. 그때도 분류는 upstream_idle_timeout이라
+    코드만 보면 통과한다 — 그래서 경과 시간을 함께 본다.
+    """
+
+    def respond(request: BaseHTTPRequestHandler) -> None:
+        begin_stream(request)
+        write(request, delta("첫"))
+        # 여기서부터 바이트를 한 개도 보내지 않는다.
+        time.sleep(4.0)
+
+    with running_upstream(respond) as url:
+        client = client_for(url, first_token_timeout_seconds=5.0, idle_timeout_seconds=0.3)
+        iterator = client.start(uuid4(), MESSAGES, max_tokens=8)
+        assert next(iterator) == "첫"
+        started = time.monotonic()
+        with pytest.raises(UpstreamError) as raised:
+            next(iterator)
+        elapsed = time.monotonic() - started
+        client.close()
+
+    assert raised.value.code == "upstream_idle_timeout"
+    assert elapsed < 2.0, f"idle 한도 0.3초가 아니라 {elapsed:.1f}초 뒤에 끊겼다"
+
+
+def test_first_token_timeout_is_not_stretched_by_a_long_idle_timeout() -> None:
+    """거울 사례 — 두 한도가 비대칭일 때 첫 토큰 쪽이 idle 값에 끌려가지 않는지 본다."""
+
+    def respond(request: BaseHTTPRequestHandler) -> None:
+        begin_stream(request)
+        time.sleep(4.0)
+
+    with running_upstream(respond) as url:
+        client = client_for(url, first_token_timeout_seconds=0.3, idle_timeout_seconds=5.0)
+        started = time.monotonic()
+        with pytest.raises(UpstreamError) as raised:
+            collect(client)
+        elapsed = time.monotonic() - started
+        client.close()
+
+    assert raised.value.code == "upstream_first_token_timeout"
+    assert elapsed < 2.0, f"첫 토큰 한도 0.3초가 아니라 {elapsed:.1f}초 뒤에 끊겼다"
+
+
 # --- 7. [DONE] 없는 종료 ---------------------------------------------------
 
 
@@ -360,6 +407,33 @@ def test_cancel_closes_upstream_and_ends_without_exception() -> None:
     # 취소는 실패가 아니다 — 예외 없이 끝나야 한다(Protocol 계약).
     assert raised == []
     assert write_failed.wait(timeout=3.0), "취소가 업스트림 연결을 닫지 않았다"
+
+
+def test_cancel_before_the_first_iteration_is_not_lost() -> None:
+    """start()가 제너레이터면 등록이 첫 next()까지 밀려 이 취소가 유실된다.
+
+    서비스는 start()를 부른 뒤 워커 스레드에서 iteration하므로 그 사이에 취소·시간 초과가
+    올 수 있다. 등록이 호출 시점에 끝나야 cancel()이 이 attempt를 찾는다.
+    """
+    requests: list[str] = []
+
+    def respond(request: BaseHTTPRequestHandler) -> None:
+        requests.append(request.path)
+        begin_stream(request)
+        write(request, delta("보내면 안 되는 조각"))
+        write(request, "data: [DONE]\n\n")
+
+    with running_upstream(respond) as url:
+        client = client_for(url)
+        generation_id = uuid4()
+        iterator = client.start(generation_id, MESSAGES, max_tokens=8)
+        client.cancel(generation_id)
+        # 취소는 실패가 아니다 — 예외 없이 빈 결과로 끝난다.
+        assert list(iterator) == []
+        client.close()
+
+    # 취소가 유실되지 않았다면 업스트림에 요청 자체가 가지 않는다.
+    assert requests == []
 
 
 def test_cancel_is_idempotent_for_unknown_and_finished_generations() -> None:
