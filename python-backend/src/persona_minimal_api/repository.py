@@ -61,20 +61,32 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 지원하지 않는다. 2026-09-22 호환 릴리스가 잠깐 0003·0004 둘 다 넓혔던 것을 다시
 # 하나로 좁힌 것 — 다음 migration을 낼 때 같은 패턴(호환 릴리스로 구·신 둘 다 잠깐
 # 허용했다가, 적용 확인 후 새 revision 하나로 좁히기)을 또 쓴다.
-SUPPORTED_ALEMBIC_REVISIONS = ("0004_chat",)
+# 2026-09-25 bridge 릴리스(G-1 generation 소유권 lease): 0004·0005 둘 다 허용한다.
+# "허용 목록만 넓힌" 호환 이미지로는 부족하다 — develop에는 기동 시 모든 활성 generation을
+# reconciling으로 바꾸는 전역 reconcile이 남아 있어, 그 이미지를 롤링하는 순간 살아 있는
+# SSE가 끊긴다. 그래서 이 이미지는 lease 스키마를 인식한다: 0004에서는 lease 컬럼을 쓰지 않고
+# 소유자 없는 행 규칙(240초 유예)만 쓰며, 0005가 적용되면 재시작 없이 lease를 켠다
+# (lease_schema_ready). 배포 순서: 이 bridge → migration 0005 Job → 기능 릴리스(0005만 허용하도록
+# 좁히기) → replica 2(api/generation-ownership-lease-design.md 3절).
+SUPPORTED_ALEMBIC_REVISIONS = ("0004_chat", "0005_generation_lease")
 # 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 호환 창이
 # 열려 있었을 때(위 SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용하던 동안)
 # 이 목록도 "0003까지는 있다"는 뜻으로 넓혀 뒀다 — 지금은 창이 닫혔지만, 다음 호환
 # 릴리스에서 또 넓힐 "호환 창 도구"로 그대로 남긴다. 0004 DB에도 초안 스키마는
 # 당연히 있다(0002에서 만들어진 뒤 한 번도 지워지지 않았다).
-DRAFT_SCHEMA_REVISIONS = ("0002_persona_draft", "0003_material_chunks", "0004_chat")
+DRAFT_SCHEMA_REVISIONS = (
+    "0002_persona_draft",
+    "0003_material_chunks",
+    "0004_chat",
+    "0005_generation_lease",
+)
 # 채팅 스키마(conversations·user_messages·generations)는 0004에서 생겼다. 호환 창이
 # 열려 있었을 때(SUPPORTED_ALEMBIC_REVISIONS가 0003도 허용하던 동안) 0003 DB엔 이
 # 테이블들이 없을 수 있었다 — chat_schema_ready/require_chat_schema가
 # draft_schema_ready와 같은 "호환 창 도구" 패턴으로 이걸 가른다. 지금은 SUPPORTED_
 # ALEMBIC_REVISIONS가 0004 하나뿐이라 이 튜플이 사실상 단일값과 같지만, 다음 호환
 # 릴리스에서 다시 넓혀 쓴다.
-CHAT_SCHEMA_REVISIONS = ("0004_chat",)
+CHAT_SCHEMA_REVISIONS = ("0004_chat", "0005_generation_lease")
 
 
 def draft_schema_ready(cur) -> bool:
@@ -124,6 +136,38 @@ def chat_schema_ready(cur) -> bool:
     row = cur.fetchone()
     version = row["version_num"] if row else None
     return version in CHAT_SCHEMA_REVISIONS
+
+
+# bridge가 lease 모드에서 읽고 쓰는 컬럼 전부. 하나라도 없으면 lease 모드로 들어가지 않는다.
+LEASE_COLUMNS = ("owner_instance_id", "lease_expires_at")
+
+
+def lease_schema_ready(cur) -> bool:
+    """generations에 lease 컬럼(0005의 LEASE_COLUMNS)이 **모두** 실제로 있는지 판정한다.
+
+    한 컬럼만 보면 안 된다 — 0005 migration은 둘을 한 ALTER TABLE로 추가하지만, 수동 DDL·부분
+    복구·스키마 drift로 하나만 남은 DB에서 "준비됨"으로 오판하면 이후 쿼리가 없는 컬럼을 써서
+    500이 된다. 둘 다 있을 때만 lease 모드, 아니면 0004 모드(lease 없이)로 동작한다.
+
+    bridge 릴리스(0004·0005 허용) 동안에만 실제로 갈리는 "호환 창 도구"이며, 창을 닫은 뒤에도
+    지우지 않는다. alembic_version 마커가 아니라 시스템 카탈로그로 컬럼 실재를 본다 — 쓰려는
+    것이 바로 그 컬럼이고, 카탈로그 조회는 MVCC라 alembic_version이나 generations에 걸린
+    테이블 잠금(migration 중 등)을 기다리지 않는다. 마커를 읽으면 그 잠금 동안 기동 회수·종료
+    반납이 DB timeout만큼 멈춘다(readyz 잠금 테스트가 이를 잡았다). 호출자는 dict_row cursor를
+    넘겨야 한다.
+    """
+    cur.execute(
+        """
+        SELECT count(*) AS present
+        FROM pg_catalog.pg_attribute
+        WHERE attrelid = to_regclass('persona_minimal.generations')
+          AND attname = ANY(%s)
+          AND NOT attisdropped
+        """,
+        (list(LEASE_COLUMNS),),
+    )
+    row = cur.fetchone()
+    return bool(row) and row["present"] == len(LEASE_COLUMNS)
 
 
 def require_chat_schema(cur) -> None:

@@ -21,6 +21,9 @@ ServiceMonitor/PodMonitor·대시보드는 persona-platform 쪽 별도 작업이
 - persona_chat_stream_disconnects_total{mode}: 클라이언트 연결 종료로 generation이
   **실제로** reconciling으로 전환된 수(UPDATE가 행을 바꾼 경우만). 이미 terminal인 뒤
   닫힌 스트림은 세지 않는다. finished와 겹치지 않는다(terminal이 아니다).
+- persona_chat_generations_reclaimed_total{reason}: 소유자 lease 만료·정상 종료로
+  reconciling으로 넘긴 수. reason은 startup_lease_expired·request_lease_expired·shutdown.
+- persona_chat_lease_heartbeat_failures_total: lease 연장 실패 횟수.
 """
 
 from __future__ import annotations
@@ -75,4 +78,24 @@ STREAM_DISCONNECTS = Counter(
     "persona_chat_stream_disconnects_total",
     "클라이언트 연결 종료로 실제 reconciling으로 전환된 generation 수",
     ["mode"],
+)
+
+# --- generation 소유권 lease (G-1) ---------------------------------------------------
+# 회수는 terminal이 아니므로 GENERATIONS_FINISHED에 넣지 않고, 클라이언트 연결 종료
+# (STREAM_DISCONNECTS)와도 섞지 않는다. reason은 아래 세 값만 쓴다. 인스턴스 ID·사용자·
+# generation 식별자는 label로 두지 않는다.
+# - startup_lease_expired: 기동 시 lease가 만료된(죽은) 소유자의 행 회수
+# - request_lease_expired: 그 사용자의 다음 요청에서 만료 행 회수
+# - shutdown: 정상 종료 시 자기 인스턴스가 아직 소유한 행 반납
+RECLAIM_REASONS = ("startup_lease_expired", "request_lease_expired", "shutdown")
+
+GENERATIONS_RECLAIMED = Counter(
+    "persona_chat_generations_reclaimed_total",
+    "소유자 lease 만료·정상 종료로 reconciling으로 넘긴 generation 수(연결 종료 제외)",
+    ["reason"],
+)
+
+LEASE_HEARTBEAT_FAILURES = Counter(
+    "persona_chat_lease_heartbeat_failures_total",
+    "generation lease 연장(heartbeat)에 실패한 횟수",
 )

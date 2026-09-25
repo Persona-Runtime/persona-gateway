@@ -22,8 +22,10 @@ from ..repository import (
     PersonaNotFound,
     SchemaNotReady,
     chat_schema_ready,
+    lease_schema_ready,
 )
 from ..retrieval.prompt import Message
+from . import metrics
 
 # 활성 상태 — 이 상태들이면 "사용자당 활성 generation 1개" 슬롯을 쥐고 있다.
 ACTIVE_STATUSES = ("queued", "running", "cancel_requested", "reconciling")
@@ -40,6 +42,61 @@ FINISHABLE_STATUSES = ("queued", "running", "cancel_requested")
 # generation 요청이 잠금 안에서 들어왔을 때만, 이 시간을 넘겼으면 그 자리에서
 # 해소한다(feedback.md 확정 정책).
 RECONCILIATION_TIMEOUT_SECONDS = 300
+
+# --- generation 소유권 lease (G-1, api/generation-ownership-lease-design.md) ---------
+# 활성 generation은 그것을 스트리밍하는 Gateway 인스턴스(owner_instance_id)와, 그 인스턴스가
+# 살아 있다고 볼 수 있는 기한(lease_expires_at)을 가진다. 살아 있는 인스턴스는 주기적으로
+# 기한을 늘리고(chat/lease.py), 다른 인스턴스는 **기한이 지난 행만** 회수한다. 모든 시각
+# 비교는 DB now()로 한다 — Pod마다 다른 시계로 만료를 판정하지 않는다.
+#
+# 기본 lease 길이(초). 실제 값은 설정(PERSONA_GENERATION_LEASE_SECONDS)이 정한다.
+DEFAULT_LEASE_SECONDS = 30.0
+# owner_instance_id가 없는 활성 행(0005 이전·호환 릴리스 구버전 Gateway가 만든 행)의 회수
+# 유예. 소유자를 모르므로 "그 소유자가 아직 스트리밍 중일 수 있는 최대 시간"이 지난 뒤에만
+# 회수한다 — 생성 전체 한도 180초(chat/service.py)에 여유 60초를 더했다. 이 값보다 짧으면
+# 롤링 중 새 Pod가 살아 있는 구버전 Pod의 스트림을 끊는다(G-1 이전과 같은 문제).
+LEGACY_OWNERLESS_GRACE_SECONDS = 240
+
+# 회수 조건(SQL 조각). "활성이고, 소유자가 있으면 lease 만료, 없으면 유예 경과". 회수 UPDATE의
+# WHERE에 그대로 넣어 판정과 전환을 한 문장으로 한다 — 두 인스턴스가 동시에 회수해도
+# Postgres가 행 잠금 뒤 WHERE를 다시 평가하므로 같은 행은 한쪽만 바꾼다.
+# 회수 시 남기는 heartbeat_at. reconciling의 300초 지연 해소는 "마지막으로 살아 있음이
+# 확인된 시각"부터 센다(계약 §7). 회수한 시각(now())을 쓰면 이미 오래 방치된 행의 시계가
+# 처음부터 다시 돌아 사용자가 300초를 또 기다린다. 그래서 소유자가 있으면 마지막 lease 기한
+# (소유자가 살아 있다고 볼 수 있던 마지막 시각), 소유자 없는 구버전 행이면 기존 heartbeat_at을
+# 그대로 남긴다. (정상 종료 반납·연결 종료는 소유자가 방금까지 살아 있었으므로 now()를 쓴다.)
+_RECLAIM_SET = """
+    status = 'reconciling',
+    heartbeat_at = CASE WHEN owner_instance_id IS NOT NULL THEN lease_expires_at
+                        ELSE heartbeat_at END
+"""
+
+_RECLAIMABLE_CONDITION = """
+    status IN ('queued', 'running', 'cancel_requested')
+    AND (
+        (owner_instance_id IS NOT NULL AND lease_expires_at < now())
+        OR (owner_instance_id IS NULL
+            AND heartbeat_at < now() - make_interval(secs => %(legacy_grace)s))
+    )
+"""
+
+# bridge 릴리스가 0004 DB(lease 컬럼 없음)에서 쓰는 회수 규칙. 모든 행이 소유자를 모르므로
+# "소유자 없는 행" 규칙 하나만 남는다 — 전역 reconcile은 하지 않는다. 살아 있는 스트림은 생성
+# 전체 한도(180초) 안에 끝나므로 240초 유예에 걸리지 않는다. 컬럼을 참조하지 않아야 0004에서
+# 실행된다.
+_RECLAIM_SET_WITHOUT_LEASE = "status = 'reconciling'"
+_RECLAIMABLE_CONDITION_WITHOUT_LEASE = """
+    status IN ('queued', 'running', 'cancel_requested')
+    AND heartbeat_at < now() - make_interval(secs => %(legacy_grace)s)
+"""
+
+
+def _reclaim_sql(lease_ready: bool) -> tuple[str, str]:
+    """(SET 절, WHERE 조건)을 lease 스키마 유무에 맞게 고른다. 두 회수 경로가 함께 쓴다."""
+    if lease_ready:
+        return _RECLAIM_SET, _RECLAIMABLE_CONDITION
+    return _RECLAIM_SET_WITHOUT_LEASE, _RECLAIMABLE_CONDITION_WITHOUT_LEASE
+
 
 CHAT_COMPLETION_OPERATION = "chat_completion"
 CREATE_CONVERSATION_OPERATION = "create_conversation"
@@ -225,7 +282,14 @@ def fingerprint_retry(generation_id: UUID) -> bytes:
 
 
 class ChatStore:
-    def __init__(self, pool: ConnectionPool, *, mode: str = "mock"):
+    def __init__(
+        self,
+        pool: ConnectionPool,
+        *,
+        mode: str = "mock",
+        instance_id: UUID | None = None,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ):
         """mode는 이 프로세스가 어떤 업스트림으로 답하는지다(`PERSONA_CHAT_INFERENCE_MODE`).
 
         generation 행에 그대로 적혀 SSE meta.mode와 Prometheus mode 라벨이 된다. 기본값이
@@ -234,6 +298,41 @@ class ChatStore:
         """
         self.pool = pool
         self.mode = mode
+        # 이 프로세스(앱 인스턴스)의 소유자 ID. 기동마다 새로 만든다 — Pod 이름을 쓰지 않는
+        # 이유는 같은 이름의 컨테이너가 재시작돼도 이전 프로세스와 구분해야 하기 때문이다.
+        # 로그·메트릭 label에는 남기지 않는다.
+        self.instance_id = instance_id or uuid4()
+        self.lease_seconds = lease_seconds
+        # lease 컬럼(0005)이 있음을 한 번 확인하면 True로 고정한다. False인 동안은 매번 다시 본다 —
+        # bridge 릴리스가 떠 있는 중에 migration이 적용되면 재시작 없이 다음 요청부터 lease를
+        # 쓰게 하려는 것이다. 운영 중 downgrade는 정책상 하지 않으므로 True를 되돌리지 않는다.
+        self._lease_schema_confirmed = False
+
+    # --- lease 스키마 인식(bridge) ----------------------------------------
+
+    def _lease_schema_available(self, connection) -> bool:
+        if self._lease_schema_confirmed:
+            return True
+        with connection.cursor(row_factory=dict_row) as cur:
+            self._lease_schema_confirmed = lease_schema_ready(cur)
+        return self._lease_schema_confirmed
+
+    def _stamp_owner(self, connection, generation_id: UUID) -> None:
+        """이 인스턴스를 소유자로, lease를 지금부터 lease 길이까지로 기록한다(0005에서만).
+
+        호출자의 트랜잭션 안에서 부른다 — INSERT·running 전이와 같은 트랜잭션으로 커밋되므로
+        소유권 기록은 그 전이와 원자적이다. 0004(bridge 기간)에서는 아무것도 하지 않는다.
+        """
+        if not self._lease_schema_available(connection):
+            return
+        connection.execute(
+            """
+            UPDATE persona_minimal.generations
+            SET owner_instance_id = %s, lease_expires_at = now() + make_interval(secs => %s)
+            WHERE id = %s
+            """,
+            (self.instance_id, self.lease_seconds, generation_id),
+        )
 
     # --- 대화 -----------------------------------------------------------
 
@@ -480,6 +579,18 @@ class ChatStore:
         이 트랜잭션 밖에서 한다. 반환값의 bool은 idempotent replay 여부다."""
         fingerprint = fingerprint_chat_completion(conversation_id, message)
         scope = f"/v1/conversations/{conversation_id}/completions"
+        # 순서가 계약이다: (1) replay·키 충돌을 먼저 답하고 (2) 새 요청일 때만 죽은 소유자의 슬롯을
+        # 회수·커밋한 뒤 (3) 본 트랜잭션에서 잠금·idempotency 재확인·슬롯 검사·삽입을 한다.
+        # 회수를 (1)보다 먼저 하면 같은 키 재전송이 응답 전에 다른 활성 행을 바꾼다 — "replay는
+        # 한도 검사보다 먼저"를 어긴다. 회수를 (3) 안에 넣으면 슬롯 검사의 409가 트랜잭션을
+        # ROLLBACK해 회수도 사라진다. (3)에서 idempotency를 다시 보는 이유: (1)과 (3) 사이에
+        # 같은 키의 다른 요청이 먼저 삽입했을 수 있다 — 그 경우 replay로 답한다.
+        replayed = self._replay_before_reclaim(
+            owner_subject, CHAT_COMPLETION_OPERATION, scope, idempotency_key, fingerprint
+        )
+        if replayed is not None:
+            return replayed, True
+        self.reclaim_user_expired_generations(owner_subject)
         with self.pool.connection() as connection, connection.transaction():
             with connection.cursor(row_factory=dict_row) as cur:
                 if not chat_schema_ready(cur):
@@ -564,6 +675,9 @@ class ChatStore:
                         self.mode,
                     ),
                 )
+                # 접수한 인스턴스가 곧 스트리밍할 인스턴스다 — queued부터 소유한다. 소유자 없이
+                # 두면 검색 중인 행이 "구버전 행"으로 오인된다. 같은 트랜잭션이라 원자적이다.
+                self._stamp_owner(connection, generation_id)
                 cur.execute(
                     """
                     INSERT INTO persona_minimal.chat_idempotency_records(
@@ -673,7 +787,7 @@ class ChatStore:
         여기서 실패해도 최종 결과는 항상 옳다(단일 진실 소스를 finish_generation
         하나로 좁힌다)."""
         with self.pool.connection() as connection, connection.transaction():
-            connection.execute(
+            cur = connection.execute(
                 """
                 UPDATE persona_minimal.generations
                 SET status = 'running', citations = %s, input_snapshot = %s, heartbeat_at = now()
@@ -685,6 +799,10 @@ class ChatStore:
                     generation_id,
                 ),
             )
+            # 실행 상태로 옮긴 같은 트랜잭션에서 소유자와 lease를 다시 기록한다(원자적). 전이가
+            # 일어나지 않았으면(취소가 먼저 옴) 소유자 기록도 하지 않는다.
+            if cur.rowcount == 1:
+                self._stamp_owner(connection, generation_id)
 
     def finish_generation(
         self, generation_id: UUID, *, status: str, content: str, failure_code: str | None
@@ -749,17 +867,147 @@ class ChatStore:
             )
             return cur.rowcount == 1
 
-    def reconcile_stale_generations_on_startup(self) -> int:
-        """Gateway 기동 시 이전 프로세스가 남긴 running/cancel_requested/queued
-        generation을 reconciling으로 전환한다(material_versions의 stale processing
-        정리와 같은 lifespan 패턴). 반환값은 전환된 행 수(로그용)."""
+    def reclaim_expired_generations(self) -> int:
+        """lease가 만료된(죽은) 소유자의 활성 generation을 reconciling으로 회수한다.
+
+        이전에는 기동 시 소유자를 가리지 않고 활성 행을 전부 바꿨다 — 롤링 중 새 Pod가 살아
+        있는 이전 Pod의 스트림을 끊는 원인이었다. 이제 lease가 유효한 행은 건드리지 않고,
+        소유자 없는 구버전 행은 LEGACY_OWNERLESS_GRACE_SECONDS가 지난 뒤에만 회수한다.
+        회수는 슬롯 해제가 아니다 — reconciling은 기존 300초 규칙을 그대로 따른다.
+
+        반환값은 이 호출이 실제로 바꾼 행 수다. 동시에 여러 인스턴스가 불러도 같은 행은 한
+        번만 세어진다(판정과 전환이 한 UPDATE 문장이라서).
+        """
         with self.pool.connection() as connection, connection.transaction():
+            set_clause, condition = _reclaim_sql(self._lease_schema_available(connection))
+            cur = connection.execute(
+                f"""
+                UPDATE persona_minimal.generations
+                SET {set_clause}
+                WHERE {condition}
+                """,
+                {"legacy_grace": LEGACY_OWNERLESS_GRACE_SECONDS},
+            )
+            return cur.rowcount
+
+    def _replay_before_reclaim(
+        self,
+        owner_subject: str,
+        operation: str,
+        scope: str,
+        idempotency_key: UUID,
+        fingerprint: bytes,
+    ) -> Generation | None:
+        """회수 전에 idempotency record만 먼저 본다. replay면 기존 generation, 충돌이면
+        IdempotencyConflict, 새 요청(또는 사용자·스키마 부재)이면 None.
+
+        사용자 행을 잠근 짧은 트랜잭션이다 — 본 트랜잭션과 같은 잠금 순서라 같은 사용자의 다른
+        요청과 직렬화된다. 부재·스키마 오류는 여기서 판정하지 않고 본 트랜잭션에 맡긴다(기존
+        오류 응답을 그대로 유지하려는 것이다).
+        """
+        with (
+            self.pool.connection() as connection,
+            connection.transaction(),
+            connection.cursor(row_factory=dict_row) as cur,
+        ):
+            if not chat_schema_ready(cur):
+                return None
+            cur.execute(
+                "SELECT subject FROM persona_minimal.users WHERE subject = %s FOR UPDATE",
+                (owner_subject,),
+            )
+            if cur.fetchone() is None:
+                return None
+            cur.execute(
+                """
+                SELECT request_fingerprint, result_id
+                FROM persona_minimal.chat_idempotency_records
+                WHERE owner_subject = %s AND operation = %s AND target_scope = %s
+                  AND idempotency_key = %s
+                """,
+                (owner_subject, operation, scope, idempotency_key),
+            )
+            record = cur.fetchone()
+            if record is None:
+                return None
+            if bytes(record["request_fingerprint"]) != fingerprint:
+                raise IdempotencyConflict
+            return self._generation_by_id(cur, record["result_id"])
+
+    def reclaim_user_expired_generations(self, owner_subject: str) -> int:
+        """그 사용자의 활성 행 중 lease가 만료된 것을 reconciling으로 회수한다(요청 시 지연 해소).
+
+        기동 말고는 죽은 소유자의 queued/running 행을 풀 경로가 없어, 모든 Pod가 살아 있는
+        동안 그 사용자가 영영 막히는 것을 막는다 — background sweep 없이 "그 사용자의 다음
+        요청"에서만 해소하는 기존 원칙과 같다. 회수 자체는 슬롯을 열지 않는다: 바뀐 행은
+        reconciling이 되고, 이어지는 슬롯 검사가 300초 규칙(마지막 생존 확인 시각 기준,
+        _RECLAIM_SET 참고)으로 409 또는 failed(reconciliation_timeout)를 정한다.
+
+        **별도 트랜잭션으로 먼저 커밋한다.** 슬롯 검사는 활성 행이 있으면 GenerationInProgress를
+        던지고, 그 예외가 접수 트랜잭션 전체를 ROLLBACK한다 — 같은 트랜잭션에서 회수하면
+        회수도 함께 사라진다. 회수 UPDATE는 조건부·멱등이라 따로 커밋해도 안전하다.
+        """
+        with self.pool.connection() as connection, connection.transaction():
+            set_clause, condition = _reclaim_sql(self._lease_schema_available(connection))
+            cur = connection.execute(
+                f"""
+                UPDATE persona_minimal.generations
+                SET {set_clause}
+                WHERE conversation_id IN (
+                    SELECT id FROM persona_minimal.conversations WHERE owner_subject = %(owner)s
+                )
+                  AND {condition}
+                """,
+                {"owner": owner_subject, "legacy_grace": LEGACY_OWNERLESS_GRACE_SECONDS},
+            )
+            reclaimed = cur.rowcount
+        if reclaimed:
+            metrics.GENERATIONS_RECLAIMED.labels(reason="request_lease_expired").inc(reclaimed)
+        return reclaimed
+
+    def extend_own_leases(self) -> list[tuple[UUID, str]]:
+        """이 인스턴스가 소유한 활성 행의 lease를 늘리고 (id, status)를 돌려준다.
+
+        인스턴스당 주기마다 한 문장이다 — 대상 행 수는 이 인스턴스가 스트리밍 중인 generation
+        수(사용자당 최대 1개)라 작다. 돌려준 status가 cancel_requested면 호출자(lease keeper)가
+        로컬 업스트림 취소를 부른다 — 다른 인스턴스로 들어온 cancel 요청을 DB로 전달받는 경로다.
+        """
+        with self.pool.connection() as connection, connection.transaction():
+            if not self._lease_schema_available(connection):
+                # 0004(bridge 기간): 연장할 lease가 없다. 실패가 아니므로 메트릭도 올리지 않는다.
+                return []
+            cur = connection.execute(
+                """
+                UPDATE persona_minimal.generations
+                SET lease_expires_at = now() + make_interval(secs => %s)
+                WHERE owner_instance_id = %s
+                  AND status IN ('queued', 'running', 'cancel_requested')
+                RETURNING id, status
+                """,
+                (self.lease_seconds, self.instance_id),
+            )
+            return [(row[0], row[1]) for row in cur.fetchall()]
+
+    def release_own_generations(self) -> int:
+        """정상 종료 시 이 인스턴스가 아직 소유한 활성 행을 reconciling으로 넘긴다.
+
+        서버가 연결을 모두 닫은 뒤(lifespan 종료) 부른다. 그 시점에 남은 행은 이 프로세스가 더
+        처리하지 않으므로, lease 만료(최대 lease 길이)를 기다리지 않고 바로 "결과를 모름"으로
+        남긴다. 다른 인스턴스의 행은 건드리지 않는다. 반환값은 바꾼 행 수다.
+        """
+        with self.pool.connection() as connection, connection.transaction():
+            if not self._lease_schema_available(connection):
+                # 0004(bridge 기간): 소유자를 기록하지 않았으므로 "내 행"을 가릴 수 없다. 남은
+                # 행은 소유자 없는 행 규칙(240초 유예)으로 다른 인스턴스가 회수한다.
+                return 0
             cur = connection.execute(
                 """
                 UPDATE persona_minimal.generations
                 SET status = 'reconciling', heartbeat_at = now()
-                WHERE status IN ('queued', 'running', 'cancel_requested')
-                """
+                WHERE owner_instance_id = %s
+                  AND status IN ('queued', 'running', 'cancel_requested')
+                """,
+                (self.instance_id,),
             )
             return cur.rowcount
 
@@ -800,6 +1048,13 @@ class ChatStore:
     ) -> tuple[Generation, bool]:
         fingerprint = fingerprint_retry(generation_id)
         scope = f"/v1/generations/{generation_id}/retry"
+        # create_generation_queued와 같은 순서(replay·충돌 → 새 요청만 회수 → 본 트랜잭션).
+        replayed = self._replay_before_reclaim(
+            owner_subject, RETRY_GENERATION_OPERATION, scope, idempotency_key, fingerprint
+        )
+        if replayed is not None:
+            return replayed, True
+        self.reclaim_user_expired_generations(owner_subject)
         with self.pool.connection() as connection, connection.transaction():
             with connection.cursor(row_factory=dict_row) as cur:
                 if not chat_schema_ready(cur):
@@ -895,6 +1150,8 @@ class ChatStore:
                         json.dumps(original["input_snapshot"]["citations"]),
                     ),
                 )
+                # retry를 받은 인스턴스가 새 스트림을 소유한다(같은 트랜잭션).
+                self._stamp_owner(connection, new_generation_id)
                 cur.execute(
                     """
                     INSERT INTO persona_minimal.chat_idempotency_records(

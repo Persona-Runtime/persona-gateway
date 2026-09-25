@@ -15,14 +15,16 @@ from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 from psycopg import Error as PsycopgError
-from psycopg.errors import UndefinedTable
+from psycopg.errors import UndefinedColumn, UndefinedTable
 from psycopg_pool import PoolTimeout
 
 from .build_info import record_build_info
+from .chat import metrics as chat_metrics
 from .chat import service as chat_service
 from .chat.fake_inference import FakeInferenceClient
 from .chat.vllm_client import VllmInferenceClient
 from .chat.inference import InferenceClient
+from .chat.lease import GenerationLeaseKeeper
 from .chat.repository import (
     ChatStore,
     Citation,
@@ -319,7 +321,11 @@ def create_app(
     # generation 행의 mode는 지금 어떤 어댑터로 답하는지를 그대로 적는다 — 이 값이 SSE
     # meta.mode와 Prometheus mode 라벨이 되므로, mock과 llm을 비교하려면 사실이어야 한다.
     chat_store = (
-        ChatStore(store.pool, mode=settings.chat_inference_mode)
+        ChatStore(
+            store.pool,
+            mode=settings.chat_inference_mode,
+            lease_seconds=settings.generation_lease_seconds,
+        )
         if isinstance(store, PostgresPersonaStore)
         else None
     )
@@ -328,6 +334,17 @@ def create_app(
     if inference_client is None:
         inference_client = build_inference_client(settings)
         owned_inference_client = inference_client
+    # 이 인스턴스가 소유한 generation의 lease를 연장하는 heartbeat(chat/lease.py). DB가 없는
+    # 테스트용 저장소에서는 소유할 generation도 없어 만들지 않는다.
+    lease_keeper = (
+        GenerationLeaseKeeper(
+            chat_store,
+            inference_client,
+            heartbeat_seconds=settings.generation_heartbeat_seconds,
+        )
+        if chat_store is not None
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -367,27 +384,48 @@ def create_app(
                 except UndefinedTable:
                     pass
 
-            # 이전 프로세스가 generation 스트리밍 도중 죽었으면(SIGTERM·크래시) 그
-            # 행이 queued/running/cancel_requested에 멈춰 있다 — "프로세스가 죽었으니
-            # failed 처리 후 슬롯 해제"는 하지 않는다(feedback.md 명시 금지). 대신
-            # reconciling으로 옮겨 "결과를 모른다"를 정직하게 남긴다. 실제 terminal
-            # 전환은 별도 background sweep이 아니라, 같은 사용자의 다음 generation
-            # 요청이 잠금 안에서 heartbeat_at·300초를 보고 그 자리에서 처리한다
-            # (chat/repository.py의 _reject_or_resolve_active_generation).
+            # 이전 프로세스가 generation 스트리밍 도중 죽었으면(OOM·노드 장애) 그 행이
+            # queued/running/cancel_requested에 멈춰 있다. **lease가 만료된 소유자의 행만**
+            # reconciling으로 회수한다 — 롤링 중에는 이전 Pod가 아직 살아서 스트리밍하므로,
+            # 예전처럼 활성 행을 전부 바꾸면 그 스트림이 끊긴다(api/generation-ownership-
+            # lease-design.md). 회수는 슬롯 해제가 아니다: "프로세스가 죽었으니 failed로 슬롯
+            # 해제"는 하지 않고, terminal 전환은 같은 사용자의 다음 요청이 300초 규칙으로 한다.
             #
-            # 0003 호환 창 동안은(채팅 스키마가 아직 없는 DB) UndefinedTable을 잡아
-            # 건너뛴다 — 위 material_versions 정리와 같은 이유.
+            # 스키마가 이 이미지보다 낮으면(테이블·컬럼 부재) 기동은 계속하고 readiness가 Not
+            # Ready로 알린다 — 여기서 죽으면 readyz조차 응답하지 못한다(위 정리와 같은 이유).
             if chat_store is not None:
                 try:
-                    reconciled = chat_store.reconcile_stale_generations_on_startup()
-                    if reconciled:
+                    reclaimed = chat_store.reclaim_expired_generations()
+                    if reclaimed:
+                        chat_metrics.GENERATIONS_RECLAIMED.labels(
+                            reason="startup_lease_expired"
+                        ).inc(reclaimed)
                         logger.warning(
-                            "chat reconciliation: %d stale generation(s) marked reconciling",
-                            reconciled,
+                            "chat lease: %d expired generation(s) reclaimed as reconciling",
+                            reclaimed,
                         )
-                except UndefinedTable:
+                except (UndefinedTable, UndefinedColumn):
                     pass
+                except (PsycopgError, PoolTimeout) as error:
+                    # 기동 회수는 best-effort다. DB가 느리거나 잠겨 있다고 기동을 실패시키면
+                    # readyz조차 응답하지 못한다. 회수하지 못한 행은 그 사용자의 다음 요청
+                    # (reclaim_user_expired_generations)이나 다음 기동이 처리한다.
+                    logger.warning("chat lease: startup reclaim skipped (%s)", type(error).__name__)
+        if lease_keeper is not None:
+            lease_keeper.start()
         yield
+        # 정상 종료: 서버가 연결을 모두 닫은 뒤 여기에 온다(uvicorn graceful shutdown 이후).
+        # heartbeat를 먼저 멈추고, 이 인스턴스가 아직 소유한 활성 행을 reconciling으로 넘긴다
+        # — lease 만료를 기다리지 않게 하려는 것이다. 풀을 닫기 전에 해야 한다.
+        if lease_keeper is not None and chat_store is not None:
+            lease_keeper.stop()
+            try:
+                released = chat_store.release_own_generations()
+                if released:
+                    chat_metrics.GENERATIONS_RECLAIMED.labels(reason="shutdown").inc(released)
+            except (PsycopgError, PoolTimeout) as error:
+                # 반납에 실패해도 lease가 만료되면 다른 인스턴스가 회수한다. 종료는 계속한다.
+                logger.warning("chat lease: shutdown release failed (%s)", type(error).__name__)
         if owned_pool is not None:
             owned_pool.close()
         # 앱이 만든 client만 닫는다 — 주입받은 것은 만든 쪽이 수명을 갖는다(owned_pool과
@@ -404,6 +442,7 @@ def create_app(
     app.state.store = store
     app.state.chat_store = chat_store
     app.state.inference_client = inference_client
+    app.state.lease_keeper = lease_keeper
 
     @app.middleware("http")
     async def response_headers(request: Request, call_next):

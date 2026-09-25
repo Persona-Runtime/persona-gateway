@@ -105,6 +105,22 @@ scripts/local-stack.sh down
 
 슬롯 규칙(reconciling은 300초 뒤 다음 요청에서 정리)은 그대로다.
 
+### generation 소유권 lease (G-1)
+
+활성 generation은 그것을 스트리밍하는 Gateway 인스턴스(`owner_instance_id`, 기동마다 새 UUID)와
+lease 기한(`lease_expires_at`)을 가진다. 인스턴스는 `PERSONA_GENERATION_HEARTBEAT_SECONDS`(기본
+10초)마다 lease를 `PERSONA_GENERATION_LEASE_SECONDS`(기본 30초)만큼 늘리고, 다른 인스턴스는
+**lease가 만료된 행만** reconciling으로 회수한다(기동 시, 또는 그 사용자의 다음 요청 시). 그래서
+롤링 배포에서 새 Pod가 기동해도 살아 있는 이전 Pod의 스트림은 끝까지 간다. 정상 종료 때는 자기
+소유의 남은 행을 reconciling으로 넘긴다. 다른 인스턴스로 들어온 cancel은 소유자의 heartbeat가 DB에서
+읽어 로컬 업스트림을 취소한다(최대 heartbeat 간격 지연). 두 설정은 `lease >= 2 × heartbeat + DB
+timeout`이어야 하며 아니면 기동이 실패한다. 이 코드는 lease 컬럼 존재를 스스로 판정하는 **bridge 릴리스**라 0004·0005 둘 다에서
+Ready이고, 0004에서는 lease 없이(전역 reconcile 없이) 동작하다가 migration이 적용되면 재시작 없이
+lease를 켠다. 설계·종료 유형별 전이·배포 순서(bridge → migration `0005_generation_lease` → 0005만
+허용하는 기능 릴리스 → replica 2)는
+[api/generation-ownership-lease-design.md](api/generation-ownership-lease-design.md). 실제 두 Pod와
+migration 적용은 아직 검증하지 않았다.
+
 설계 판단(2026-09-25): 연결 종료는 vLLM 취소가 아니므로 브라우저가 사라져도 GPU 생성은
 계속될 수 있다. DB는 `reconciling`으로 남고 사용자 슬롯은 300초 뒤 다음 요청에서야 정리된다.
 GPU 한 장 환경에서는 이 "보이지 않는 생성"이 GPU를 얼마나 점유하는지가 중요하므로,
@@ -125,6 +141,8 @@ label에는 route 템플릿·method·상태 코드·결과처럼 가짓수가 �
 | `persona_chat_generations_started_total` | Counter | mode | 건 |
 | `persona_chat_generations_finished_total` | Counter | mode, terminal_reason | 건 |
 | `persona_chat_stream_disconnects_total` | Counter | mode | 건 |
+| `persona_chat_generations_reclaimed_total` | Counter | reason(startup_lease_expired·request_lease_expired·shutdown) | 건 |
+| `persona_chat_lease_heartbeat_failures_total` | Counter | 없음 | 건 |
 | `persona_chat_time_to_first_token_seconds` | Histogram | 없음 | 초 |
 | `persona_chat_generation_seconds` | Histogram | 없음 | 초 |
 | `persona_retrieval_seconds` | Histogram | kind_group | 초 |
