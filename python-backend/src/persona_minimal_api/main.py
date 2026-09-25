@@ -19,6 +19,7 @@ from psycopg_pool import PoolTimeout
 
 from .chat import service as chat_service
 from .chat.fake_inference import FakeInferenceClient
+from .chat.vllm_client import VllmInferenceClient
 from .chat.inference import InferenceClient
 from .chat.repository import (
     ChatStore,
@@ -274,6 +275,33 @@ def error_response(request: Request, error: ApiError) -> JSONResponse:
     return response
 
 
+def build_inference_client(settings: Settings) -> InferenceClient:
+    """설정값 하나로 어떤 업스트림을 쓸지 정한다. 기동 시점에 한 번만 부른다.
+
+    llm 모드에서 연결이 안 되더라도 mock으로 바꾸지 않는다 — 계약(§8 "실제 운영 중
+    LLM이 꺼졌다고 몰래 mock으로 fallback하지 않는다")이 금지하고, 그렇게 하면 합성
+    응답이 진짜 답변인 것처럼 저장된다. 연결 실패는 생성 시점에 UpstreamError로 드러난다.
+
+    llm인데 연결 설정이 비어 있는 경우는 여기까지 오지 않는다 — Settings의
+    llm_settings_are_complete가 기동 시점에 이미 막는다.
+    """
+    if settings.chat_inference_mode == "mock":
+        return FakeInferenceClient()
+    # mypy·독자 모두에게: 위 validator가 보장하지만 타입상으로는 None일 수 있다.
+    assert settings.vllm_base_url is not None
+    assert settings.vllm_model is not None
+    return VllmInferenceClient(
+        base_url=settings.vllm_base_url,
+        model=settings.vllm_model,
+        api_key=(
+            settings.vllm_api_key.get_secret_value() if settings.vllm_api_key is not None else None
+        ),
+        connect_timeout_seconds=settings.vllm_connect_timeout_seconds,
+        first_token_timeout_seconds=settings.vllm_first_token_timeout_seconds,
+        idle_timeout_seconds=settings.vllm_idle_timeout_seconds,
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     store: PersonaStore | None = None,
@@ -284,13 +312,18 @@ def create_app(
     if store is None:
         owned_pool = create_pool(settings.database_url, settings.database_timeout_seconds)
         store = PostgresPersonaStore(owned_pool)
-    # settings.chat_inference_mode는 지금 "mock"만 허용한다(config.py) — 그래서 여기
-    # 분기가 하나뿐이다. "llm"이 추가돼도 값이 다르면 기본 FakeInferenceClient로
-    # 조용히 넘어가지 않고, 그 분기를 명시적으로 추가하기 전까지는 pydantic이
-    # 기동 시점에 이미 막는다.
-    chat_store = ChatStore(store.pool) if isinstance(store, PostgresPersonaStore) else None
+    # generation 행의 mode는 지금 어떤 어댑터로 답하는지를 그대로 적는다 — 이 값이 SSE
+    # meta.mode와 Prometheus mode 라벨이 되므로, mock과 llm을 비교하려면 사실이어야 한다.
+    chat_store = (
+        ChatStore(store.pool, mode=settings.chat_inference_mode)
+        if isinstance(store, PostgresPersonaStore)
+        else None
+    )
+    # 테스트가 직접 주입한 client가 있으면 그것을 쓴다. 없을 때만 설정값으로 고른다.
+    owned_inference_client = None
     if inference_client is None:
-        inference_client = FakeInferenceClient()
+        inference_client = build_inference_client(settings)
+        owned_inference_client = inference_client
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -353,6 +386,12 @@ def create_app(
         yield
         if owned_pool is not None:
             owned_pool.close()
+        # 앱이 만든 client만 닫는다 — 주입받은 것은 만든 쪽이 수명을 갖는다(owned_pool과
+        # 같은 규칙). vLLM adapter는 HTTP 연결 풀을 쥐고 있어 정리가 필요하다.
+        if owned_inference_client is not None:
+            close = getattr(owned_inference_client, "close", None)
+            if close is not None:
+                close()
 
     app = FastAPI(
         title="Persona Runtime minimal API", docs_url=None, redoc_url=None, lifespan=lifespan

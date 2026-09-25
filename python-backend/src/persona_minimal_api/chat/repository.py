@@ -225,8 +225,15 @@ def fingerprint_retry(generation_id: UUID) -> bytes:
 
 
 class ChatStore:
-    def __init__(self, pool: ConnectionPool):
+    def __init__(self, pool: ConnectionPool, *, mode: str = "mock"):
+        """mode는 이 프로세스가 어떤 업스트림으로 답하는지다(`PERSONA_CHAT_INFERENCE_MODE`).
+
+        generation 행에 그대로 적혀 SSE meta.mode와 Prometheus mode 라벨이 된다. 기본값이
+        mock인 이유는 테스트가 pool만 넘겨 만들기 때문이고, 실제 앱은 main.create_app이
+        설정값을 넘긴다. DB CHECK가 'mock'·'llm'만 허용하므로 다른 값은 INSERT에서 걸린다.
+        """
         self.pool = pool
+        self.mode = mode
 
     # --- 대화 -----------------------------------------------------------
 
@@ -547,13 +554,14 @@ class ChatStore:
                     """
                     INSERT INTO persona_minimal.generations(
                         id, conversation_id, user_message_id, version_id, mode, status
-                    ) VALUES (%s, %s, %s, %s, 'mock', 'queued')
+                    ) VALUES (%s, %s, %s, %s, %s, 'queued')
                     """,
                     (
                         generation_id,
                         conversation_id,
                         user_message_id,
                         version_row["active_version_id"],
+                        self.mode,
                     ),
                 )
                 cur.execute(
@@ -863,13 +871,17 @@ class ChatStore:
                     INSERT INTO persona_minimal.generations(
                         id, conversation_id, user_message_id, version_id, mode, status,
                         retry_of_generation_id, input_snapshot, citations
-                    ) VALUES (%s, %s, %s, %s, 'mock', 'running', %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s, %s)
                     """,
                     (
                         new_generation_id,
                         original["conversation_id"],
                         original["user_message_id"],
                         original["version_id"],
+                        # 재시도는 원본의 mode가 아니라 지금 프로세스의 mode로 답한다 —
+                        # 그 사이 배포로 업스트림이 바뀌었을 수 있고, 기록은 실제로
+                        # 답한 쪽을 가리켜야 한다.
+                        self.mode,
                         original["id"],
                         json.dumps(original["input_snapshot"]),
                         json.dumps(original["input_snapshot"]["citations"]),

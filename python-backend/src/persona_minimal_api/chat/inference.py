@@ -1,11 +1,15 @@
-"""업스트림(생성 모델) 어댑터가 지켜야 할 최소 인터페이스.
+"""업스트림(생성 모델) 어댑터가 지켜야 할 최소 인터페이스와 공통 오류 타입.
 
-Gateway는 "지금 upstream이 Fake인지 실제 vLLM인지"를 설정값으로만 안다 — RAG·권한·
-저장·SSE 규칙은 두 구현이 동일하게 거친다. 이번 라운드는 `fake_inference.py`만
-구현한다. 실제 vLLM adapter(`vllm_client.py`)는 GPU 연결 시점에 별도로 만든다 —
-검증할 실제 vLLM이 없는 채로 작성해 두면 아무도 실행해 보지 않은 코드가 된다.
+Gateway는 "지금 upstream이 Fake인지 실제 vLLM인지"를 설정값(`PERSONA_CHAT_INFERENCE_MODE`)
+으로만 안다 — RAG·권한·저장·SSE 규칙은 두 구현이 동일하게 거친다. 구현은 두 가지다.
 
-취소는 어댑터 책임이다: 실제 vLLM이었다면 업스트림에도 취소를 통지해야 하므로,
+- `fake_inference.FakeInferenceClient`: mock 모드(개발·테스트 전용, 모델 호출 없음)
+- `vllm_client.VllmInferenceClient`: llm 모드(vLLM OpenAI 호환 streaming API)
+
+어느 쪽이 쓰일지는 `main.build_inference_client()`가 기동 시점에 한 번 정한다. llm 연결이
+실패해도 mock으로 바꾸지 않는다(계약 §8 "몰래 mock으로 fallback하지 않는다").
+
+취소는 어댑터 책임이다: 실제 vLLM이면 업스트림 HTTP stream을 닫아야 하므로,
 "신호만 세우고 Gateway가 알아서 멈추는" 방식이 아니라 어댑터가 `cancel()`을 받아
 직접 처리하게 한다.
 """
@@ -16,6 +20,19 @@ from typing import Iterator, Protocol
 from uuid import UUID
 
 from ..retrieval.prompt import Message
+
+
+class UpstreamError(Exception):
+    """업스트림 실패를 Gateway 오류 체계로 옮긴 것. `code`가 그대로 generation의
+    `failure_code`와 SSE error 이벤트의 `code`가 된다.
+
+    code·메시지에는 고정된 분류 문자열만 넣는다 — URL·token·프롬프트·응답 원문은
+    DB·SSE·로그로 새어 나가므로 절대 담지 않는다.
+    """
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 
 
 class InferenceClient(Protocol):

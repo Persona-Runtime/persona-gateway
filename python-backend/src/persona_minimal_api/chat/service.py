@@ -23,8 +23,7 @@ from ..repository import NotIndexed, PersonaNotFound, SchemaNotReady
 from ..retrieval.prompt import BUDGET_8192, QuestionTooLong, build_messages
 from ..retrieval.search import RetrievedChunk, retrieve_context
 from . import metrics
-from .fake_inference import UpstreamError
-from .inference import InferenceClient
+from .inference import InferenceClient, UpstreamError
 from .repository import (
     ChatStore,
     Citation,
@@ -297,9 +296,12 @@ def _run_generation(
     # 끊으려면 별도 스레드가 필요하다 — queue.get(timeout=...)은 워커가 next() 안에서
     # 블록 중이어도 정확히 그 시간에 반환되지만, 기존의 for 루프 조건 체크는 새
     # chunk가 와야만 실행돼 업스트림이 조용히 멈추면 영원히 대기했다(고쳐지기 전
-    # 버그). 워커는 daemon 스레드다 — 이번 범위엔 실제 vLLM이 없어 무한 대기해도
-    # DB 커넥션 등 자원을 쥐고 있지 않으므로 프로세스 종료를 막지 않는 daemon으로
-    # 충분하다.
+    # 버그). 워커는 daemon 스레드라 프로세스 종료를 막지 않는다.
+    #
+    # 아래 타임아웃 경로는 cancel()만 부르고 워커를 join하지 않는다 — 그래서 어댑터의
+    # cancel()이 실제로 업스트림 연결을 닫아 줘야 한다. llm 모드의 워커는 HTTP 소켓을
+    # 쥐고 있어서, 닫지 않으면 이 요청이 끝난 뒤에도 연결이 남는다(vllm_client.cancel
+    # 참고). mock 모드는 쥐고 있는 자원이 없다.
     chunk_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
     def _drain() -> None:
