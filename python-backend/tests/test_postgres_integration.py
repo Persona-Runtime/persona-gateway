@@ -23,7 +23,12 @@ from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 from persona_minimal_api.chat import service as chat_service
-from persona_minimal_api.chat.fake_inference import FakeInferenceClient, UpstreamError
+from persona_minimal_api.chat.fake_inference import (
+    DEFAULT_CHUNKS,
+    FakeInferenceClient,
+    MockWorkloadProfile,
+    UpstreamError,
+)
 from persona_minimal_api.chat.repository import ChatStore, GenerationInProgress
 from persona_minimal_api.config import Settings
 from persona_minimal_api.indexing.embedding_client import EmbeddingError, EmbeddingResult
@@ -4476,3 +4481,122 @@ def test_lease_schema_requires_every_lease_column(
         connection.rollback()
         with connection.cursor(row_factory=dict_row) as cur:
             assert lease_schema_ready(cur) is True
+
+
+# --- mock workload profile (G-2) -------------------------------------------------------
+
+
+def _post_chat(
+    api: TestClient,
+    conversation_id: UUID,
+    *,
+    query: str = "",
+    extra_headers: dict[str, str] | None = None,
+    extra_body: dict[str, str] | None = None,
+):
+    """합성 질문으로 채팅을 요청한다. query·extra_*는 mock profile 조작 시도를 흉내 낸다."""
+    return api.post(
+        f"/v1/chat/completions{query}",
+        headers={
+            "Authorization": "Bearer integration-token",
+            "Idempotency-Key": str(uuid4()),
+            "Accept": "text/event-stream",
+            **(extra_headers or {}),
+        },
+        json={"conversation_id": str(conversation_id), "message": "안녕", **(extra_body or {})},
+    )
+
+
+def _delta_texts(events: list[tuple[str, dict]]) -> list[str]:
+    return [data["text"] for name, data in events if name == "delta"]
+
+
+def test_default_mock_profile_from_settings_streams_existing_short_shape(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """inference_client를 주입하지 않으면 설정(기본 short)대로 고른다 — 기존 기본 mock과 같은
+    3조각 뒤 done이어야 한다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "기본프로필")
+    api = TestClient(create_app(_chat_settings(owner), store))
+
+    events = _parse_sse(_post_chat(api, conversation_id).text)
+
+    assert [name for name, _ in events] == ["meta", "citations", "delta", "delta", "delta", "done"]
+    assert _delta_texts(events) == list(DEFAULT_CHUNKS)
+
+
+def test_scaled_profile_streams_every_fragment_in_order_then_done(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """medium/long과 같은 규칙을 시간만 줄인 profile로 본다(실제 40초를 기다리지 않는다)."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "줄인프로필")
+    profile = MockWorkloadProfile("scaled-test", 6, 0.02)
+    api = TestClient(
+        create_app(
+            _chat_settings(owner), store, inference_client=FakeInferenceClient.from_profile(profile)
+        )
+    )
+
+    events = _parse_sse(_post_chat(api, conversation_id).text)
+
+    assert [name for name, _ in events][:2] == ["meta", "citations"]
+    assert events[-1][0] == "done"
+    assert _delta_texts(events) == list(profile.fragments())
+    assert [data["index"] for name, data in events if name == "delta"] == list(range(6))
+
+
+def test_mock_profile_cannot_be_changed_by_request(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """query·header로 profile을 바꾸려 해도 설정(short)대로 3조각이다. body의 추가 필드는
+    ChatRequest(extra=forbid)가 422로 거절하고 generation을 만들지 않는다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "조작불가")
+    api = TestClient(create_app(_chat_settings(owner), store))
+
+    via_query = _parse_sse(_post_chat(api, conversation_id, query="?profile=long").text)
+    assert len(_delta_texts(via_query)) == 3
+
+    via_header = _parse_sse(
+        _post_chat(api, conversation_id, extra_headers={"X-Mock-Profile": "long"}).text
+    )
+    assert len(_delta_texts(via_header)) == 3
+
+    via_body = _post_chat(api, conversation_id, extra_body={"profile": "long"})
+    assert via_body.status_code == 422
+    # 거절된 요청이 활성 generation을 남기지 않았다 — 다음 정상 요청이 409 없이 스트리밍된다.
+    after = _parse_sse(_post_chat(api, conversation_id).text)
+    assert after[-1][0] == "done"
+
+
+def test_real_uvicorn_close_during_long_profile_reconciles_without_gc(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """long형 profile(시간만 줄임: 50조각 × 0.1초)에서 첫 delta를 받은 뒤 끊어도 기존 규칙대로
+    1초 안에 reconciling이 되고 연결 종료 카운터가 1 오른다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+    owner, conversation_id = _prepare_conversation(store, chat_store, "긴프로필종료")
+    profile = MockWorkloadProfile("scaled-long", 50, 0.1)
+    app = create_app(
+        _chat_settings(owner), store, inference_client=FakeInferenceClient.from_profile(profile)
+    )
+    disconnects_before = _disconnects("mock")
+
+    with _gc_disabled(), _running_uvicorn(app) as base_url:
+        generation_id = _read_until_then_close(
+            base_url,
+            "/v1/chat/completions",
+            {"conversation_id": str(conversation_id), "message": "안녕"},
+            "delta",
+        )
+        status, elapsed = _wait_for_status(
+            chat_store, owner, generation_id, "reconciling", RECONCILE_WITHIN_SECONDS
+        )
+        assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
+        assert _disconnects("mock") == disconnects_before + 1

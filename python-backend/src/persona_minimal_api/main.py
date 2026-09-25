@@ -21,7 +21,7 @@ from psycopg_pool import PoolTimeout
 from .build_info import record_build_info
 from .chat import metrics as chat_metrics
 from .chat import service as chat_service
-from .chat.fake_inference import FakeInferenceClient
+from .chat.fake_inference import MOCK_WORKLOAD_PROFILES, FakeInferenceClient
 from .chat.vllm_client import VllmInferenceClient
 from .chat.inference import InferenceClient
 from .chat.lease import GenerationLeaseKeeper
@@ -292,7 +292,16 @@ def build_inference_client(settings: Settings) -> InferenceClient:
     llm_settings_are_complete가 기동 시점에 이미 막는다.
     """
     if settings.chat_inference_mode == "mock":
-        return FakeInferenceClient()
+        profile = MOCK_WORKLOAD_PROFILES[settings.chat_mock_profile]
+        chat_metrics.MOCK_WORKLOAD.info(
+            {
+                "profile": profile.name,
+                "fragment_count": str(profile.fragment_count),
+                "fragment_interval_seconds": str(profile.fragment_interval_seconds),
+            }
+        )
+        return FakeInferenceClient.from_profile(profile)
+    # llm 모드는 chat_mock_profile을 읽지 않는다 — mock 설정이 vLLM 요청에 섞이지 않게.
     # mypy·독자 모두에게: 위 validator가 보장하지만 타입상으로는 None일 수 있다.
     assert settings.vllm_base_url is not None
     assert settings.vllm_model is not None

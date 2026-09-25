@@ -3,7 +3,9 @@
 상태(2026-09-25): bridge 릴리스(PR #19, `6fe5200`)가 운영에 배포됐고 migration Job
 `0005_generation_lease`가 Complete됐다(운영 확인은 사용자 제공 사실). 이 브랜치
 (`release/gateway-0005-only`)는 배포 순서의 3단계인 **기능 릴리스**다 — 0005만 허용한다(3절).
-이미지 게시·배포는 아직 하지 않았다. 아래 "이전 동작"은 develop(`b35c9b8`)까지의 동작이고, "적용된
+같은 브랜치에 mock workload profile(G-2, `PERSONA_CHAT_MOCK_PROFILE`)도 들어 있어 이 이미지 하나로
+노드 장애·롤아웃 실험의 긴 SSE를 재현할 수 있다(README "mock" 절). 이미지 게시·배포는 아직 하지
+않았다. 아래 "이전 동작"은 develop(`b35c9b8`)까지의 동작이고, "적용된
 동작"은 G-1 이후의 동작이다. "미구현"은 아직 없는 것이다.
 
 ## 1. 이전 동작과 문제
