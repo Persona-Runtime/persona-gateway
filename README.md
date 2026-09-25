@@ -10,7 +10,8 @@ Go Gateway와 dispatcher는 현재 활성 런타임이 아니다.
 | ---------------- | --------------------------------------------------------- |
 | 운영 확인        | 인증 확인, 캐릭터 목록·생성, health/readiness             |
 | 현재 코드에 추가 | 캐릭터 상세 조회, 설정·자료 초안 생성·조회·수정·폐기      |
-| 미완료           | ingestion 자동 실행, 검색·LLM 채팅, 캐릭터 삭제 전체 흐름 |
+| 현재 코드에 추가 | 검색 기반 채팅(SSE), vLLM 업스트림 어댑터(`llm` 모드, 실제 GPU 미검증) |
+| 미완료           | ingestion 자동 실행, 캐릭터 삭제 전체 흐름                |
 
 2026-09-17 사용자 제공 결과 기준 운영 DB는 `0001_persona_minimal`이다.
 초안 API는 `0002_persona_draft` 작업이며 코드 구현과 운영 제공을 구분한다.
@@ -33,7 +34,8 @@ flowchart LR
 이 그림의 터널은 실제 검증에 사용한 접속 방식이다. 진입점 전체의 HA나
 Tailscale Serve 경로까지 검증했다는 뜻은 아니다.
 Web이 API를 중계하는 것이 아니라 브라우저가 같은 origin의 `/v1`로 요청한다.
-미연결 ingestion·Qdrant·vLLM은 현재 흐름에 포함하지 않는다.
+미연결 ingestion·Qdrant는 현재 흐름에 포함하지 않는다. vLLM은 `llm` 모드에서 Gateway가
+직접 부르는 업스트림이지만, 이 그림의 클러스터에는 아직 붙어 있지 않다.
 
 로컬 개발 경로는 운영 Traefik과 별개다.
 
@@ -67,6 +69,32 @@ scripts/local-stack.sh url
 scripts/local-stack.sh down
 ```
 
+## 채팅 업스트림
+
+`PERSONA_CHAT_INFERENCE_MODE`가 어떤 어댑터로 답할지 정한다. 기동 시점에 한 번 고르고,
+이후 연결이 실패해도 바꾸지 않는다 — LLM이 꺼졌다고 mock으로 넘어가면 합성 문구가 진짜
+답변으로 저장된다.
+
+| 값 | 어댑터 | 필요한 설정 |
+| --- | --- | --- |
+| `mock`(기본) | `FakeInferenceClient` — 모델을 부르지 않는 합성 응답 | 없음 |
+| `llm` | `VllmInferenceClient` — vLLM OpenAI 호환 `/v1/chat/completions`(stream) | `PERSONA_VLLM_BASE_URL`, `PERSONA_VLLM_MODEL` |
+
+`llm`인데 위 두 값이 비어 있으면 앱이 **기동하지 못한다**. 선택값으로
+`PERSONA_VLLM_API_KEY`(vLLM을 `--api-key`로 띄웠을 때만),
+`PERSONA_VLLM_CONNECT_TIMEOUT_SECONDS`(기본 5),
+`PERSONA_VLLM_FIRST_TOKEN_TIMEOUT_SECONDS`(기본 60),
+`PERSONA_VLLM_IDLE_TIMEOUT_SECONDS`(기본 30)가 있다.
+
+세 timeout은 각각 다른 것을 잰다 — 연결 수립까지, 요청 전송부터 첫 응답 조각까지, 조각
+사이의 무응답. 사용자에게 보이는 상한(첫 답변 60초·전체 180초)은 여전히 서비스 계층이
+정하고, 이 값들은 그보다 안쪽의 소켓·스트림 보호다.
+
+취소가 보장하는 것은 **Gateway가 업스트림 응답 스트림을 닫고 generation 상태를 정리하는
+것**까지다. vLLM 쪽 모델 연산이 즉시 멈추는지는 보장하지 않는다. 브라우저가 연결을 끊는
+경우는 취소가 아니라 `reconciling`으로 남으므로, 시간 예산이 만료될 때까지 업스트림
+연결이 유지된다.
+
 ## 검증
 
 계약 검사는 저장소 루트에서, Python 검사는 `python-backend`에서 실행한다.
@@ -88,8 +116,11 @@ uv run pytest
 
 - migrator는 migration DDL, runtime은 앱에 필요한 제한된 SQL 권한만 사용한다.
 - 앱 기동 시 migration을 자동 실행하지 않는다.
-- 운영 설정은 `DATABASE_URL`, `PERSONA_STATIC_BEARER_TOKEN`, `PERSONA_STATIC_USER_ID`,
-  `PERSONA_STATIC_DISPLAY_NAME`, `PERSONA_CURSOR_SIGNING_KEY`로 공급한다. 실제 값은 공개하지 않는다.
+- 운영 설정은 `DATABASE_URL`, `PERSONA_EMBEDDING_URL`, `PERSONA_STATIC_BEARER_TOKEN`,
+  `PERSONA_STATIC_USER_ID`, `PERSONA_STATIC_DISPLAY_NAME`, `PERSONA_CURSOR_SIGNING_KEY`로
+  공급한다. 실제 값은 공개하지 않는다.
+- 채팅 업스트림은 `PERSONA_CHAT_INFERENCE_MODE`로 고른다(`mock` 기본, `llm`). 아래
+  "채팅 업스트림" 참고.
 - `/healthz`는 프로세스 생존, `/readyz`는 필수 스키마·revision과 DB 연결 상태를 확인한다.
 - DB 장애가 곧바로 앱 재시작으로 이어지도록 liveness를 설계하지 않는다.
 - 로컬 스택 검증은 운영 migration·배포 승인이 아니다.

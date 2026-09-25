@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=None, extra="ignore")
+    # hide_input_in_errors: 설정 검증 실패 메시지(기동 로그)에 입력값을 싣지 않는다 —
+    # vLLM URL·DB URL처럼 내부 주소가 담긴 값이 오류 메시지로 새어 나가지 않게 한다.
+    model_config = SettingsConfigDict(env_file=None, extra="ignore", hide_input_in_errors=True)
 
     database_url: str = Field(validation_alias="DATABASE_URL")
     # database_url과 같은 성격 — 반드시 외부에서 줘야 하는 연결 대상이라 기본값을
@@ -34,13 +36,35 @@ class Settings(BaseSettings):
     forward_auth_enabled: bool = Field(
         default=False, validation_alias="PERSONA_FORWARD_AUTH_ENABLED"
     )
-    # 값 도메인이 지금은 "mock" 하나뿐이다(vLLM 어댑터가 아직 없다) — 그래도 명시적
-    # 설정값으로 강제해 둔다. "llm"을 나중에 추가할 때, 연결 실패 시 조용히 mock으로
-    # fallback하는 경로가 생기지 않게 하려는 목적이다(feedback.md 명시 요구). Literal이라
-    # "mock" 외의 값은 pydantic이 기동 시점에 바로 거부한다 — 조용한 fallback 대신
-    # 시끄러운 실패.
-    chat_inference_mode: Literal["mock"] = Field(
+    # mock: FakeInferenceClient(모델 호출 없음), llm: vLLM OpenAI 호환 streaming API.
+    # 기본값은 mock이다. llm 연결이 실패해도 mock으로 조용히 fallback하지 않는다 —
+    # 어떤 client를 쓸지는 main.build_inference_client()가 이 값 하나로만 정한다.
+    # Literal이라 두 값 외에는 pydantic이 기동 시점에 바로 거부한다.
+    chat_inference_mode: Literal["mock", "llm"] = Field(
         default="mock", validation_alias="PERSONA_CHAT_INFERENCE_MODE"
+    )
+    # 아래 vLLM 설정은 llm 모드에서만 쓴다. mock 모드 기동·테스트에 새 연결 설정을
+    # 강제하지 않으려고 모두 선택값으로 두고, llm일 때의 필수 여부는
+    # llm_settings_are_complete가 검사한다.
+    # base URL은 "/v1" 앞부분까지다(예: http://vllm:8000). 경로는 adapter가 붙인다.
+    vllm_base_url: str | None = Field(default=None, validation_alias="PERSONA_VLLM_BASE_URL")
+    # OpenAI 요청의 "model" 필드 — vLLM의 served-model-name과 같아야 한다.
+    vllm_model: str | None = Field(default=None, validation_alias="PERSONA_VLLM_MODEL")
+    # vLLM을 --api-key로 띄웠을 때만 준다. 없으면 Authorization 헤더를 보내지 않는다.
+    vllm_api_key: SecretStr | None = Field(default=None, validation_alias="PERSONA_VLLM_API_KEY")
+    # TCP 연결 수립까지의 한도(초).
+    vllm_connect_timeout_seconds: float = Field(
+        default=5.0, validation_alias="PERSONA_VLLM_CONNECT_TIMEOUT_SECONDS"
+    )
+    # 요청 전송부터 첫 content 조각까지의 한도(초). keepalive·빈 delta는 시간을 늘려주지
+    # 않는다. 서비스 계층의 60초 first_token_timeout(검색 시간 포함, 접수 기준)과 별개로
+    # upstream 호출만 따로 잰다.
+    vllm_first_token_timeout_seconds: float = Field(
+        default=60.0, validation_alias="PERSONA_VLLM_FIRST_TOKEN_TIMEOUT_SECONDS"
+    )
+    # 첫 조각 이후 content 조각 사이의 최대 간격(초).
+    vllm_idle_timeout_seconds: float = Field(
+        default=30.0, validation_alias="PERSONA_VLLM_IDLE_TIMEOUT_SECONDS"
     )
 
     @field_validator("static_user_id", "static_display_name")
@@ -57,9 +81,35 @@ class Settings(BaseSettings):
             raise ValueError("must be at least 16 characters")
         return value
 
-    @field_validator("database_timeout_seconds")
+    @field_validator(
+        "database_timeout_seconds",
+        "vllm_connect_timeout_seconds",
+        "vllm_first_token_timeout_seconds",
+        "vllm_idle_timeout_seconds",
+    )
     @classmethod
-    def database_timeout_is_positive(cls, value: float) -> float:
+    def timeout_is_positive(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be positive")
         return value
+
+    @model_validator(mode="after")
+    def llm_settings_are_complete(self) -> Settings:
+        """llm 모드인데 연결 설정이 비어 있으면 기동을 실패시킨다.
+
+        첫 채팅 요청에서야 드러나게 두면 운영자는 "기동은 됐는데 채팅만 안 된다"를 보게
+        된다. 오류 메시지에는 어떤 env가 빠졌는지만 적고 값은 적지 않는다.
+        """
+        if self.chat_inference_mode != "llm":
+            return self
+        missing = [
+            env_name
+            for env_name, value in (
+                ("PERSONA_VLLM_BASE_URL", self.vllm_base_url),
+                ("PERSONA_VLLM_MODEL", self.vllm_model),
+            )
+            if value is None or not value.strip()
+        ]
+        if missing:
+            raise ValueError(f"llm inference mode requires {', '.join(missing)}")
+        return self

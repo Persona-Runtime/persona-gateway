@@ -19,15 +19,13 @@ from uuid import UUID
 
 from ..retrieval.prompt import Message
 
+# UpstreamError는 vLLM adapter와 함께 쓰려고 inference.py로 옮겼다. 기존 테스트가
+# 여기서 import하므로 같은 이름으로 다시 내보낸다.
+from .inference import UpstreamError
+
+__all__ = ["DEFAULT_CHUNKS", "FakeInferenceClient", "UpstreamError"]
+
 DEFAULT_CHUNKS = ("합성 ", "응답", "입니다.")
-
-
-class UpstreamError(Exception):
-    """실제 vLLM이었다면 429/503/형식 오류로 보였을 상황을 흉내낸다."""
-
-    def __init__(self, code: str):
-        self.code = code
-        super().__init__(code)
 
 
 class FakeInferenceClient:
