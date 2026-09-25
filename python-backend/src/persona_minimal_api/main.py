@@ -17,6 +17,7 @@ from psycopg import Error as PsycopgError
 from psycopg.errors import UndefinedTable
 from psycopg_pool import PoolTimeout
 
+from .build_info import record_build_info
 from .chat import service as chat_service
 from .chat.fake_inference import FakeInferenceClient
 from .chat.vllm_client import VllmInferenceClient
@@ -44,6 +45,7 @@ from .cursor import (
     encode_conversation_cursor,
     encode_message_cursor,
 )
+from .http_metrics import HttpMetricsMiddleware
 from .indexing.embedding_client import EmbeddingError, embed
 from .indexing.runner import run_indexing
 from .repository import (
@@ -415,6 +417,11 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Request-Id"] = request.state.request_id
         return response
+
+    # 가장 바깥에 둔다(add_middleware는 나중에 추가한 것을 바깥에 놓는다). 위 헤더
+    # 미들웨어와 예외 처리까지 포함한 실제 응답 시간과 상태 코드를 재기 위해서다.
+    app.add_middleware(HttpMetricsMiddleware)
+    record_build_info()
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, error: ApiError):

@@ -4,16 +4,20 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import httpx
 import psycopg
 import pytest
+import uvicorn
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from prometheus_client import REGISTRY
 
 from persona_minimal_api.chat import service as chat_service
 from persona_minimal_api.chat.fake_inference import FakeInferenceClient, UpstreamError
@@ -2702,6 +2706,143 @@ def test_disconnect_immediately_after_meta_becomes_reconciling(
 
     reconciled = chat_store.get_generation(owner, accepted.generation.id)
     assert reconciled.status == "reconciling"
+
+
+def _ttft_observations() -> tuple[float, float]:
+    count = REGISTRY.get_sample_value("persona_chat_time_to_first_token_seconds_count") or 0.0
+    total = REGISTRY.get_sample_value("persona_chat_time_to_first_token_seconds_sum") or 0.0
+    return count, total
+
+
+def test_ttft_is_measured_at_first_delta_not_at_meta_or_citations(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """meta·citations는 바로 나가고 첫 delta만 늦게 오는 경우, TTFT는 delta 시점이어야
+    한다 — 첫 SSE 프레임 시점으로 재면 사용자가 글자를 본 시간보다 훨씬 짧게 보인다."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "지연대상",
+        "지연대상은 침착한 안내자다.",
+        "지연대상은 소포를 발견했다.",
+        "지연대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    accepted = chat_service.accept_chat_completion(
+        chat_store, owner, conversation.id, "안녕", uuid4()
+    )
+    first_delta_delay_seconds = 0.3
+    count_before, sum_before = _ttft_observations()
+
+    generator = chat_service.stream_generation(
+        pool=store.pool,
+        embedding_url="http://embedding.invalid",
+        chat_store=chat_store,
+        owner_subject=owner,
+        persona_id=persona.id,
+        generation=accepted.generation,
+        question="안녕",
+        inference_client=FakeInferenceClient(delay_before_first_chunk=first_delta_delay_seconds),
+    )
+    events = _parse_sse("".join(generator))
+
+    assert [name for name, _ in events][:3] == ["meta", "citations", "delta"]
+    count_after, sum_after = _ttft_observations()
+    assert count_after == count_before + 1
+    assert sum_after - sum_before >= first_delta_delay_seconds
+
+
+def _http_count(route: str, status: str, outcome: str) -> float:
+    labels = {"method": "POST", "route": route, "status": status, "outcome": outcome}
+    return REGISTRY.get_sample_value("persona_http_requests_total", labels) or 0.0
+
+
+def test_real_uvicorn_client_close_on_chat_stream_is_recorded_as_client_disconnected(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TestClient가 아니라 localhost의 실제 uvicorn에 SSE로 붙었다가 meta를 받은 직후
+    클라이언트 연결을 닫는다. 실제 앱의 미들웨어 구성(헤더 BaseHTTPMiddleware 포함)에서
+    HTTP 요청이 completed가 아니라 client_disconnected로 기록되는지 확인한다.
+
+    이 테스트가 **확인하지 않는 것**: generation이 reconciling으로 바뀌는지와
+    persona_chat_stream_disconnects_total 증가. 2026-09-25 실측에서 연결 종료 뒤에도
+    stream_generation 제너레이터는 곧바로 닫히지 않았다 — Starlette가 sync 제너레이터의
+    반복만 멈추고 close()를 부르지 않아, 가비지 컬렉션이 돌 때에야 GeneratorExit가
+    발생했다(gc.collect() 뒤 닫힘, 그 전에는 running 유지). 시점이 GC에 달려 있어
+    검증 조건으로 쓰면 우연히 통과하거나 실패한다. 연결 종료 시 제너레이터를 명시적으로
+    닫는 설계가 후속 과제다.
+    """
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store,
+        owner,
+        "실연결대상",
+        "실연결대상은 침착한 안내자다.",
+        "실연결대상은 소포를 발견했다.",
+        "실연결대상: 안녕",
+    )
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    # 첫 delta를 늦게 보내 meta 직후 끊을 시간을 확보한다.
+    slow_client = FakeInferenceClient(
+        chunks=("가", "나", "다"), delay_before_first_chunk=1.0, delay_between_chunks=1.0
+    )
+    app = create_app(_chat_settings(owner), store, inference_client=slow_client)
+    # lifespan은 끈다 — 기동 시 reconcile이 같은 DB의 다른 테스트 행을 건드리지 않게 한다.
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=0, lifespan="off", log_level="warning")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not server.started:
+            assert time.monotonic() < deadline, "uvicorn이 5초 안에 기동하지 않았다"
+            time.sleep(0.02)
+        port = server.servers[0].sockets[0].getsockname()[1]
+
+        route = "/v1/chat/completions"
+        disconnected_before = _http_count(route, "200", "client_disconnected")
+        completed_before = _http_count(route, "200", "completed")
+
+        received_meta = False
+        with (
+            httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as client,
+            client.stream(
+                "POST",
+                route,
+                headers={
+                    "Authorization": "Bearer integration-token",
+                    "Idempotency-Key": str(uuid4()),
+                    "Accept": "text/event-stream",
+                },
+                json={"conversation_id": str(conversation.id), "message": "안녕"},
+            ) as response,
+        ):
+            assert response.status_code == 200
+            for line in response.iter_lines():
+                if line == "event: meta":
+                    received_meta = True
+                    break
+        # with 블록을 나오면 응답과 연결이 닫힌다(클라이언트 쪽 연결 종료).
+        assert received_meta
+
+        # 요청 처리 코루틴이 연결 종료를 감지하고 끝나야 기록된다 — 짧게 기다린다.
+        deadline = time.monotonic() + 5
+        while _http_count(route, "200", "client_disconnected") == disconnected_before:
+            assert time.monotonic() < deadline, "HTTP client_disconnected가 기록되지 않았다"
+            time.sleep(0.05)
+        assert _http_count(route, "200", "client_disconnected") == disconnected_before + 1
+        assert _http_count(route, "200", "completed") == completed_before
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
 
 
 def test_disconnect_mid_stream_after_some_deltas_becomes_reconciling(
