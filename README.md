@@ -97,6 +97,15 @@ scripts/local-stack.sh down
 적용된 profile은 `persona_chat_mock_workload_info{profile,fragment_count,fragment_interval_seconds}`로
 확인한다.
 
+**prompt 입력 예산은 mode를 따른다.** `llm`은 `BUDGET_4096`, `mock`은 기존 `BUDGET_8192`다
+(`chat/service.py`의 `prompt_budget_for_mode`). 운영 vLLM이 `--max-model-len 4096`으로 뜨기 때문이다.
+
+- `BUDGET_4096`은 블록별 **글자 수** 상한이다. 실제 4096 토큰을 보장하지 않는다.
+- 입력과 출력 `max_tokens` 512의 합이 vLLM 한도를 넘으면 vLLM이 400을 돌려준다. 그 생성은
+  `upstream_status_400`으로 실패하고, 자동 재시도하거나 성공으로 바꾸지 않는다. 첫 실행에서 이 오류가
+  나오면 반복 실행하지 말고 길이 초과인지 먼저 확인한다.
+- `BUDGET_4096`의 질문 상한은 1000자라, `llm`에서 1001~2000자 질문은 `QuestionTooLong`으로 실패한다.
+
 `llm`인데 위 두 값이 비어 있으면 앱이 **기동하지 못한다**. 선택값으로
 `PERSONA_VLLM_API_KEY`(vLLM을 `--api-key`로 띄웠을 때만),
 `PERSONA_VLLM_CONNECT_TIMEOUT_SECONDS`(기본 5),
