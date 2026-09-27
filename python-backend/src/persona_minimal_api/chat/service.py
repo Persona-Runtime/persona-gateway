@@ -20,7 +20,13 @@ from psycopg_pool import ConnectionPool
 
 from ..indexing.embedding_client import EmbeddingError
 from ..repository import NotIndexed, PersonaNotFound, SchemaNotReady
-from ..retrieval.prompt import BUDGET_8192, QuestionTooLong, build_messages
+from ..retrieval.prompt import (
+    BUDGET_4096,
+    BUDGET_8192,
+    PromptBudget,
+    QuestionTooLong,
+    build_messages,
+)
 from ..retrieval.search import RetrievedChunk, retrieve_context
 from . import metrics
 from .inference import InferenceClient, UpstreamError
@@ -46,6 +52,26 @@ TOTAL_GENERATION_DEADLINE_SECONDS = 180.0
 # 이 간격으로 깨어나 client_gone을 확인한다 — 연결 종료 뒤 reconciling 전환까지의 지연
 # 상한이 이 값이 된다. 깨어나는 비용은 큐 대기 한 번이라 무시할 만하다.
 CLIENT_GONE_POLL_SECONDS = 0.1
+
+
+def prompt_budget_for_mode(mode: str) -> PromptBudget:
+    """generation을 답할 업스트림 mode에 맞는 prompt 입력 예산을 고른다.
+
+    - llm: 운영 vLLM이 `--max-model-len 4096`으로 뜨므로 BUDGET_4096을 쓴다. BUDGET_8192로
+      조립하면 캐릭터 설정·검색 자료만으로도 입력이 4096을 넘기 쉽다.
+    - mock(그 밖의 값 포함): 모델 문맥 한도가 없으므로 기존 BUDGET_8192를 그대로 쓴다.
+
+    BUDGET_4096은 블록별 **글자 수** 상한이다. 실제 4096 토큰을 보장하지 않는다 — 한국어
+    토큰 수는 tokenizer에 따라 달라, 입력 + 출력(MAX_ANSWER_TOKENS)이 vLLM 한도를 넘을 수
+    있다. 넘으면 vLLM이 400을 돌려주고, 이 생성은 `upstream_status_400` 오류로 실패 처리된다.
+    예산을 줄여 다시 시도하거나 성공으로 바꾸지 않는다.
+
+    BUDGET_4096의 질문 상한은 1000자다. llm 모드에서 1001~2000자 질문은 요청 검증
+    (MAX_QUESTION_CHARS 2000)은 통과하지만 조립 단계에서 QuestionTooLong으로 실패한다.
+    """
+    if mode == "llm":
+        return BUDGET_4096
+    return BUDGET_8192
 
 
 class ClientGone(Exception):
@@ -295,7 +321,8 @@ def _run_generation(
                 body_chunks=context.body,
                 history=history,
                 question=question,
-                budget=BUDGET_8192,
+                # generation.mode는 접수 시점에 이 프로세스가 고른 업스트림이다(repository).
+                budget=prompt_budget_for_mode(generation.mode),
             )
             messages = result.messages
             citations = _citations_from_chunks(

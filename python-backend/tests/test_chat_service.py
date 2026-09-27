@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from persona_minimal_api.chat.service import InvalidQuestion, validate_question
+from persona_minimal_api.chat.service import (
+    InvalidQuestion,
+    prompt_budget_for_mode,
+    validate_question,
+)
+from persona_minimal_api.retrieval.prompt import BUDGET_4096, BUDGET_8192
 
 
 def test_validate_question_strips_and_accepts_normal_text() -> None:
@@ -24,3 +29,12 @@ def test_validate_question_rejects_over_2000_codepoints() -> None:
 def test_validate_question_accepts_exactly_2000_codepoints() -> None:
     question = "가" * 2000
     assert validate_question(question) == question
+
+
+def test_llm_mode_uses_4096_prompt_budget() -> None:
+    # 운영 vLLM의 --max-model-len 4096에 맞춘 글자 수 예산이다(토큰 보장은 아니다).
+    assert prompt_budget_for_mode("llm") is BUDGET_4096
+
+
+def test_mock_mode_keeps_8192_prompt_budget() -> None:
+    assert prompt_budget_for_mode("mock") is BUDGET_8192
