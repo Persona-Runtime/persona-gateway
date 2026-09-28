@@ -4600,3 +4600,217 @@ def test_real_uvicorn_close_during_long_profile_reconciles_without_gc(
         )
         assert status == "reconciling", f"{elapsed:.2f}초 뒤 상태: {status}"
         assert _disconnects("mock") == disconnects_before + 1
+
+
+# --- 캐릭터 삭제(DELETE /v1/personas/{id}) ------------------------------------------
+
+
+def _auth(key: UUID | None = None) -> dict[str, str]:
+    return {"Authorization": "Bearer integration-token", "Idempotency-Key": str(key or uuid4())}
+
+
+def _persona_row_counts(store: PostgresPersonaStore, persona_id: UUID) -> dict[str, int]:
+    """이 캐릭터에 속한 행 수를 테이블별로 센다. 삭제 뒤에는 모두 0이어야 한다."""
+    queries = {
+        "material_versions": (
+            "SELECT count(*) FROM persona_minimal.material_versions WHERE persona_id = %s"
+        ),
+        "material_sources": (
+            "SELECT count(*) FROM persona_minimal.material_sources s "
+            "JOIN persona_minimal.material_versions v ON v.version_id = s.version_id "
+            "WHERE v.persona_id = %s"
+        ),
+        "material_chunks": (
+            "SELECT count(*) FROM persona_minimal.material_chunks WHERE persona_id = %s"
+        ),
+        "conversations": (
+            "SELECT count(*) FROM persona_minimal.conversations WHERE persona_id = %s"
+        ),
+        "draft_idempotency": (
+            "SELECT count(*) FROM persona_minimal.idempotency_records "
+            "WHERE persona_id = %s AND operation NOT IN ('create_persona', 'delete_persona')"
+        ),
+    }
+    with store.pool.connection() as connection:
+        return {
+            name: connection.execute(sql, (persona_id,)).fetchone()[0]
+            for name, sql in queries.items()
+        }
+
+
+def _chat_row_count(store: PostgresPersonaStore, table: str, ids: list[UUID]) -> int:
+    column = "conversation_id" if table != "chat_idempotency_records" else "result_id"
+    with store.pool.connection() as connection:
+        return connection.execute(
+            f"SELECT count(*) FROM persona_minimal.{table} WHERE {column} = ANY(%s)", (ids,)
+        ).fetchone()[0]
+
+
+def _active_version_of(store: PostgresPersonaStore, owner: str, persona_id: UUID) -> UUID:
+    return store.get_persona(owner, persona_id).active_version_id
+
+
+def test_persona_busy_statuses_match_chat_active_statuses() -> None:
+    # 삭제 거절 기준과 "진행 중 generation" 기준이 어긋나면 삭제가 실행 중 생성을 지운다.
+    from persona_minimal_api.chat.repository import ACTIVE_STATUSES
+    from persona_minimal_api.repository import PERSONA_BUSY_GENERATION_STATUSES
+
+    assert tuple(PERSONA_BUSY_GENERATION_STATUSES) == tuple(ACTIVE_STATUSES)
+
+
+def test_delete_persona_removes_related_data_and_frees_the_limit(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """본인 캐릭터 삭제: 204, 연관 데이터 정리, 한도 반환, 다른 캐릭터는 그대로."""
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    monkeypatch.setattr("persona_minimal_api.retrieval.search.embed", _fake_embed)
+
+    # 준비: 한도(3개)를 채우고, 삭제 대상에는 적용본·새 초안·대화·완료된 생성을 만든다.
+    owner = f"owner-{uuid4()}"
+    create_key = uuid4()
+    target, _ = _index_character(
+        store, owner, "삭제대상", "삭제대상은 합성 안내자다.", "삭제대상 사건", "삭제대상: 안녕"
+    )
+    keeper, _ = _index_character(
+        store, owner, "보존대상", "보존대상은 합성 안내자다.", "보존대상 사건", "보존대상: 안녕"
+    )
+    store.create_persona(owner, "합성 사용자", "세번째", create_key)
+    # 적용본 위에 새 초안까지 있어 version이 둘인 상태에서도 모두 지워지는지 본다.
+    store.create_draft(
+        owner, target.id, None, uuid4(), base_version_id=_active_version_of(store, owner, target.id)
+    )
+
+    api = _chat_client(store, owner)
+    conversation_id = api.post(f"/v1/personas/{target.id}/conversations", headers=_auth()).json()[
+        "id"
+    ]
+    completion_key = uuid4()
+    completed = api.post(
+        "/v1/chat/completions",
+        headers=_auth(completion_key),
+        json={"conversation_id": conversation_id, "message": "합성 질문"},
+    )
+    assert completed.status_code == 200
+    generation_id = UUID(_parse_sse(completed.text)[0][1]["generation_id"])
+    assert (
+        api.post("/v1/personas", headers=_auth(), json={"name": "네번째"}).json()["error"]["code"]
+        == "persona_limit_exceeded"
+    )
+
+    # 실행
+    delete_key = uuid4()
+    deleted = api.delete(f"/v1/personas/{target.id}", headers=_auth(delete_key))
+
+    # 검증: 성공, 조회 불가, 연관 데이터 0건
+    assert deleted.status_code == 204, deleted.text
+    assert api.get(f"/v1/personas/{target.id}", headers=_auth()).status_code == 404
+    assert all(count == 0 for count in _persona_row_counts(store, target.id).values())
+    conversation_uuid = UUID(conversation_id)
+    assert _chat_row_count(store, "user_messages", [conversation_uuid]) == 0
+    assert _chat_row_count(store, "generations", [conversation_uuid]) == 0
+    assert (
+        _chat_row_count(store, "chat_idempotency_records", [conversation_uuid, generation_id]) == 0
+    )
+    with store.pool.connection() as connection:
+        tombstone = connection.execute(
+            "SELECT name, deleted_at, deletion_id FROM persona_minimal.personas WHERE id = %s",
+            (target.id,),
+        ).fetchone()
+    # 이름은 tombstone에 남기지 않는다.
+    assert tombstone[0] == "" and tombstone[1] is not None and tombstone[2] is not None
+
+    # 한도 반환: 목록에서 빠지고 새 캐릭터를 만들 수 있다.
+    listed = api.get("/v1/personas", headers=_auth()).json()["items"]
+    assert str(target.id) not in {item["id"] for item in listed}
+    assert api.post("/v1/personas", headers=_auth(), json={"name": "네번째"}).status_code == 201
+
+    # 다른 캐릭터의 적용본·조각은 그대로다.
+    assert _persona_row_counts(store, keeper.id)["material_chunks"] > 0
+    assert store.get_persona(owner, keeper.id).status == "ready"
+
+    # 멱등성: 같은 키 재전송은 204, 옛 생성·채팅 키는 삭제된 내용을 되살리지 않는다.
+    assert api.delete(f"/v1/personas/{target.id}", headers=_auth(delete_key)).status_code == 204
+    assert api.delete(f"/v1/personas/{target.id}", headers=_auth()).status_code == 404
+    with pytest.raises(PersonaNotFound):
+        store.create_persona(owner, "합성 사용자", "삭제대상", _create_key_of(store, target.id))
+    replayed_chat = api.post(
+        "/v1/chat/completions",
+        headers=_auth(completion_key),
+        json={"conversation_id": conversation_id, "message": "합성 질문"},
+    )
+    assert replayed_chat.status_code == 404
+
+
+def _create_key_of(store: PostgresPersonaStore, persona_id: UUID) -> UUID:
+    with store.pool.connection() as connection:
+        return connection.execute(
+            "SELECT idempotency_key FROM persona_minimal.idempotency_records "
+            "WHERE persona_id = %s AND operation = 'create_persona'",
+            (persona_id,),
+        ).fetchone()[0]
+
+
+def test_delete_persona_of_another_user_is_not_found_and_keeps_data(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(
+        store, owner, "남의캐릭터", "합성 소개", "합성 사건", "남의캐릭터: 안녕"
+    )
+    before = _persona_row_counts(store, persona.id)
+
+    intruder = _chat_client(store, f"intruder-{uuid4()}")
+    response = intruder.delete(f"/v1/personas/{persona.id}", headers=_auth())
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "persona_not_found"
+    assert store.get_persona(owner, persona.id).status == "ready"
+    assert _persona_row_counts(store, persona.id) == before
+
+
+def test_delete_persona_is_rejected_while_indexing_is_in_progress(
+    store: PostgresPersonaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner, persona = _persona_for(store)
+    draft = store.create_draft(owner, persona.id, _settings(), uuid4())
+    patched = store.patch_draft(
+        owner, persona.id, draft.revision, None, [{"kind": "events", "content": "합성 사건"}], []
+    )
+    api = _chat_client(store, owner)
+
+    # 색인 접수 뒤(advisory lock 보유, status processing) 삭제는 거절된다.
+    handle = store.start_indexing(owner, persona.id, patched.revision)
+    rejected = api.delete(f"/v1/personas/{persona.id}", headers=_auth())
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "persona_busy"
+    assert store.get_draft(owner, persona.id).status == "processing"
+
+    # 색인이 끝나면 삭제할 수 있다.
+    run_indexing(handle, "http://unused")
+    assert api.delete(f"/v1/personas/{persona.id}", headers=_auth()).status_code == 204
+
+
+def test_delete_persona_is_rejected_while_a_generation_is_active(
+    store: PostgresPersonaStore, chat_store: ChatStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("persona_minimal_api.indexing.runner.embed", _fake_embed)
+    owner = f"owner-{uuid4()}"
+    persona, _ = _index_character(store, owner, "생성중", "합성 소개", "합성 사건", "생성중: 안녕")
+    conversation = chat_store.create_conversation(owner, persona.id, uuid4())
+    generation, _ = chat_store.create_generation_queued(
+        owner, conversation.id, "합성 질문", uuid4()
+    )
+    api = _chat_client(store, owner)
+
+    rejected = api.delete(f"/v1/personas/{persona.id}", headers=_auth())
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "persona_busy"
+    assert chat_store.get_generation(owner, generation.id).status == "queued"
+
+    # 생성이 끝나면 삭제할 수 있다.
+    chat_store.finish_generation(
+        generation.id, status="completed", content="합성", failure_code=None
+    )
+    assert api.delete(f"/v1/personas/{persona.id}", headers=_auth()).status_code == 204

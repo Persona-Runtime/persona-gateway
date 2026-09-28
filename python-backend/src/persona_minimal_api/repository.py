@@ -26,6 +26,12 @@ CREATE_PERSONA_SCOPE = "/v1/personas"
 # 초안 생성과 폐기는 서로 다른 operation이다. 같은 키로 둘을 보내도 서로의 기록을 덮지 않는다.
 CREATE_DRAFT_OPERATION = "create_draft"
 DISCARD_DRAFT_OPERATION = "discard_draft"
+# 캐릭터 삭제의 멱등 기록. 삭제한 캐릭터 행(tombstone)을 가리키므로 삭제 뒤에도 남는다.
+DELETE_PERSONA_OPERATION = "delete_persona"
+# 캐릭터 삭제를 막는 generation 상태. chat/repository.py의 ACTIVE_STATUSES와 같은 값이다 —
+# 이 모듈이 chat 모듈을 import하면 순환 참조가 되므로 값을 옮겨 적고, 둘이 어긋나지 않는지는
+# 테스트(test_persona_busy_statuses_match_chat_active_statuses)가 확인한다.
+PERSONA_BUSY_GENERATION_STATUSES = ("queued", "running", "cancel_requested", "reconciling")
 # §4-6 구현(2026-09-18). 옛 14번 상한(파일 1 MiB·전체 5 MiB, 바이트 기준)을 대체한다.
 # 코드포인트(len()) 기준 — UTF-8 바이트가 아니다. MAX_PROFILE_CHARS와 같은 이유로,
 # 한글은 바이트 상한에서 훨씬 적은 글자 수만 허용돼 나무위키 긴 문서를 못 받는다.
@@ -301,6 +307,12 @@ class NotActivatable(Exception):
     방금 고친 내용이 빠진 색인이 적용본이 된다."""
 
 
+class PersonaBusy(Exception):
+    """캐릭터에 진행 중인 응답 생성 또는 자료 색인이 있어 지금 삭제할 수 없다.
+
+    진행 중인 작업을 강제로 취소하지 않는다. 작업이 끝난 뒤 사용자가 다시 시도한다."""
+
+
 class NoActiveVersion(Exception):
     """적용본(personas.active_version_id)이 없다.
 
@@ -515,6 +527,10 @@ class PersonaStore(Protocol):
         self, owner_subject: str, persona_id: UUID, expected_revision: int
     ) -> ActivatedVersion: ...
 
+    def delete_persona(
+        self, owner_subject: str, persona_id: UUID, idempotency_key: UUID
+    ) -> None: ...
+
 
 @runtime_checkable
 class ReadinessStore(Protocol):
@@ -679,7 +695,12 @@ class PostgresPersonaStore:
                         """,
                         (record["persona_id"],),
                     )
-                    return _persona(cur.fetchone())
+                    replayed = cur.fetchone()
+                    # 이 키로 만든 캐릭터를 이미 삭제했다. 이름이 비워진 tombstone을 성공
+                    # 응답으로 돌려주거나 새 캐릭터를 만들지 않고 없는 대상으로 답한다.
+                    if replayed["deleted_at"] is not None:
+                        raise PersonaNotFound
+                    return _persona(replayed)
 
                 cur.execute(
                     """
@@ -1170,6 +1191,204 @@ class PostgresPersonaStore:
                             persona_id,
                         ),
                     )
+
+    # --- 캐릭터 삭제 ----------------------------------------------------------
+
+    def delete_persona(self, owner_subject: str, persona_id: UUID, idempotency_key: UUID) -> None:
+        """캐릭터와 그에 속한 자료·색인 조각·대화·메시지·생성 기록을 한 트랜잭션에서 지운다.
+
+        캐릭터 행 자체는 지우지 않고 tombstone으로 남긴다(deleted_at·deletion_id 기록, 이름은
+        비운다). 캐릭터 생성·삭제의 멱등 기록이 이 행을 FK로 가리키기 때문이다 — 행을 지우면
+        그 기록도 지워야 하고, 그러면 옛 생성 키를 재전송했을 때 캐릭터가 새로 만들어진다.
+        목록·개수·상세 조회는 모두 deleted_at IS NULL만 보므로 tombstone은 한도에 세지 않는다.
+
+        예외:
+        - PersonaNotFound: 없거나 다른 사용자의 캐릭터다(존재 여부를 새지 않으려고 같게 다룬다).
+        - PersonaBusy: 진행 중인 응답 생성 또는 색인이 있다. 강제 취소는 하지 않는다.
+        - SchemaNotReady: 초안·채팅 스키마가 없는 revision이다.
+        """
+        with self.pool.connection() as connection, connection.transaction():
+            with connection.cursor(row_factory=dict_row) as cur:
+                require_draft_pointer_schema(cur)
+
+                # 잠금 순서: 사용자 행 → 캐릭터 행. 응답 생성 시작(create_generation_queued·
+                # create_retry_generation)이 사용자 행을 먼저 잠그고, 색인 시작·대화 생성은
+                # 캐릭터 행만 잠근다. 같은 순서를 지켜야 서로 기다리다 교착하지 않는다.
+                # 사용자 행을 쥐고 있는 동안에는 새 generation이 끼어들 수 없어, 아래
+                # "진행 중 생성 없음" 검사가 커밋 순간까지 유효하다.
+                cur.execute(
+                    "SELECT subject FROM persona_minimal.users WHERE subject = %s FOR UPDATE",
+                    (owner_subject,),
+                )
+                if cur.fetchone() is None:
+                    raise PersonaNotFound
+
+                # 멱등 재전송을 캐릭터 조회보다 먼저 본다 — 이미 삭제한 캐릭터는 아래
+                # 조회에서 404가 되므로, 응답이 유실된 같은 요청이 실패로 보이지 않게 한다.
+                scope = f"/v1/personas/{persona_id}"
+                cur.execute(
+                    """
+                    SELECT persona_id FROM persona_minimal.idempotency_records
+                    WHERE owner_subject = %s AND operation = %s AND target_scope = %s
+                      AND idempotency_key = %s
+                    """,
+                    (owner_subject, DELETE_PERSONA_OPERATION, scope, idempotency_key),
+                )
+                if cur.fetchone() is not None:
+                    return
+
+                # 캐릭터 행을 잠그면 색인 시작·대화 생성·초안 수정이 이 트랜잭션이 끝날
+                # 때까지 기다리고, 끝난 뒤에는 deleted_at 때문에 캐릭터를 찾지 못한다.
+                self._lock_persona(cur, owner_subject, persona_id)
+
+                self._reject_if_busy(cur, persona_id)
+                self._delete_chat_records(cur, owner_subject, persona_id)
+                self._delete_material_records(cur, persona_id)
+
+                # 이름은 tombstone에 남기지 않는다(계약 §9). 같은 이름의 유일성 인덱스는
+                # deleted_at IS NULL 행만 보므로 빈 이름이 겹쳐도 문제없다.
+                cur.execute(
+                    """
+                    UPDATE persona_minimal.personas
+                    SET deleted_at = now(), deletion_id = %s, name = ''
+                    WHERE id = %s
+                    """,
+                    (uuid4(), persona_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO persona_minimal.idempotency_records(
+                        owner_subject, operation, target_scope, idempotency_key,
+                        request_fingerprint, persona_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        owner_subject,
+                        DELETE_PERSONA_OPERATION,
+                        scope,
+                        idempotency_key,
+                        hashlib.sha256(b"delete_persona").digest(),
+                        persona_id,
+                    ),
+                )
+
+    @staticmethod
+    def _reject_if_busy(cur, persona_id: UUID) -> None:
+        """진행 중인 색인·응답 생성이 있으면 PersonaBusy. 호출자는 캐릭터 행을 잠근 상태다.
+
+        색인은 두 가지로 본다. (1) 색인 실행은 캐릭터 키 advisory lock을 끝날 때까지 쥐고
+        있으므로, 같은 키를 트랜잭션 범위로 시도해 실패하면 실행 중이다. (2) status가
+        processing인 version이 있으면 막 접수됐거나 실행 중이다. 둘 중 하나라도 걸리면
+        거절한다 — 색인이 조각을 쓰는 도중에 자료를 지우면 FK 오류나 고아 조각이 남는다.
+        """
+        cur.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS locked", (str(persona_id),))
+        if not cur.fetchone()["locked"]:
+            raise PersonaBusy
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM persona_minimal.material_versions
+                WHERE persona_id = %s AND status = 'processing'
+            ) AS busy
+            """,
+            (persona_id,),
+        )
+        if cur.fetchone()["busy"]:
+            raise PersonaBusy
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM persona_minimal.generations AS g
+                JOIN persona_minimal.conversations AS c ON c.id = g.conversation_id
+                WHERE c.persona_id = %s AND g.status = ANY(%s)
+            ) AS busy
+            """,
+            (persona_id, list(PERSONA_BUSY_GENERATION_STATUSES)),
+        )
+        if cur.fetchone()["busy"]:
+            raise PersonaBusy
+
+    @staticmethod
+    def _delete_chat_records(cur, owner_subject: str, persona_id: UUID) -> None:
+        """대화·질문·생성 기록과 그 멱등 기록을 지운다. 참조하는 쪽부터 지운다.
+
+        채팅 멱등 기록의 result_id는 대화 또는 generation ID다. 함께 지우지 않으면 옛 키를
+        재전송했을 때 이미 지운 generation을 찾다가 실패한다. 지우고 나면 같은 키는 새
+        요청으로 처리되고, 대화가 없으므로 404로 끝난다 — 삭제된 내용이 되살아나지 않는다.
+        """
+        cur.execute(
+            "SELECT id FROM persona_minimal.conversations WHERE persona_id = %s",
+            (persona_id,),
+        )
+        conversation_ids = [row["id"] for row in cur.fetchall()]
+        if not conversation_ids:
+            return
+        cur.execute(
+            "SELECT id FROM persona_minimal.generations WHERE conversation_id = ANY(%s)",
+            (conversation_ids,),
+        )
+        generation_ids = [row["id"] for row in cur.fetchall()]
+        cur.execute(
+            """
+            DELETE FROM persona_minimal.chat_idempotency_records
+            WHERE owner_subject = %s AND result_id = ANY(%s)
+            """,
+            (owner_subject, conversation_ids + generation_ids),
+        )
+        # retry_of_generation_id가 같은 테이블을 참조하지만, 한 문장으로 모두 지우면 FK는
+        # 문장 끝에서 확인되므로 순서를 따로 맞출 필요가 없다.
+        cur.execute(
+            "DELETE FROM persona_minimal.generations WHERE conversation_id = ANY(%s)",
+            (conversation_ids,),
+        )
+        cur.execute(
+            "DELETE FROM persona_minimal.user_messages WHERE conversation_id = ANY(%s)",
+            (conversation_ids,),
+        )
+        cur.execute(
+            "DELETE FROM persona_minimal.conversations WHERE id = ANY(%s)",
+            (conversation_ids,),
+        )
+
+    @staticmethod
+    def _delete_material_records(cur, persona_id: UUID) -> None:
+        """초안·적용본 version과 자료·색인 조각, 초안 관련 멱등 기록을 지운다.
+
+        순서: 캐릭터의 version 포인터를 먼저 비운다(personas → material_versions FK) →
+        조각 → 자료 → version. 캐릭터 생성·삭제 멱등 기록은 tombstone을 가리키므로 남긴다.
+        """
+        cur.execute(
+            """
+            UPDATE persona_minimal.personas
+            SET active_version_id = NULL, draft_version_id = NULL
+            WHERE id = %s
+            """,
+            (persona_id,),
+        )
+        cur.execute(
+            "DELETE FROM persona_minimal.material_chunks WHERE persona_id = %s",
+            (persona_id,),
+        )
+        cur.execute(
+            """
+            DELETE FROM persona_minimal.material_sources
+            WHERE version_id IN (
+                SELECT version_id FROM persona_minimal.material_versions WHERE persona_id = %s
+            )
+            """,
+            (persona_id,),
+        )
+        cur.execute(
+            "DELETE FROM persona_minimal.material_versions WHERE persona_id = %s",
+            (persona_id,),
+        )
+        cur.execute(
+            """
+            DELETE FROM persona_minimal.idempotency_records
+            WHERE persona_id = %s AND operation <> ALL(%s)
+            """,
+            (persona_id, [CREATE_PERSONA_OPERATION, DELETE_PERSONA_OPERATION]),
+        )
 
     def patch_draft(
         self,
