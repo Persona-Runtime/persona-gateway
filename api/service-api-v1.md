@@ -56,9 +56,9 @@ HTTP 오류: 400 문법/식별자/cursor, 401 인증, 404 소유권/부재, 409 
 | version | 적용하면 불변인 설정·자료 묶음. 설정과 검증된 검색 결과 참조를 함께 고정 |
 | job | 특정 초안 revision을 처리하는 작업. 자동 시도는 최대 2회 |
 | generation | 질문 하나에 대한 응답 생성 시도. 재시도할 때 새 ID |
-| deletion | 삭제 접수 이후 남는 소유자 범위의 최소 상태 기록 |
+| deletion | 삭제한 캐릭터 행을 남긴 tombstone(`deleted_at`·`deletion_id`, 이름 비움). 별도 조회 API 없음 |
 
-persona 표시 상태는 서버가 계산한다. `deleting`이 우선이며, 적용본이 있으면 초안 처리 여부와 무관하게 `ready`다.
+persona 표시 상태는 서버가 계산한다. `deleting`이 우선이며(삭제가 동기로 바뀐 뒤 현재 구현은 이 상태를 만들지 않는다), 적용본이 있으면 초안 처리 여부와 무관하게 `ready`다.
 적용본이 없으면 초안 없음=`needs_material`, 실행 중=`preparing`, 그 외 초안 존재=`review_required`다.
 세부 실패·대기는 `draft.status`와 job으로 구분한다. `ready`는 GPU가 지금 켜져 있다는 뜻이 아니다.
 
@@ -80,8 +80,8 @@ rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `faile
 | Method | 경로 | 성공 | 핵심 제약 |
 | --- | --- | --- | --- |
 | GET | `/v1/me` | 200 User | 인증된 고정 사용자 |
-| POST | `/v1/personas` | 201 Persona | 비공백 이름, 사용자 내 이름 유일, 삭제 중 포함 최대 3개 |
-| GET | `/v1/personas` | 200 PersonaPage | 삭제 중 포함, 삭제 완료 제외 |
+| POST | `/v1/personas` | 201 Persona | 비공백 이름, 사용자 내 이름 유일, 최대 3개(삭제한 캐릭터는 세지 않음) |
+| GET | `/v1/personas` | 200 PersonaPage | 삭제한 캐릭터 제외 |
 | GET | `/v1/personas/{persona_id}` | 200 PersonaDetail | 현재 적용 설정·문서 요약·초안 요약 |
 | POST | `/v1/personas/{persona_id}/uploads` | 202 JobAccepted | 최초 입력용. 적용본/초안 없어야 함 |
 | GET | `/v1/jobs/{job_id}` | 200 Job | 소유자만 조회 |
@@ -99,12 +99,11 @@ rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `faile
 | POST | `/v1/chat/completions` | 200 SSE 또는 replay JSON | conversation_id + message, 사용자당 활성 생성 1개 |
 | POST | `/v1/generations/{generation_id}/cancel` | 200 Generation | 취소 접수와 종료 구분 |
 | POST | `/v1/generations/{generation_id}/retry` | 200 SSE 또는 replay JSON | 최신 질문·최신 실패/중단 시도만 |
-| DELETE | `/v1/personas/{persona_id}` | 202 DeletionAccepted | 삭제 잠금·작업 중단·비동기 정리 |
-| GET | `/v1/deletions/{deletion_id}` | 200 Deletion | 삭제 후에도 소유자 조회 가능 |
+| DELETE | `/v1/personas/{persona_id}` | 204 | 한 트랜잭션에서 동기 삭제. 진행 중 생성·색인이 있으면 409 `persona_busy`, 없거나 남의 캐릭터면 404 `persona_not_found` |
 | GET | `/v1/service-status` | 200 ServiceStatus | 안내용 snapshot, 처리 시 다시 확인 |
 | GET | `/v1/personas/{persona_id}/retrieve` | 200 RetrieveResult | 디버그 전용 — `PERSONA_RETRIEVE_DEBUG_ENABLED`(기본 false) 꺼지면 404. q 1~2000자, k 1~10(기본 5) |
 
-24 operations / 18 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
+23 operations / 17 paths. 표의 타입 정의·필수 필드·nullable 값은 OpenAPI에 있다.
 이전 설계에서 추가로 논의하지 않은 대화 삭제·응답 편집·정상 응답 재생성·실행 중 ingestion 사용자 취소 API는 만들지 않는다.
 
 ## 4. 접수와 중복 방지
@@ -120,7 +119,7 @@ rev3 색인 성공 후 rev4를 편집·적용해 실패해도 `status`는 `faile
 
 활성화 성공 뒤 초안이 없어져도 동일 키 성공 결과는 재전송할 수 있어야 한다. 삭제 완료 리소스도 소유자 범위의 tombstone으로 식별한다.
 삭제 중/완료된 캐릭터의 과거 업로드·생성 키를 재전송해 새 작업을 살리거나 삭제된 텍스트를 반환하면 안 된다.
-캐릭터 삭제 접수는 다른 키로 반복돼도 같은 deletion ID를 반환한다. 초안 폐기 동일 키는 204 replay다.
+캐릭터 삭제와 초안 폐기의 동일 키 재전송은 204 replay다. 이미 삭제한 캐릭터에 다른 키로 보내면 404다.
 일반 접수는 원래 성공 상태 코드/응답을 replay하고 현재 상태는 GET으로 확인한다. 생성 replay만 200 JSON으로 최신 Generation을 반환한다.
 
 multipart fingerprint는 임의 boundary 바이트가 아니라 입력 항목별 순서·파일명·원문 SHA를 기준으로 정규화한다.
@@ -278,16 +277,17 @@ mock backend의 `chunk`는 Gateway에서 delta로 변환하고, 원본 mock done
 
 ## 9. 삭제와 서비스 상태
 
-캐릭터 삭제는 원자적으로 deleting 표시와 deletion record를 만든 뒤 202를 반환한다.
-동시에 들어오는 새 질문·적용·업로드와 직렬화해, 삭제 수락 후 새 작업이 시작되지 않게 한다.
-실행 중 Job/생성을 중단하고 종료 확인·늦은 쓰기 fencing 후 정리한다. 일반 사용자용 ingestion cancel API가 없다는 것과 모순되지 않는다.
-ingestion 전용 역할/함수도 삭제 중 입력 읽기·늦은 결과 쓰기를 거부해야 한다.
+2026-09-28 변경: 비동기 삭제(202·deletion record·삭제 worker·실행 중 작업 강제 중단) 설계를 **동기 삭제(204)**로 바꿨다.
+worker·강제 취소 없이 실험용 캐릭터를 지우고 한도를 되돌리는 것이 1단계에 필요한 전부이기 때문이다.
 
-삭제 대상은 서비스가 보유한 업로드·초안/버전·처리 산출물·벡터·질문/답변·재시도 입력 snapshot이다.
-캐릭터 삭제는 논리 삭제(`deleted_at`)라 DB의 참조 연쇄로 지워지지 않는다. 삭제 worker가 명시적으로 지운다.
-처리 도중 실패하면 deletion failed와 persona deleting을 유지한다. 반쯤 지워진 캐릭터를 다시 ready로 표시하지 않는다.
-v1 복구는 운영자 런북으로 수행하며 사용자 복구 API/휴지통 UI는 없다. 삭제 worker 실행 방식·권한은 platform/gateway에서 별도 구현 설계한다.
-성공 후 persona GET은 404, 삭제 상태는 최소 owner-scoped record로 계속 조회 가능하다. 이름·본문을 tombstone에 남기지 않는다.
+캐릭터 삭제는 한 트랜잭션에서 검사와 정리를 함께 하고 204를 반환한다. 잠금 순서는 사용자 행 → 캐릭터 행이다.
+응답 생성 시작은 사용자 행을, 색인 시작·대화 생성·초안 변경은 캐릭터 행을 먼저 잠그므로 삭제 도중 새 작업이 시작되지 않는다.
+진행 중인 응답 생성(queued·running·cancel_requested·reconciling) 또는 색인(advisory lock 보유·status processing)이 있으면 409 `persona_busy`로 거절한다. 강제 취소는 하지 않는다.
+
+삭제 대상은 서비스가 보유한 초안/버전·자료·검색 조각(벡터)·대화·질문·생성 기록(답변·재시도 입력 snapshot 포함)과 그 멱등 기록이다.
+캐릭터 행은 tombstone으로 남긴다(`deleted_at`·`deletion_id` 기록, 이름 비움). 캐릭터 생성·삭제의 멱등 기록이 이 행을 가리켜, 옛 생성 키 재전송은 새 캐릭터를 만들지 않고 404가 된다.
+다른 캐릭터·사용자 데이터, 공유 모델 캐시·PVC는 건드리지 않는다. 휴지통·복원·일괄 삭제·강제 삭제는 없다.
+성공 후 persona GET은 404다. tombstone 행의 보존 기간 정리(7일)는 아직 구현하지 않았다.
 백업·복제본·로컬 원천 파일까지 무조건 지웠다는 뜻은 아니다. 백업 정책이 미결이면 “모든 사본 영구 삭제”라고 표시하지 않는다.
 
 service-status는 메타데이터 snapshot이다. generation.mode는 mock/llm, available은 그 시점의 사용 가능 판단이다.
@@ -301,7 +301,7 @@ ingestion 대기열에 작업이 있다는 것과 접수 불가능한 것은 다
 2. 첫 profile-only 업로드 성공, 문서 추가/제거, 설정-only 재사용, 실패 후 옛 자료 유지, 적용 전 혼입 방지.
 3. 같은 키 중복 업로드/재시도/적용, 응답 유실, 과거 작업 늦은 쓰기와 중복 활성 생성 차단.
 4. SSE UTF-8/이벤트 분할, done/error/EOF 구분, 취소/완료 경합, replay JSON, 새로고침 기록 조회.
-5. 캐릭터 삭제 중 처리 결과 도착·벡터 정리 실패·운영자 복구·과거 키 재전송을 테스트.
+5. 캐릭터 삭제: 연관 데이터 정리·한도 반환·타인 캐릭터 404·진행 중 생성/색인 409·과거 키 재전송을 테스트.
 6. 합성 fixture로 웹 → 실제 intake/Job/DB/검색 → mock generation을 연결. 실제 LLM 품질은 GPU 연결 후 별도 검증.
 
 ## 11. 확정 정책과 남은 설계
@@ -310,7 +310,7 @@ ingestion 대기열에 작업이 있다는 것과 접수 불가능한 것은 다
 
 | 항목 | 확정값·처리 |
 | --- | --- |
-| 캐릭터 수 | 사용자당 최대 3개. 삭제 중도 포함하고 삭제 완료 후에만 슬롯 반환 |
+| 캐릭터 수 | 사용자당 최대 3개. 삭제(동기)가 끝나면 바로 슬롯 반환 |
 | 원문 합계 | 사용자당 100 MiB(104857600 bytes). 적용본·초안·보관 중인 구버전의 원문 포함. **미구현** |
 | 제출 입력 | §4-6과 같다(코드포인트): events/relationships/abilities 각 200,000자, speech_examples 100,000자·줄당 500자, 소스 합계 500,000자(profile 제외 1,500자). 파일 20개, multipart body 6 MiB 유지(2026-09-18 구현, 옛 파일당 1 MiB·합계 5 MiB 바이트 상한 대체) |
 | 이번 질문 | 최대 2,000 Unicode 코드 포인트. 비공백 필수, 초과 시 422 `message_too_long`; 무음 잘라내기 없음 |
@@ -352,8 +352,8 @@ mock 출력에는 실제 모델 토큰 수를 꾸며내지 않는다. 512토큰 
 | 멱등 키 | 대상 작업/리소스가 남아 있는 동안 조기 만료 금지 |
 
 실행 중 요청·적용본·초안·보존 중인 재시도 snapshot이 참조하는 자료는 정리하지 않는다. 참조가 해제되어 실제 사용이 끝난 시점부터 구버전 정리 기간을 계산한다.
-캐릭터 삭제는 7일 유예가 아니다. 새 실행 차단 → 실행 종료 확인/늦은 쓰기 차단 → 서비스 원문·벡터·대화·임시 결과 정리 → 성공 기록 순서다.
-미완료 삭제 기록은 7일이 지나도 버리지 않는다. 실패는 deleting/복구 필요로 유지하며 휴지통·복원 UI는 없다.
+캐릭터 삭제는 7일 유예가 아니다. 진행 중 작업이 없을 때만 한 트랜잭션에서 원문·벡터·대화를 정리하고 tombstone을 남긴다. 실패하면 트랜잭션이 되돌려져 캐릭터가 그대로 남는다.
+휴지통·복원 UI는 없다.
 백업은 별도다. 배포 전 실제 pg_dump 등 사본과 보존 정책을 확인하고, 그 검증 없이 모든 사본 영구 삭제라고 표시하지 않는다.
 
 ### 아직 미결

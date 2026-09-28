@@ -43,7 +43,7 @@ Web의 검증은 세 층이고, 사라진 것은 그중 하나다.
 | 사용자 retry가 새 job을 만드는 규칙 미구현 | 자동 attempt retry와 구분, 옛 revision/실행과의 경합 차단 |
 | 설정 수정 없이 전체 입력만 접수 | draft PATCH·source 편집/제거·설정 변경 동기화·revision CAS 추가 |
 | 채팅 초안만 있고 SSE public route 없음 | generation 저장·동시성·취소/완료 경합·mock adapter·스트림/JSON replay 구분 |
-| 캐릭터 삭제 실행/권한 미구현 | deleting fencing·Job 종료 확인·Qdrant/DB cleanup·실패 복구·삭제 기록 유지 |
+| 캐릭터 삭제 | 동기 삭제(204·409 `persona_busy`)로 구현했다. 비동기 worker·강제 취소·deletion 조회 API는 두지 않는다. tombstone 보존 기간 정리는 미구현 |
 
 ## 소비자별 인수인계
 

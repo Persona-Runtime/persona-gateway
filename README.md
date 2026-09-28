@@ -11,7 +11,8 @@ Go Gateway와 dispatcher는 현재 활성 런타임이 아니다.
 | 운영 확인        | 인증 확인, 캐릭터 목록·생성, health/readiness             |
 | 현재 코드에 추가 | 캐릭터 상세 조회, 설정·자료 초안 생성·조회·수정·폐기      |
 | 현재 코드에 추가 | 검색 기반 채팅(SSE), vLLM 업스트림 어댑터(`llm` 모드, 실제 GPU 미검증) |
-| 미완료           | ingestion 자동 실행, 캐릭터 삭제 전체 흐름                |
+| 현재 코드에 추가 | 캐릭터 동기 삭제(`DELETE /v1/personas/{id}`, 204·409 `persona_busy`) |
+| 미완료           | ingestion 자동 실행                                       |
 
 2026-09-17 사용자 제공 결과 기준 운영 DB는 `0001_persona_minimal`이다.
 초안 API는 `0002_persona_draft` 작업이며 코드 구현과 운영 제공을 구분한다.

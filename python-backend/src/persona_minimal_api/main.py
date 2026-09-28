@@ -68,6 +68,7 @@ from .repository import (
     NotActivatable,
     NotIndexed,
     Persona,
+    PersonaBusy,
     PersonaLimitExceeded,
     PersonaNotFound,
     RevisionConflict,
@@ -630,6 +631,9 @@ def create_app(
             raise ApiError(
                 409, "idempotency_conflict", "같은 키에 다른 요청을 사용할 수 없습니다."
             ) from exc
+        except PersonaNotFound as exc:
+            # 이 키로 만든 캐릭터를 이미 삭제한 뒤의 재전송이다.
+            raise ApiError(404, "persona_not_found", "캐릭터를 찾을 수 없습니다.") from exc
         return persona_response(persona)
 
     def draft_error(error: Exception) -> ApiError:
@@ -691,6 +695,31 @@ def create_app(
         except Exception as error:
             raise draft_error(error) from error
         return persona_detail_response(persona)
+
+    @app.delete("/v1/personas/{persona_id}", status_code=204)
+    def delete_persona(
+        request: Request,
+        persona_id: UUID,
+        user: tuple[str, str] = Depends(authenticated_user),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        """캐릭터와 그 자료·대화 기록을 삭제한다(동기, 204).
+
+        진행 중인 응답 생성·색인이 있으면 409 persona_busy로 거절하고 강제 취소하지 않는다.
+        같은 키 재전송은 이미 삭제했어도 204다. 없거나 남의 캐릭터는 404로 같게 답한다.
+        """
+        key = require_idempotency_key(idempotency_key)
+        try:
+            request.app.state.store.delete_persona(user[0], persona_id, key)
+        except PersonaBusy as error:
+            raise ApiError(
+                409,
+                "persona_busy",
+                "응답 생성 또는 자료 색인이 진행 중입니다. 끝난 뒤 다시 시도하세요.",
+            ) from error
+        except Exception as error:
+            raise draft_error(error) from error
+        return Response(status_code=204)
 
     @app.post("/v1/personas/{persona_id}/draft", status_code=201)
     def create_draft(

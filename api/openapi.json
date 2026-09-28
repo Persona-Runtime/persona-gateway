@@ -279,11 +279,11 @@
       },
       "delete": {
         "operationId": "deletePersona",
-        "summary": "캐릭터 비동기 삭제 접수",
+        "summary": "캐릭터 동기 삭제",
         "tags": [
           "Operations"
         ],
-        "description": "캐릭터 비동기 삭제 접수",
+        "description": "캐릭터와 그 초안·적용본·자료·검색 조각·대화·메시지·생성 기록을 한 트랜잭션에서 삭제한다. 진행 중인 응답 생성 또는 자료 색인이 있으면 409 persona_busy로 거절하고 강제 취소하지 않는다. 없거나 다른 사용자 소유면 404 persona_not_found. 같은 Idempotency-Key 재전송은 이미 삭제했어도 204다.",
         "parameters": [
           {
             "in": "path",
@@ -299,15 +299,8 @@
           }
         ],
         "responses": {
-          "202": {
-            "description": "캐릭터 비동기 삭제 접수",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeletionAccepted"
-                }
-              }
-            }
+          "204": {
+            "description": "캐릭터 삭제 완료"
           },
           "400": {
             "$ref": "#/components/responses/Error400"
@@ -1471,69 +1464,6 @@
           },
           "error": {
             "$ref": "#/components/schemas/SseError"
-          }
-        }
-      }
-    },
-    "/v1/deletions/{deletion_id}": {
-      "get": {
-        "operationId": "getDeletion",
-        "summary": "소유자의 삭제 진행 조회",
-        "tags": [
-          "Operations"
-        ],
-        "description": "소유자의 삭제 진행 조회",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "deletion_id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "소유자의 삭제 진행 조회",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Deletion"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error400"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error401"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error404"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error409"
-          },
-          "413": {
-            "$ref": "#/components/responses/Error413"
-          },
-          "415": {
-            "$ref": "#/components/responses/Error415"
-          },
-          "422": {
-            "$ref": "#/components/responses/Error422"
-          },
-          "429": {
-            "$ref": "#/components/responses/Error429"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error500"
-          },
-          "503": {
-            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -2807,85 +2737,6 @@
         "required": [
           "replayed",
           "generation"
-        ]
-      },
-      "Deletion": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "persona_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "pending",
-              "running",
-              "succeeded",
-              "failed"
-            ]
-          },
-          "failure_code": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "finished_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "persona_id",
-          "status",
-          "failure_code",
-          "created_at",
-          "finished_at"
-        ]
-      },
-      "DeletionAccepted": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "deletion_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "pending",
-              "running",
-              "succeeded",
-              "failed"
-            ]
-          }
-        },
-        "required": [
-          "deletion_id",
-          "status"
         ]
       },
       "ServiceStatus": {
