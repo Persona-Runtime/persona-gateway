@@ -36,6 +36,10 @@ class UpstreamError(Exception):
 
 
 class InferenceClient(Protocol):
+    # 이 upstream에 보낼 프롬프트를 어떤 버전으로 조립할지(retrieval/prompt.py). 샘플링과 같이
+    # 팩토리가 설정에서 한 번 정한다 — 서비스는 build_messages에 이 값을 그대로 넘긴다.
+    prompt_version: str
+
     def start(
         self, generation_id: UUID, messages: list[Message], *, max_tokens: int
     ) -> Iterator[str]:

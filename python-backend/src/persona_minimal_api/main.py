@@ -34,7 +34,7 @@ from .build_info import record_build_info
 from .chat import metrics as chat_metrics
 from .chat import service as chat_service
 from .chat.fake_inference import MOCK_WORKLOAD_PROFILES, FakeInferenceClient
-from .chat.vllm_client import VllmInferenceClient
+from .chat.vllm_client import SamplingParams, VllmInferenceClient
 from .chat.inference import InferenceClient
 from .chat.lease import GenerationLeaseKeeper
 from .chat.repository import (
@@ -347,7 +347,25 @@ def build_inference_client(settings: Settings) -> InferenceClient:
 
     llm인데 연결 설정이 비어 있는 경우는 여기까지 오지 않는다 — Settings의
     llm_settings_are_complete가 기동 시점에 이미 막는다.
+
+    프롬프트 버전·샘플링(config.py Q-1 구획)도 여기서 client에 고정한다. 라우트·서비스는
+    이 값을 따로 받지 않고 client에서 읽는다.
     """
+    sampling = SamplingParams(
+        temperature=settings.vllm_temperature,
+        top_p=settings.vllm_top_p,
+        top_k=settings.vllm_top_k,
+        min_p=settings.vllm_min_p,
+        presence_penalty=settings.vllm_presence_penalty,
+        repetition_penalty=settings.vllm_repetition_penalty,
+    )
+    chat_metrics.GENERATION_CONFIG.info(
+        {
+            "mode": settings.chat_inference_mode,
+            "prompt_version": settings.prompt_version,
+            **{name: str(value) for name, value in sampling.payload_fields().items()},
+        }
+    )
     if settings.chat_inference_mode == "mock":
         profile = MOCK_WORKLOAD_PROFILES[settings.chat_mock_profile]
         chat_metrics.MOCK_WORKLOAD.info(
@@ -357,7 +375,7 @@ def build_inference_client(settings: Settings) -> InferenceClient:
                 "fragment_interval_seconds": str(profile.fragment_interval_seconds),
             }
         )
-        return FakeInferenceClient.from_profile(profile)
+        return FakeInferenceClient.from_profile(profile, prompt_version=settings.prompt_version)
     # llm 모드는 chat_mock_profile을 읽지 않는다 — mock 설정이 vLLM 요청에 섞이지 않게.
     # mypy·독자 모두에게: 위 validator가 보장하지만 타입상으로는 None일 수 있다.
     assert settings.vllm_base_url is not None
@@ -371,6 +389,8 @@ def build_inference_client(settings: Settings) -> InferenceClient:
         connect_timeout_seconds=settings.vllm_connect_timeout_seconds,
         first_token_timeout_seconds=settings.vllm_first_token_timeout_seconds,
         idle_timeout_seconds=settings.vllm_idle_timeout_seconds,
+        sampling=sampling,
+        prompt_version=settings.prompt_version,
     )
 
 

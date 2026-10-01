@@ -24,6 +24,7 @@ from ..retrieval.prompt import (
     BUDGET_4096,
     BUDGET_8192,
     PromptBudget,
+    PromptStats,
     QuestionTooLong,
     build_messages,
 )
@@ -155,6 +156,34 @@ def _version_settings(pool: ConnectionPool, version_id: UUID) -> tuple[str, str]
     if row is None:
         raise PersonaNotFound
     return row["settings_name"], row["settings_profile"]
+
+
+def _log_prompt_stats(generation_id: UUID, stats: PromptStats) -> None:
+    """조립된 프롬프트의 버전과 블록별 글자 수만 남긴다.
+
+    프롬프트 버전은 generation 행에 컬럼이 없어(스키마 변경은 이번 범위 밖) 로그로 대조한다.
+    본문(질문·조각·이력)은 사용자 데이터라 남기지 않는다 — PromptStats에는 숫자만 있다.
+
+    전제: 이 앱은 로깅 설정을 하지 않아 uvicorn 기본 실행에서는 INFO가 출력되지 않는다
+    (2026-10-01 골든셋 실행에서 확인). 그때 프로세스의 프롬프트 버전은
+    `persona_chat_generation_config` Info 메트릭으로 확인한다.
+    """
+    logger.info(
+        "prompt assembled generation_id=%s prompt_version=%s budget_profile=%s "
+        "chars(system=%d speech=%d references=%d history=%d question=%d) "
+        "dropped(speech=%d references=%d history_messages=%d)",
+        generation_id,
+        stats.prompt_version,
+        stats.budget_profile,
+        stats.system_and_settings_chars,
+        stats.speech_chars,
+        stats.references_chars,
+        stats.history_chars,
+        stats.question_chars,
+        stats.speech_chunks_dropped,
+        stats.reference_chunks_dropped,
+        stats.history_turns_dropped,
+    )
 
 
 def _citations_from_chunks(version_id: UUID, chunks: list[RetrievedChunk]) -> list[Citation]:
@@ -323,7 +352,10 @@ def _run_generation(
                 question=question,
                 # generation.mode는 접수 시점에 이 프로세스가 고른 업스트림이다(repository).
                 budget=prompt_budget_for_mode(generation.mode),
+                # 버전은 업스트림 설정과 함께 팩토리가 client에 고정해 둔 값이다.
+                prompt_version=inference_client.prompt_version,
             )
+            _log_prompt_stats(generation.id, result.stats)
             messages = result.messages
             citations = _citations_from_chunks(
                 generation.version_id, result.body_chunks_used + result.speech_chunks_used

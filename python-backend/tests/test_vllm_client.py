@@ -540,3 +540,97 @@ def test_api_key_is_sent_as_a_header_and_never_appears_in_errors() -> None:
 
     assert seen[0] == f"Bearer {SYNTHETIC_API_KEY}"
     assert SYNTHETIC_API_KEY not in str(raised.value)
+
+
+# --- 샘플링 명시 (Q-1) -----------------------------------------------------
+
+DEFAULT_SAMPLING_FIELDS = {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.0,
+    "repetition_penalty": 1.0,
+}
+
+
+def send_once(client: VllmInferenceClient, seen: list[dict[str, object]]) -> None:
+    """요청 한 번을 끝까지 보내고 upstream이 정확히 한 번 받았는지 확인한다."""
+    collect(client)
+    client.close()
+    assert len(seen) == 1
+
+
+def body_recording_upstream(seen: list[dict[str, object]]):
+    """받은 요청 body를 `seen`에 쌓고 바로 [DONE]으로 끝내는 합성 upstream."""
+
+    def respond(request: BaseHTTPRequestHandler) -> None:
+        seen.append(json.loads(request.body))  # type: ignore[attr-defined]
+        begin_stream(request)
+        write(request, "data: [DONE]\n\n")
+
+    return running_upstream(respond)
+
+
+def test_request_body_carries_default_sampling_when_nothing_is_configured() -> None:
+    seen: list[dict[str, object]] = []
+    with body_recording_upstream(seen) as url:
+        send_once(client_for(url), seen)
+
+    for field, expected in DEFAULT_SAMPLING_FIELDS.items():
+        assert seen[0][field] == expected, field
+    # max_tokens는 기존처럼 호출자가 준 값 그대로다.
+    assert seen[0]["max_tokens"] == 8
+
+
+def test_settings_defaults_match_the_client_defaults() -> None:
+    # env를 하나도 주지 않은 Settings로 만든 client도 같은 기본값을 보내야 한다.
+    seen: list[dict[str, object]] = []
+    with body_recording_upstream(seen) as url:
+        client = build_inference_client(llm_settings(url))
+        assert isinstance(client, VllmInferenceClient)
+        send_once(client, seen)
+
+    for field, expected in DEFAULT_SAMPLING_FIELDS.items():
+        assert seen[0][field] == expected, field
+    assert client.prompt_version == "v2"
+
+
+def test_configured_sampling_and_prompt_version_reach_the_upstream_request() -> None:
+    # env 이름·문자열 파싱은 test_config.py가 본다. 여기서는 설정값이 팩토리를 거쳐 요청에
+    # 그대로 실리는지만 본다.
+    seen: list[dict[str, object]] = []
+    with body_recording_upstream(seen) as url:
+        settings = llm_settings(url).model_copy(
+            update={
+                "prompt_version": "v1",
+                "vllm_temperature": 0.3,
+                "vllm_top_p": 0.95,
+                "vllm_top_k": -1,
+                "vllm_min_p": 0.05,
+                "vllm_presence_penalty": 1.5,
+                "vllm_repetition_penalty": 1.1,
+            }
+        )
+        client = build_inference_client(settings)
+        assert isinstance(client, VllmInferenceClient)
+        send_once(client, seen)
+
+    assert seen[0]["temperature"] == 0.3
+    assert seen[0]["top_p"] == 0.95
+    assert seen[0]["top_k"] == -1
+    assert seen[0]["min_p"] == 0.05
+    assert seen[0]["presence_penalty"] == 1.5
+    assert seen[0]["repetition_penalty"] == 1.1
+    # 프롬프트 버전은 upstream 요청 필드가 아니다 — 서비스가 조립할 때만 쓴다.
+    assert "prompt_version" not in seen[0]
+    assert client.prompt_version == "v1"
+
+
+def test_mock_client_also_carries_the_configured_prompt_version() -> None:
+    mock_settings = llm_settings("http://unused.invalid").model_copy(
+        update={"chat_inference_mode": "mock", "prompt_version": "v1"}
+    )
+    client = build_inference_client(mock_settings)
+    assert isinstance(client, FakeInferenceClient)
+    assert client.prompt_version == "v1"

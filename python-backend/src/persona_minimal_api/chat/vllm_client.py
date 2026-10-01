@@ -11,7 +11,9 @@ threadpool)에서 부르므로, 여기 상태는 잠금으로 보호한다.
   여기 timeout은 그보다 짧은 **소켓·스트림 보호**이고, 사용자에게 보이는 상한을 정하지
   않는다.
 - 프롬프트 조립(RAG·예산)은 `retrieval/prompt.py`가 이미 끝냈다. 여기서는 내부 `Message`를
-  OpenAI messages 배열로 옮기기만 한다.
+  OpenAI messages 배열로 옮기기만 한다. 다만 어떤 프롬프트 버전으로 조립할지(`prompt_version`)는
+  샘플링과 함께 이 client가 들고 있다 — 둘 다 "이 프로세스가 upstream에 무엇을 보내는가"라는
+  같은 설정이라, 팩토리(`main.build_inference_client`) 한 곳에서 정해 서비스가 읽게 한다.
 
 기록하지 않는 것(의도적): 프롬프트·응답 원문·응답 헤더·URL·API key. 오류에는 고정 분류
 문자열과 HTTP 상태 코드만 넣는다 — 그 문자열이 그대로 generation의 `failure_code`와 SSE
@@ -26,11 +28,12 @@ import queue
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from uuid import UUID
 
 import httpx
 
-from ..retrieval.prompt import Message
+from ..retrieval.prompt import DEFAULT_PROMPT_VERSION, Message
 from .inference import UpstreamError
 
 logger = logging.getLogger(__name__)
@@ -47,6 +50,35 @@ OUTCOME_MALFORMED = "upstream_malformed_response"
 # fake와 같은 code를 쓴다 — 서비스 계층이 둘을 구분할 이유가 없고, 운영에서 보는 실패
 # 분류가 어댑터마다 갈라지면 대시보드도 갈라진다.
 OUTCOME_DISCONNECTED = "upstream_disconnected"
+
+
+@dataclass(frozen=True)
+class SamplingParams:
+    """요청마다 명시하는 샘플링 값. 기본값은 config.py Q-1 구획과 같다.
+
+    값을 생략하면 vLLM이 모델 generation_config 기본값을 쓰는데, 그러면 실제로 어떤 값으로
+    답했는지 코드에서 보이지 않아 실험 비교가 안 된다. 그래서 항상 전부 보낸다.
+    """
+
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+    min_p: float = 0.0
+    presence_penalty: float = 1.0
+    repetition_penalty: float = 1.0
+
+    def payload_fields(self) -> dict[str, float | int]:
+        return {
+            # OpenAI Chat Completions 표준 필드.
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "presence_penalty": self.presence_penalty,
+            # vLLM 확장 필드(OpenAI 표준에 없음). vLLM OpenAI 호환 서버는 이 이름들을 최상위
+            # 필드로 받는다. 다른 OpenAI 호환 서버로 바꾸면 무시되거나 거부될 수 있다.
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "repetition_penalty": self.repetition_penalty,
+        }
 
 
 class _StreamDone:
@@ -79,10 +111,15 @@ class VllmInferenceClient:
         connect_timeout_seconds: float,
         first_token_timeout_seconds: float,
         idle_timeout_seconds: float,
+        sampling: SamplingParams | None = None,
+        prompt_version: str = DEFAULT_PROMPT_VERSION,
         client: httpx.Client | None = None,
     ):
         self._url = f"{base_url.rstrip('/')}{CHAT_COMPLETIONS_PATH}"
         self._model = model
+        self._sampling = sampling if sampling is not None else SamplingParams()
+        # InferenceClient 계약의 속성. 서비스가 build_messages에 넘긴다.
+        self.prompt_version = prompt_version
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._first_token_timeout = first_token_timeout_seconds
         self._idle_timeout = idle_timeout_seconds
@@ -180,6 +217,7 @@ class VllmInferenceClient:
             # 실수로 upstream에 나가지 않는다.
             "messages": [{"role": item.role, "content": item.content} for item in messages],
             "max_tokens": max_tokens,
+            **self._sampling.payload_fields(),
             "stream": True,
         }
         if attempt.cancelled.is_set():
