@@ -5,7 +5,7 @@
 """골든셋 채점기 — run.py 결과(jsonl)에 규칙 지표와 LLM 심판 점수를 매겨 summary를 쓴다.
 
 - 규칙 지표(LLM 없음): 금지 문자열 포함, 문장 수, 한글 외 문자 비율, 검색 recall@5·
-  citation precision.
+  citation precision, unknown 문항의 모른다율.
 - LLM 심판: OpenAI 호환 엔드포인트 하나(env `QUALITY_JUDGE_*`)에 루브릭·기대 사실·답변을 주고
   5축 1~5점 JSON을 받는다. 심판이 외부 API면 답변 원문이 그쪽으로 간다 — **합성 자료로만
   돌린다는 전제**에서만 허용한다(README).
@@ -57,6 +57,19 @@ AXIS_LABELS = {
     "length_format": "길이·형식",
 }
 RECALL_AT = 5
+# unknown 문항에서 "모른다/기억이 흐릿하다"고 답했는지 보는 표현. 같은 소형 모델을 심판으로 쓰면
+# 지어낸 답에도 '지어냄 없음' 고점을 주는 일이 실측에서 나와(2026-10-01 baseline), LLM 없이
+# 판정하는 보조 지표로 둔다. 표현이 있어도 뒤에서 지어낼 수 있으므로 상한 신호로만 읽는다.
+ABSTAIN_MARKERS = (
+    "모르",
+    "몰라",
+    "기억 안",
+    "기억이 안",
+    "기억이 흐릿",
+    "흐릿",
+    "글쎄",
+    "생각이 안 나",
+)
 # 말투 예시 citation은 검색 정답 비교에서 뺀다 — 정답 조각은 사건·관계 본문이다.
 SPEECH_CITATION_PREFIX = "말투 예시"
 
@@ -128,6 +141,12 @@ def rule_metrics(record: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]
         "non_hangul_ratio": round(non_hangul_letter_ratio(answer), 4),
         "recall_at_5": recall,
         "citation_precision": precision,
+        # unknown 문항만 값이 있다(그 밖은 None).
+        "abstained": (
+            any(marker in answer for marker in ABSTAIN_MARKERS)
+            if item["type"] == "unknown"
+            else None
+        ),
     }
 
 
@@ -200,6 +219,21 @@ def parse_judge_json(text: str) -> dict[str, Any]:
     return scores
 
 
+def _post_with_one_retry(
+    client: httpx.Client, url: str, payload: dict[str, Any], headers: dict[str, str]
+) -> httpx.Response:
+    """전송 계층 오류(연결 끊김 등)에만 한 번 더 시도한다.
+
+    공유 vLLM에서 응답 없이 연결이 끊기는 일이 실측 중에 있었다. 같은 요청을 한 번 더 보내도
+    채점 결과는 바뀌지 않으므로 재시도한다. HTTP 상태 오류·형식 오류는 재시도하지 않고 그대로
+    judge_error로 드러낸다.
+    """
+    try:
+        return client.post(url, json=payload, headers=headers)
+    except httpx.TransportError:
+        return client.post(url, json=payload, headers=headers)
+
+
 def judge(client: httpx.Client, config: JudgeConfig, prompt: str) -> dict[str, Any]:
     """심판 한 번. 실패는 숨기지 않고 `judge_error`로 돌려준다(0점·skip으로 바꾸지 않는다)."""
     headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else {}
@@ -210,8 +244,8 @@ def judge(client: httpx.Client, config: JudgeConfig, prompt: str) -> dict[str, A
         "max_tokens": JUDGE_MAX_TOKENS,
     }
     try:
-        response = client.post(
-            f"{config.base_url}/v1/chat/completions", json=payload, headers=headers
+        response = _post_with_one_retry(
+            client, f"{config.base_url}/v1/chat/completions", payload, headers
         )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
@@ -233,13 +267,19 @@ def fmt(value: float | None, digits: int = 2) -> str:
 
 
 def aggregate(rows: list[dict[str, Any]]) -> dict[str, float | None]:
-    """문항 묶음 하나의 평균. 심판 실패·미실행 문항은 심판 평균에서 빠진다(개수는 따로 센다)."""
+    """문항 묶음 하나의 평균. 심판 실패·미실행 문항은 심판 평균에서 빠진다(개수는 따로 센다).
+
+    앞 턴 실패로 본 질문을 하지 않은 문항(history_failed)은 규칙 지표에서도 뺀다. 빈 답·빈
+    citation으로 집계하면 recall 0처럼 "검색이 틀렸다"는 잘못된 숫자가 섞이기 때문이다.
+    """
     judged = [
         row["judge"] for row in rows if row.get("judge") and "judge_error" not in row["judge"]
     ]
     summary: dict[str, float | None] = {axis: mean([j[axis] for j in judged]) for axis in AXES}
     summary["judge_overall"] = mean([sum(j[axis] for axis in AXES) / len(AXES) for j in judged])
     summary["n"] = len(rows)
+    rows = [row for row in rows if not row.get("history_failed")]
+    summary["asked"] = len(rows)
     summary["judged"] = len(judged)
     summary["must_not_rate"] = mean([1.0 if row["rules"]["must_not_hits"] else 0.0 for row in rows])
     summary["sentences"] = mean([row["rules"]["sentences"] for row in rows])
@@ -254,6 +294,10 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     ]
     summary["recall_at_5"] = mean(recalls)
     summary["precision"] = mean(precisions)
+    abstains = [
+        row["rules"]["abstained"] for row in rows if row["rules"].get("abstained") is not None
+    ]
+    summary["abstain_rate"] = mean([1.0 if value else 0.0 for value in abstains])
     summary["ttft_ms"] = mean([row["ttft_ms"] for row in rows if row.get("ttft_ms") is not None])
     summary["total_ms"] = mean([row["total_ms"] for row in rows if row.get("total_ms") is not None])
     return summary
@@ -263,9 +307,9 @@ def render_summary(
     label: str, config: dict[str, Any], rows: list[dict[str, Any]], note: str
 ) -> str:
     header = (
-        "| 유형 | n | 심판 | "
+        "| 유형 | 질문/전체 | 심판 | "
         + " | ".join(AXIS_LABELS[axis] for axis in AXES)
-        + " | 심판 평균 | 금지어율 | 문장 수 | 비한글 | recall@5 | precision | TTFT ms | 총 ms |"
+        + " | 심판 평균 | 금지어율 | 문장 수 | 비한글 | recall@5 | precision | 모른다율 | TTFT ms | 총 ms |"
     )
     divider = "|" + " --- |" * (header.count("|") - 1)
     lines = [
@@ -285,11 +329,11 @@ def render_summary(
             continue
         s = aggregate(group)
         lines.append(
-            f"| {name} | {s['n']} | {s['judged']} | "
+            f"| {name} | {s['asked']}/{s['n']} | {s['judged']} | "
             + " | ".join(fmt(s[axis]) for axis in AXES)
             + f" | {fmt(s['judge_overall'])} | {fmt(s['must_not_rate'])} | {fmt(s['sentences'], 1)}"
             + f" | {fmt(s['non_hangul'], 3)} | {fmt(s['recall_at_5'])} | {fmt(s['precision'])}"
-            + f" | {fmt(s['ttft_ms'], 0)} | {fmt(s['total_ms'], 0)} |"
+            + f" | {fmt(s['abstain_rate'])} | {fmt(s['ttft_ms'], 0)} | {fmt(s['total_ms'], 0)} |"
         )
     lines += [
         "",

@@ -280,7 +280,13 @@ def run_question(gateway: Gateway, persona_id: str, item: dict[str, Any]) -> dic
         actual_history.append({"role": "user", "content": turn["content"]})
         actual_history.append({"role": "assistant", "content": warmup.answer})
         if warmup.status != "completed":
-            return {"history_failed": True, "actual_history": actual_history}
+            # 실패 원인(failure_code)을 남겨야 baseline·비교 결과에서 이 문항이 왜 빠졌는지 읽힌다.
+            return {
+                "history_failed": True,
+                "status": warmup.status,
+                "failure_code": warmup.failure_code,
+                "actual_history": actual_history,
+            }
 
     result = gateway.chat(conversation_id, item["question"])
     return {

@@ -163,6 +163,10 @@ def _log_prompt_stats(generation_id: UUID, stats: PromptStats) -> None:
 
     프롬프트 버전은 generation 행에 컬럼이 없어(스키마 변경은 이번 범위 밖) 로그로 대조한다.
     본문(질문·조각·이력)은 사용자 데이터라 남기지 않는다 — PromptStats에는 숫자만 있다.
+
+    전제: 이 앱은 로깅 설정을 하지 않아 uvicorn 기본 실행에서는 INFO가 출력되지 않는다
+    (2026-10-01 골든셋 실행에서 확인). 그때 프로세스의 프롬프트 버전은
+    `persona_chat_generation_config` Info 메트릭으로 확인한다.
     """
     logger.info(
         "prompt assembled generation_id=%s prompt_version=%s budget_profile=%s "
