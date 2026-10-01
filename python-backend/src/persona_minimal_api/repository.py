@@ -79,7 +79,12 @@ DRAFT_KINDS = ("profile", "events", "relationships", "abilities", "speech_exampl
 # 이 이미지는 기동은 하지만 readyz가 503이라 트래픽을 받지 않는다(롤아웃이 NotReady에서 멈춘다).
 # 0004 모드 코드(lease_schema_ready와 lease 없는 회수 분기)는 다음 스키마 전환 때 재사용할
 # "호환 창 도구"로 남긴다.
-SUPPORTED_ALEMBIC_REVISIONS = ("0005_generation_lease",)
+# 2026-10-01 A-1 bridge 릴리스(계정·세션): 0005·0006 둘 다 허용한다. 0006은 테이블 추가뿐이라
+# 이 이미지는 0005 DB에서도 auth 경로만 503(AuthSchemaNotReady)이고 나머지 기능은 그대로 동작한다.
+# 지금 운영 이미지는 0005만 허용하므로(완전 일치 검사) 0006 DB에서는 NotReady가 된다 — 그래서
+# 순서는 이 bridge 롤아웃(DB는 아직 0005) → migration 0006 Job → grants → 기능 릴리스(0006만
+# 허용하도록 좁히기)다. 0003·0004·0005와 같은 "넓혔다가 좁히기" 무중단 절차다.
+SUPPORTED_ALEMBIC_REVISIONS = ("0005_generation_lease", "0006_auth_sessions")
 # 초안(material_versions·material_sources 등) 테이블은 0002에서 생겼다. 호환 창이
 # 열려 있었을 때(위 SUPPORTED_ALEMBIC_REVISIONS가 0003·0004 둘 다 허용하던 동안)
 # 이 목록도 "0003까지는 있다"는 뜻으로 넓혀 뒀다 — 지금은 창이 닫혔지만, 다음 호환
@@ -90,6 +95,7 @@ DRAFT_SCHEMA_REVISIONS = (
     "0003_material_chunks",
     "0004_chat",
     "0005_generation_lease",
+    "0006_auth_sessions",
 )
 # 채팅 스키마(conversations·user_messages·generations)는 0004에서 생겼다. 호환 창이
 # 열려 있었을 때(SUPPORTED_ALEMBIC_REVISIONS가 0003도 허용하던 동안) 0003 DB엔 이
@@ -97,7 +103,7 @@ DRAFT_SCHEMA_REVISIONS = (
 # draft_schema_ready와 같은 "호환 창 도구" 패턴으로 이걸 가른다. 지금은 SUPPORTED_
 # ALEMBIC_REVISIONS가 0004 하나뿐이라 이 튜플이 사실상 단일값과 같지만, 다음 호환
 # 릴리스에서 다시 넓혀 쓴다.
-CHAT_SCHEMA_REVISIONS = ("0004_chat", "0005_generation_lease")
+CHAT_SCHEMA_REVISIONS = ("0004_chat", "0005_generation_lease", "0006_auth_sessions")
 
 
 def draft_schema_ready(cur) -> bool:

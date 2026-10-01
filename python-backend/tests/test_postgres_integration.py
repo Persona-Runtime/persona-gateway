@@ -247,15 +247,15 @@ def test_readyz_requires_the_revision_this_release_supports(
 ) -> None:
     """이 릴리스가 요구하는 revision에서만 Ready다.
 
-    2026-09-25 기능 릴리스(bridge 창 종료) — migration 0005_generation_lease가 운영에 적용된
-    뒤라 0005만 200이다. bridge 이미지가 허용하던 0004는 이제 503이다: 0004 DB로 되돌아간
-    환경에 이 이미지가 롤아웃되면 새 Pod가 Ready가 되지 않아 트래픽을 받지 않는다. 0003 이하와
-    알 수 없는 값도 503이다(api/generation-ownership-lease-design.md 3절).
+    2026-10-01 A-1 bridge 릴리스 — 0005·0006 둘 다 200이다. 이 이미지를 0005 DB에 먼저 롤아웃한
+    뒤 migration 0006을 적용해도 어느 시점에도 NotReady가 되지 않는다(0005에서는 auth 경로만 503).
+    0004 이하와 알 수 없는 값은 503이다. 다음 기능 릴리스에서 0006 하나로 좁힌다.
 
     revision 이름을 상수에서 읽지 않고 직접 적는다. 상수를 순회하면 허용 목록을
     바꿨을 때 검사 범위도 같이 바뀌어, 정작 막으려던 회귀를 놓친다.
     """
-    assert SUPPORTED_ALEMBIC_REVISIONS == ("0005_generation_lease",)
+    assert SUPPORTED_ALEMBIC_REVISIONS == ("0005_generation_lease", "0006_auth_sessions")
+    assert _readyz_with_revision(store, "0006_auth_sessions") == 200
     assert _readyz_with_revision(store, "0005_generation_lease") == 200
     assert _readyz_with_revision(store, "0004_chat") == 503
     assert _readyz_with_revision(store, "0003_material_chunks") == 503
@@ -4816,3 +4816,303 @@ def test_delete_persona_is_rejected_while_a_generation_is_active(
         generation.id, status="completed", content="합성", failure_code=None
     )
     assert api.delete(f"/v1/personas/{persona.id}", headers=_auth()).status_code == 204
+
+
+# --- 계정·세션 인증(A-1, migration 0006) ---
+# 메모리 fake로는 볼 수 없는 DB 보장만 여기서 본다: 한 트랜잭션 가입, UNIQUE 경합, FOR UPDATE로
+# 직렬화된 실패 횟수, DB 시계 기준 만료, 사용자별 캐릭터 격리. 아이디·비밀번호는 합성 값이다.
+
+_AUTH_PASSWORD = "integration-pass-1"
+
+
+def _auth_settings(**env: str) -> Settings:
+    return Settings(
+        DATABASE_URL="postgresql://unused",
+        PERSONA_EMBEDDING_URL="http://embedding.invalid",
+        PERSONA_STATIC_BEARER_TOKEN="integration-token",
+        PERSONA_STATIC_USER_ID=f"auth-static-{uuid4()}",
+        PERSONA_STATIC_DISPLAY_NAME="통합 사용자",
+        PERSONA_CURSOR_SIGNING_KEY="integration-cursor-key",
+        **env,
+    )
+
+
+def _unique_username() -> str:
+    # 모듈이 DB 하나를 공유하므로 테스트마다 다른 아이디를 쓴다.
+    return f"it_{uuid4().hex[:12]}"
+
+
+def _signup(app: TestClient, username: str, password: str = _AUTH_PASSWORD):
+    return app.post("/v1/auth/signup", json={"username": username, "password": password})
+
+
+def _login(app: TestClient, username: str, password: str = _AUTH_PASSWORD):
+    return app.post("/v1/auth/login", json={"username": username, "password": password})
+
+
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_auth_signup_login_logout_persist_only_hashes(store: PostgresPersonaStore) -> None:
+    username = _unique_username()
+    with TestClient(create_app(_auth_settings(), store)) as app:
+        signed_up = _signup(app, username)
+        assert signed_up.status_code == 201, signed_up.text
+        subject = signed_up.json()["user"]["id"]
+        assert app.get("/v1/me", headers=_bearer(signed_up.json()["token"])).status_code == 200
+
+        logged_in = _login(app, username.upper())
+        assert logged_in.status_code == 200, logged_in.text
+        token = logged_in.json()["token"]
+        assert app.post("/v1/auth/logout", headers=_bearer(token)).status_code == 204
+        assert app.get("/v1/me", headers=_bearer(token)).status_code == 401
+
+    with store.pool.connection() as connection:
+        password_hash = connection.execute(
+            "SELECT password_hash FROM persona_minimal.credentials WHERE subject = %s",
+            (subject,),
+        ).fetchone()[0]
+        session_hashes = [
+            bytes(row[0])
+            for row in connection.execute(
+                "SELECT token_hash FROM persona_minimal.sessions WHERE subject = %s", (subject,)
+            ).fetchall()
+        ]
+    assert password_hash.startswith("$argon2id$")
+    assert _AUTH_PASSWORD not in password_hash
+    assert hashlib.sha256(token.encode()).digest() in session_hashes
+    assert all(token.encode() != stored for stored in session_hashes)
+
+
+def test_session_users_only_see_their_own_personas(store: PostgresPersonaStore) -> None:
+    with TestClient(create_app(_auth_settings(), store)) as app:
+        first = _signup(app, _unique_username()).json()["token"]
+        second = _signup(app, _unique_username()).json()["token"]
+        for token, name in ((first, "첫 사용자 캐릭터"), (second, "둘째 사용자 캐릭터")):
+            created = app.post(
+                "/v1/personas",
+                headers={**_bearer(token), "Idempotency-Key": str(uuid4())},
+                json={"name": name},
+            )
+            assert created.status_code == 201, created.text
+
+        first_names = [
+            item["name"] for item in app.get("/v1/personas", headers=_bearer(first)).json()["items"]
+        ]
+        second_names = [
+            item["name"]
+            for item in app.get("/v1/personas", headers=_bearer(second)).json()["items"]
+        ]
+
+    assert first_names == ["첫 사용자 캐릭터"]
+    assert second_names == ["둘째 사용자 캐릭터"]
+
+
+def test_concurrent_signups_with_same_username_create_one_account(
+    store: PostgresPersonaStore,
+) -> None:
+    """같은 아이디 동시 가입은 UNIQUE 제약이 하나만 통과시키고, 진 쪽은 users 행도 남기지 않는다."""
+    username = _unique_username()
+    attempts = 4
+    with TestClient(create_app(_auth_settings(), store)) as app:
+        with ThreadPoolExecutor(max_workers=attempts) as pool:
+            statuses = sorted(
+                pool.map(lambda _: _signup(app, username).status_code, range(attempts))
+            )
+
+    assert statuses == [201] + [409] * (attempts - 1)
+    with store.pool.connection() as connection:
+        accounts = connection.execute(
+            "SELECT count(*) FROM persona_minimal.credentials WHERE username = %s", (username,)
+        ).fetchone()[0]
+        users = connection.execute(
+            "SELECT count(*) FROM persona_minimal.users WHERE display_name = %s", (username,)
+        ).fetchone()[0]
+    assert (accounts, users) == (1, 1)
+
+
+def test_concurrent_wrong_logins_are_all_counted(store: PostgresPersonaStore) -> None:
+    """credentials 행 잠금으로 동시 실패가 서로의 증가분을 덮어쓰지 않는다."""
+    username = _unique_username()
+    attempts = 5
+    settings = _auth_settings(PERSONA_LOGIN_LOCK_THRESHOLD="100")
+    with TestClient(create_app(settings, store)) as app:
+        assert _signup(app, username).status_code == 201
+        with ThreadPoolExecutor(max_workers=attempts) as pool:
+            statuses = list(
+                pool.map(
+                    lambda _: _login(app, username, "integration-wrong-1").status_code,
+                    range(attempts),
+                )
+            )
+
+    assert statuses == [401] * attempts
+    with store.pool.connection() as connection:
+        failed = connection.execute(
+            "SELECT failed_attempts FROM persona_minimal.credentials WHERE username = %s",
+            (username,),
+        ).fetchone()[0]
+    assert failed == attempts
+
+
+def test_lock_survives_new_app_and_uses_db_clock(store: PostgresPersonaStore) -> None:
+    username = _unique_username()
+    settings = _auth_settings(PERSONA_LOGIN_LOCK_THRESHOLD="2")
+    with TestClient(create_app(settings, store)) as app:
+        _signup(app, username)
+        for _ in range(2):
+            assert _login(app, username, "integration-wrong-1").status_code == 401
+
+    with TestClient(create_app(settings, PostgresPersonaStore(store.pool))) as recreated:
+        locked = _login(recreated, username)
+        assert locked.status_code == 423
+        assert 1 <= int(locked.headers["Retry-After"]) <= 900
+
+        with store.pool.connection() as connection:
+            connection.execute(
+                "UPDATE persona_minimal.credentials SET locked_until = now() - interval '1 second' "
+                "WHERE username = %s",
+                (username,),
+            )
+        assert _login(recreated, username).status_code == 200
+
+
+def _session_row(store: PostgresPersonaStore, token: str) -> dict:
+    with store.pool.connection() as connection:
+        row = connection.execute(
+            "SELECT last_seen_at, expires_at FROM persona_minimal.sessions WHERE token_hash = %s",
+            (hashlib.sha256(token.encode()).digest(),),
+        ).fetchone()
+    return {"last_seen_at": row[0], "expires_at": row[1]}
+
+
+def test_last_seen_is_written_at_most_once_per_minute(store: PostgresPersonaStore) -> None:
+    with TestClient(create_app(_auth_settings(), store)) as app:
+        token = _signup(app, _unique_username()).json()["token"]
+        app.get("/v1/me", headers=_bearer(token))
+        first_seen = _session_row(store, token)["last_seen_at"]
+        app.get("/v1/me", headers=_bearer(token))
+        assert first_seen is not None
+        assert _session_row(store, token)["last_seen_at"] == first_seen
+
+        with store.pool.connection() as connection:
+            connection.execute(
+                "UPDATE persona_minimal.sessions "
+                "SET last_seen_at = now() - interval '2 minutes' WHERE token_hash = %s",
+                (hashlib.sha256(token.encode()).digest(),),
+            )
+        backdated = _session_row(store, token)["last_seen_at"]
+        app.get("/v1/me", headers=_bearer(token))
+        assert _session_row(store, token)["last_seen_at"] > backdated
+
+
+def test_session_expiry_is_judged_by_db_clock(store: PostgresPersonaStore) -> None:
+    with TestClient(create_app(_auth_settings(), store)) as app:
+        token = _signup(app, _unique_username()).json()["token"]
+        with store.pool.connection() as connection:
+            connection.execute(
+                "UPDATE persona_minimal.sessions "
+                "SET expires_at = now() - interval '1 second' WHERE token_hash = %s",
+                (hashlib.sha256(token.encode()).digest(),),
+            )
+
+        assert app.get("/v1/me", headers=_bearer(token)).status_code == 401
+        assert app.post("/v1/auth/logout", headers=_bearer(token)).status_code == 401
+
+
+def test_static_token_does_not_touch_auth_tables(store: PostgresPersonaStore) -> None:
+    """정적 토큰 요청은 auth 테이블 권한이 없어도 동작한다(grants 적용 전 전환기)."""
+    with store.pool.connection() as connection, connection.transaction():
+        # 이 트랜잭션이 sessions를 배타 잠금으로 쥐는 동안, 정적 토큰 요청이 세션을 조회하면
+        # statement_timeout까지 멈췄다가 실패한다. 바로 200이면 조회하지 않은 것이다.
+        connection.execute("LOCK TABLE persona_minimal.sessions IN ACCESS EXCLUSIVE MODE")
+        with TestClient(create_app(_auth_settings(), store)) as app:
+            started = time.monotonic()
+            response = app.get("/v1/me", headers=_bearer("integration-token"))
+            elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 1.0
+
+
+def test_migration_0006_round_trip_adds_and_drops_only_auth_tables(
+    round_trip_database_url: str,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert _table_exists(connection, "persona_minimal", "credentials")
+                assert _table_exists(connection, "persona_minimal", "sessions")
+        finally:
+            pool.close()
+
+        command.downgrade(config, "0005_generation_lease")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with pool.connection() as connection:
+                assert not _table_exists(connection, "persona_minimal", "credentials")
+                assert not _table_exists(connection, "persona_minimal", "sessions")
+                assert _table_exists(connection, "persona_minimal", "users")
+                assert _column_exists(
+                    connection, "persona_minimal", "generations", "lease_expires_at"
+                )
+        finally:
+            pool.close()
+
+        command.upgrade(config, "head")
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+
+
+def test_bridge_image_serves_0005_db_and_enables_auth_after_0006_without_restart(
+    round_trip_database_url: str,
+) -> None:
+    """A-1 bridge 배포 순서 재현: 이 이미지 롤아웃(DB 0005) → migration 0006.
+
+    0005 DB에서 Ready이고 auth 경로만 503, 정적 토큰과 일반 API는 그대로다. 같은 앱 인스턴스가
+    그대로 떠 있는 상태에서 0006을 올리면 재시작 없이 가입이 된다. (실제 프로세스 재시작이나
+    구 이미지 자체를 띄우는 검증은 아니다 — 같은 프로세스 안의 앱 하나로 본다.)
+    """
+    root = Path(__file__).resolve().parents[1]
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = round_trip_database_url
+    try:
+        config = Config(str(root / "alembic.ini"))
+        command.upgrade(config, "head")
+        command.downgrade(config, "0005_generation_lease")
+        pool = create_pool(round_trip_database_url, 2)
+        try:
+            with TestClient(create_app(_auth_settings(), PostgresPersonaStore(pool))) as app:
+                assert app.get("/readyz").status_code == 200
+                assert _signup(app, _unique_username()).status_code == 503
+                assert _login(app, _unique_username()).status_code == 503
+                static = _bearer("integration-token")
+                assert app.get("/v1/me", headers=static).status_code == 200
+                assert app.get("/v1/personas", headers=static).status_code == 200
+                assert app.get("/v1/me", headers=_bearer("not-a-session")).status_code == 401
+
+                command.upgrade(config, "head")
+
+                assert app.get("/readyz").status_code == 200
+                signed_up = _signup(app, _unique_username())
+                assert signed_up.status_code == 201, signed_up.text
+                token = signed_up.json()["token"]
+                assert app.get("/v1/me", headers=_bearer(token)).status_code == 200
+        finally:
+            pool.close()
+    finally:
+        command.upgrade(config, "head")
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old

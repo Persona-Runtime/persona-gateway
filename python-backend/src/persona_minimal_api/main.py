@@ -18,6 +18,18 @@ from psycopg import Error as PsycopgError
 from psycopg.errors import UndefinedColumn, UndefinedTable
 from psycopg_pool import PoolTimeout
 
+from .auth.metrics import AUTH_REQUESTS, AuthEndpoint, AuthOutcome
+from .auth.service import (
+    AccountLocked,
+    AuthPolicy,
+    AuthService,
+    CredentialsRuleViolation,
+    InvalidCredentials,
+    IssuedSession,
+    SessionInvalid,
+    SignupDisabled,
+)
+from .auth.store import AuthSchemaNotReady, AuthStore, PostgresAuthStore, UsernameTaken
 from .build_info import record_build_info
 from .chat import metrics as chat_metrics
 from .chat import service as chat_service
@@ -91,12 +103,19 @@ _GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
 
 class ApiError(Exception):
     def __init__(
-        self, status: int, code: str, message: str, fields: list[dict[str, str]] | None = None
+        self,
+        status: int,
+        code: str,
+        message: str,
+        fields: list[dict[str, str]] | None = None,
+        headers: dict[str, str] | None = None,
     ):
         self.status = status
         self.code = code
         self.message = message
         self.fields = fields
+        # 오류 응답에 꼭 실어야 하는 헤더(예: 423의 Retry-After). 본문 형식은 그대로다.
+        self.headers = headers
 
 
 class CreatePersonaRequest(BaseModel):
@@ -146,6 +165,14 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     conversation_id: UUID
     message: str
+
+
+class CredentialsRequest(BaseModel):
+    """계약의 SignupRequest·LoginRequest. 두 요청의 모양이 같다."""
+
+    model_config = ConfigDict(extra="forbid")
+    username: str
+    password: str
 
 
 def require_idempotency_key(raw: str | None) -> UUID:
@@ -260,6 +287,33 @@ def retrieve_chunk_response(chunk: RetrievedChunk) -> dict[str, object]:
     }
 
 
+def bearer_token(authorization: str | None) -> str | None:
+    """`Authorization: Bearer <token>`에서 토큰만 꺼낸다. 형식이 다르면 None."""
+    parts = authorization.split() if authorization else []
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1]
+
+
+def session_issued_response(issued: IssuedSession) -> dict[str, object]:
+    return {
+        "user": {"id": issued.subject, "display_name": issued.display_name},
+        "token": issued.token,
+        "expires_at": issued.expires_at.isoformat(),
+    }
+
+
+def record_auth_outcome(request: Request, endpoint: AuthEndpoint, outcome: AuthOutcome) -> None:
+    # username·비밀번호·토큰은 로그에 남기지 않는다. 결과와 request id면 요청을 추적할 수 있다.
+    AUTH_REQUESTS.labels(endpoint=endpoint, outcome=outcome).inc()
+    logger.info(
+        "auth %s outcome=%s request_id=%s",
+        endpoint,
+        outcome,
+        getattr(request.state, "request_id", None),
+    )
+
+
 def error_body(error: ApiError, request_id: str) -> dict[str, object]:
     detail: dict[str, object] = {
         "code": error.code,
@@ -273,7 +327,9 @@ def error_body(error: ApiError, request_id: str) -> dict[str, object]:
 
 def error_response(request: Request, error: ApiError) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None) or str(uuid4())
-    response = JSONResponse(status_code=error.status, content=error_body(error, request_id))
+    response = JSONResponse(
+        status_code=error.status, content=error_body(error, request_id), headers=error.headers
+    )
     # response_headers 미들웨어와 같은 값을 쓴다 — 예외 처리 경로가 그 미들웨어를
     # 거치기 전에 이 응답을 반환하는 경우가 있어(실측: 일반 Exception 핸들러 경로),
     # 여기서도 직접 맞춰 둬야 항상 같은 값이 나간다.
@@ -342,12 +398,30 @@ def create_app(
     settings: Settings | None = None,
     store: PersonaStore | None = None,
     inference_client: InferenceClient | None = None,
+    auth_store: AuthStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     owned_pool = None
     if store is None:
         owned_pool = create_pool(settings.database_url, settings.database_timeout_seconds)
         store = PostgresPersonaStore(owned_pool)
+    # 계정·세션은 persona 저장소와 같은 DB·같은 pool을 쓴다. 테스트가 auth_store를 주입하지 않고
+    # DB 없는 fake persona 저장소를 쓰면 세션 인증이 없는 앱이 된다(auth 경로는 503).
+    if auth_store is None and isinstance(store, PostgresPersonaStore):
+        auth_store = PostgresAuthStore(store.pool)
+    auth_service = (
+        AuthService(
+            auth_store,
+            AuthPolicy(
+                signup_enabled=settings.signup_enabled,
+                session_ttl_seconds=settings.session_ttl_seconds,
+                login_lock_threshold=settings.login_lock_threshold,
+                login_lock_seconds=settings.login_lock_seconds,
+            ),
+        )
+        if auth_store is not None
+        else None
+    )
     # generation 행의 mode는 지금 어떤 어댑터로 답하는지를 그대로 적는다 — 이 값이 SSE
     # meta.mode와 Prometheus mode 라벨이 되므로, mock과 llm을 비교하려면 사실이어야 한다.
     chat_store = (
@@ -473,6 +547,7 @@ def create_app(
     app.state.chat_store = chat_store
     app.state.inference_client = inference_client
     app.state.lease_keeper = lease_keeper
+    app.state.auth_service = auth_service
 
     @app.middleware("http")
     async def response_headers(request: Request, call_next):
@@ -501,6 +576,15 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, _: RequestValidationError):
         return error_response(request, ApiError(422, "invalid_request", "요청 값을 확인해주세요."))
+
+    @app.exception_handler(AuthSchemaNotReady)
+    async def auth_schema_not_ready(request: Request, _: AuthSchemaNotReady):
+        # A-1 bridge 릴리스가 0005 DB에서 도는 동안 auth 경로만 일시적으로 쓸 수 없다. 재시도하면
+        # migration 0006 적용 뒤 성공하는 상태라 500이 아니라 503이다.
+        return error_response(
+            request,
+            ApiError(503, "dependency_unavailable", "잠시 후 다시 시도해주세요."),
+        )
 
     @app.exception_handler(PoolTimeout)
     async def exhausted_database_pool(request: Request, _: Exception):
@@ -542,8 +626,13 @@ def create_app(
            strip-auth-header Middleware가 이 헤더를 항상 지운다 — 그 경로로는 헤더
            자체가 Gateway에 전달되지 않는다.
 
-        플래그가 꺼져 있거나 헤더가 없으면 기존 정적 토큰 경로로 넘어간다 — 정적 토큰
-        인증은 이 기능과 무관하게 계속 동작한다.
+        플래그가 꺼져 있거나 헤더가 없으면 Bearer 토큰 판정으로 넘어간다.
+
+        Bearer 토큰은 정적 토큰(static_token_enabled일 때)을 먼저 상수 시간으로 비교하고,
+        아니면 세션 토큰으로 조회한다. 정적 토큰을 먼저 보는 이유: 정적 토큰 요청이 auth
+        테이블(0006)·grants 상태와 무관하게 동작하게 하려는 것이다. 세션을 먼저 조회하면 그
+        테이블에 권한이 없을 때 정적 토큰 요청까지 500이 된다. 세션 토큰은 256비트 난수라 정적
+        토큰과 같을 일이 없어, 순서를 바꿔도 결과는 같다.
         """
         if settings.forward_auth_enabled and forwarded_user is not None:
             login = forwarded_user.strip().lower()
@@ -551,15 +640,23 @@ def create_app(
                 raise ApiError(401, "unauthorized", "인증이 필요합니다.")
             return f"github:{login}", login
 
-        expected = settings.static_bearer_token.get_secret_value()
-        parts = authorization.split() if authorization else []
-        if (
-            len(parts) != 2
-            or parts[0].lower() != "bearer"
-            or not hmac.compare_digest(parts[1].encode("utf-8"), expected.encode("utf-8"))
-        ):
+        token = bearer_token(authorization)
+        if token is None:
             raise ApiError(401, "unauthorized", "인증이 필요합니다.")
-        return settings.static_user_id, settings.static_display_name
+        if settings.static_token_enabled:
+            expected = settings.static_bearer_token.get_secret_value()
+            if hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+                return settings.static_user_id, settings.static_display_name
+        identity = auth_service.authenticate(token) if auth_service is not None else None
+        if identity is None:
+            raise ApiError(401, "unauthorized", "인증이 필요합니다.")
+        return identity
+
+    def require_auth_service() -> AuthService:
+        # DB 없는 fake 저장소로 만든 앱에만 해당한다. 운영 앱은 항상 auth_service가 있다.
+        if auth_service is None:
+            raise ApiError(503, "dependency_unavailable", "잠시 후 다시 시도해주세요.")
+        return auth_service
 
     @app.get("/healthz")
     def healthz():
@@ -583,6 +680,62 @@ def create_app(
     @app.get("/v1/me")
     def get_me(user: tuple[str, str] = Depends(authenticated_user)):
         return {"id": user[0], "display_name": user[1]}
+
+    # auth 경로는 sync def다 — argon2 hash·verify(수십 ms CPU)를 FastAPI 스레드풀에서 돌려
+    # 이벤트 루프를 막지 않게 한다. Idempotency-Key는 받지 않는다(계약).
+    @app.post("/v1/auth/signup", status_code=201)
+    def signup(request: Request, body: CredentialsRequest):
+        service = require_auth_service()
+        try:
+            issued = service.signup(body.username, body.password)
+        except SignupDisabled as error:
+            record_auth_outcome(request, "signup", "disabled")
+            raise ApiError(403, "signup_disabled", "지금은 가입할 수 없습니다.") from error
+        except CredentialsRuleViolation as error:
+            record_auth_outcome(request, "signup", "validation")
+            raise ApiError(
+                422, "invalid_request", "아이디와 비밀번호를 확인해주세요.", fields=error.fields
+            ) from error
+        except UsernameTaken as error:
+            record_auth_outcome(request, "signup", "invalid")
+            raise ApiError(409, "username_taken", "이미 사용 중인 아이디입니다.") from error
+        record_auth_outcome(request, "signup", "ok")
+        return session_issued_response(issued)
+
+    @app.post("/v1/auth/login")
+    def login(request: Request, body: CredentialsRequest):
+        service = require_auth_service()
+        try:
+            issued = service.login(body.username, body.password)
+        except AccountLocked as error:
+            record_auth_outcome(request, "login", "locked")
+            raise ApiError(
+                423,
+                "account_locked",
+                "로그인 시도가 많아 잠시 잠겼습니다.",
+                headers={"Retry-After": str(error.retry_after_seconds)},
+            ) from error
+        except InvalidCredentials as error:
+            record_auth_outcome(request, "login", "invalid")
+            raise ApiError(
+                401, "invalid_credentials", "아이디 또는 비밀번호가 맞지 않습니다."
+            ) from error
+        record_auth_outcome(request, "login", "ok")
+        return session_issued_response(issued)
+
+    @app.post("/v1/auth/logout", status_code=204)
+    def logout(request: Request, authorization: str | None = Header(default=None)):
+        service = require_auth_service()
+        token = bearer_token(authorization)
+        try:
+            if token is None:
+                raise SessionInvalid
+            service.logout(token)
+        except SessionInvalid as error:
+            record_auth_outcome(request, "logout", "invalid")
+            raise ApiError(401, "unauthorized", "인증이 필요합니다.") from error
+        record_auth_outcome(request, "logout", "ok")
+        return Response(status_code=204)
 
     @app.get("/v1/personas")
     def list_personas(

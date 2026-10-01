@@ -88,6 +88,29 @@ class Settings(BaseSettings):
         default=30.0, validation_alias="PERSONA_GENERATION_LEASE_SECONDS"
     )
 
+    # --- 계정·세션 인증(A-1) ---
+    # 정적 Bearer 토큰 경로를 계속 받을지. 웹·실험 스크립트가 세션 토큰으로 전환된 뒤 platform이
+    # false로 내린다. 꺼도 PERSONA_STATIC_BEARER_TOKEN 등 기존 env는 그대로 필수다(기동 계약 유지).
+    static_token_enabled: bool = Field(
+        default=True, validation_alias="PERSONA_STATIC_TOKEN_ENABLED"
+    )
+    # 세션 수명(초). 발급 시각에 고정하고 활동으로 연장하지 않는다 — 탈취된 토큰의 유효 기간에
+    # 상한을 두기 위해서다. 기본 7일.
+    session_ttl_seconds: int = Field(default=604800, validation_alias="PERSONA_SESSION_TTL_SECONDS")
+    # 연속 로그인 실패가 이 횟수에 닿으면 계정을 login_lock_seconds 동안 잠근다.
+    login_lock_threshold: int = Field(default=5, validation_alias="PERSONA_LOGIN_LOCK_THRESHOLD")
+    login_lock_seconds: int = Field(default=900, validation_alias="PERSONA_LOGIN_LOCK_SECONDS")
+    # 공개 회원가입 on/off. 초대 코드 없이 열어 둔다(소유자 결정). 끄면 signup은 403.
+    signup_enabled: bool = Field(default=True, validation_alias="PERSONA_SIGNUP_ENABLED")
+
+    @field_validator("session_ttl_seconds", "login_lock_threshold", "login_lock_seconds")
+    @classmethod
+    def auth_limit_is_positive(cls, value: int) -> int:
+        # 0 이하는 "발급 즉시 만료"·"잠금 시간 없음"처럼 기능이 조용히 깨진 설정이라 기동에서 거부한다.
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
     @field_validator("static_user_id", "static_display_name")
     @classmethod
     def nonempty(cls, value: str) -> str:
