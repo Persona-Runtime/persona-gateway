@@ -55,6 +55,25 @@ uv run scripts/quality-eval/score.py scripts/quality-eval/results/<파일>.jsonl
 scripts/quality-eval/eval-stack.sh down
 ```
 
+추론 엔드포인트 주소·키는 명령줄 대신 `scripts/quality-eval/.env.eval`에 둔다(루트 `.gitignore`의
+`.env.*`라 커밋되지 않는다). `eval-stack.sh`가 있으면 자동으로 읽고 값은 출력하지 않는다.
+`score.py`는 실행 전에 `set -a; . scripts/quality-eval/.env.eval; set +a`로 같은 파일을 읽힌다.
+
+```bash
+# scripts/quality-eval/.env.eval — 변수 이름만 예시. 값은 이 파일에만 둔다.
+PERSONA_CHAT_INFERENCE_MODE=llm
+PERSONA_VLLM_BASE_URL=
+PERSONA_VLLM_MODEL=
+PERSONA_VLLM_API_KEY=          # vLLM을 --api-key로 띄웠을 때만
+QUALITY_JUDGE_BASE_URL=
+QUALITY_JUDGE_MODEL=
+QUALITY_JUDGE_API_KEY=
+```
+
+추론은 상태가 없으므로 Gateway·DB만 격리하고 vLLM은 다른 곳의 것을 빌려 쓸 수 있다(소유자 판단).
+이때도 Gateway·DB는 반드시 이 격리 스택이어야 하고, 보내는 자료는 합성 텍스트뿐이다. 실행기는
+문항을 하나씩 순서대로 보내므로 동시 요청은 1개다.
+
 설정이나 코드만 바꿔 다시 잴 때는 스택 전체를 내리지 않고 Gateway만 다시 띄운다.
 
 ```bash

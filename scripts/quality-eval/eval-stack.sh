@@ -29,6 +29,18 @@ eval_dir="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 repo_dir="$(CDPATH= cd -- "${eval_dir}/../.." && pwd)"
 state_dir="${eval_dir}/.stack"
 
+# 추론 엔드포인트 주소·키는 git에 올리지 않는 env 파일에 둔다(루트 .gitignore의 `.env.*`).
+# 주소를 명령줄·채팅·로그에 남기지 않으려는 것이다. 파일이 있으면 읽어 Gateway에 물려주고,
+# 값은 출력하지 않는다. 다른 파일을 쓰려면 QUALITY_EVAL_ENV_FILE로 지정한다.
+env_file="${QUALITY_EVAL_ENV_FILE:-${eval_dir}/.env.eval}"
+if [ -f "$env_file" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$env_file"
+  set +a
+  echo "  env 파일 적용: $(basename "$env_file") (값은 출력하지 않음)"
+fi
+
 postgres="persona-quality-eval-pg"
 owner_label="io.persona.quality-eval"
 owner_value="persona-gateway/scripts/quality-eval/eval-stack.sh"
