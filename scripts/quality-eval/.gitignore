@@ -1,0 +1,4 @@
+# 실행 상태(pid·로그)와 결과물은 커밋하지 않는다. 비교 summary는 PR에 첨부한다.
+.stack/
+results/*
+!results/.gitkeep

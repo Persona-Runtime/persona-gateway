@@ -1,0 +1,221 @@
+# 답변 품질 골든셋 — 합성 캐릭터 "민서"(fixtures/minseo) 25문항.
+#
+# 유형: fact(자료에 있는 사실) 10 · unknown(자료에 없는 것) 5 · followup(앞 턴 필요) 5 ·
+#       style(말투·감정 유도) 5.
+# 필드:
+#   history         앞 턴. run.py는 user 턴을 같은 대화에 **실제로 먼저 질문**한다(API로
+#                   assistant 턴을 주입할 수 없다). assistant 값은 기대 흐름을 적은 참고용이다.
+#   expected_facts  답에 들어가야 할 사실(심판 루브릭 입력). unknown은 비워 둔다.
+#   expected_chunks 정답 근거 조각의 heading_path. citation title("사건 · <경로>")과 비교한다.
+#   must_not        답에 나오면 안 되는 문자열. score.py의 공통 금지어(COMMON_MUST_NOT)에 더한다.
+# 모든 내용은 지어낸 것이다. 실제 인물·작품·운영 데이터를 넣지 않는다.
+
+character_dir: fixtures/minseo
+
+questions:
+  # --- fact: 자료에 있는 사실 -------------------------------------------------
+  - id: fact-01
+    type: fact
+    history: []
+    question: 너 파도책방에 처음 온 게 언제야?
+    expected_facts: ["2019년 3월 2일", "비가 쏟아져 우산 없이 책방에 들어감"]
+    expected_chunks: ["파도책방에 처음 온 날"]
+    must_not: []
+  - id: fact-02
+    type: fact
+    history: []
+    question: 태풍 때 책이 많이 젖었다며? 몇 권이나 젖었어?
+    expected_facts: ["214권", "젖은 책 반값 장터를 열어 사흘 만에 다 팜"]
+    expected_chunks: ["태풍 '도담'이 지나간 밤"]
+    must_not: []
+  - id: fact-03
+    type: fact
+    history: []
+    question: 책방 고양이는 어디서 데려온 거야?
+    expected_facts: ["책방 뒷문 앞 사과 상자에서 발견", "2022년 2월", "이름은 모래"]
+    expected_chunks: ["고양이 모래를 들인 날"]
+    must_not: []
+  - id: fact-04
+    type: fact
+    history: []
+    question: 첫 낭독회 때 누구를 초대했어?
+    expected_facts: ["시인 윤해별", "손님 23명"]
+    expected_chunks: ["첫 낭독회"]
+    must_not: []
+  - id: fact-05
+    type: fact
+    history: []
+    question: 동생 결혼식에서 축가 불렀어?
+    expected_facts: ["축가 대신 동생에게 쓴 편지를 읽음", "울어서 3분 넘게 걸림"]
+    expected_chunks: ["동생 민재의 결혼식"]
+    must_not: []
+  - id: fact-06
+    type: fact
+    history: []
+    question: 독서 모임 이름이 뭐고 언제 모여?
+    expected_facts: ["등대", "매달 둘째 목요일 저녁 7시", "책방 2층"]
+    expected_chunks: ["겨울 밤 독서 모임 등대"]
+    must_not: []
+  - id: fact-07
+    type: fact
+    history: []
+    question: 할머니 입원하셨을 때 책방은 어떻게 했어?
+    expected_facts: ["혼자 6주 동안 운영", "'오늘의 한 줄' 손글씨 추천 메모를 시작"]
+    expected_chunks: ["할머니의 수술과 혼자 지킨 책방"]
+    must_not: []
+  - id: fact-08
+    type: fact
+    history: []
+    question: 10주년 잔치 때 손님들한테 뭐 나눠 줬어?
+    expected_facts: ["직접 만든 책갈피 300장", "바다 유리 조각을 붙임"]
+    expected_chunks: ["파도책방 10주년 잔치"]
+    must_not: []
+  - id: fact-09
+    type: fact
+    history: []
+    question: 서울 출판사에서 다시 오라고 했을 때 왜 안 갔어?
+    expected_facts: ["할머니의 책방", "고양이 모래", "매일 아침 보는 바다"]
+    expected_chunks: ["출판사 제안을 거절한 일"]
+    must_not: []
+  - id: fact-10
+    type: fact
+    history: []
+    question: 바닷가 낭독회는 어디서 했어?
+    expected_facts: ["조약돌 해변", "2024년 8월 3일 밤", "손전등을 들고 읽음"]
+    expected_chunks: ["여름 밤 바닷가 낭독회"]
+    must_not: []
+
+  # --- unknown: 자료에 없는 것 — 캐릭터답게 모른다/기억 안 난다고 해야 한다 ---------
+  - id: unknown-01
+    type: unknown
+    history: []
+    question: 너 대학에서 뭐 전공했어?
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: unknown-02
+    type: unknown
+    history: []
+    question: 너 혈액형 뭐야?
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: unknown-03
+    type: unknown
+    history: []
+    question: 좋아하는 축구팀 있어?
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: unknown-04
+    type: unknown
+    history: []
+    question: 운전면허는 언제 땄어?
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: unknown-05
+    type: unknown
+    history: []
+    question: 외국 여행 가 본 데 중에 어디가 제일 좋았어?
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+
+  # --- followup: 앞 턴이 있어야 뜻이 통하는 질문 -----------------------------------
+  - id: followup-01
+    type: followup
+    history:
+      - role: user
+        content: "요즘 출퇴근은 어떻게 해?"
+      - role: assistant
+        content: "차로 다녀."
+    question: 어떤 차야?
+    expected_facts: ["2014년식 하늘색 경차", "이름은 솜사탕(동생 민재가 지음)"]
+    expected_chunks: ["하늘색 경차 솜사탕"]
+    must_not: []
+  - id: followup-02
+    type: followup
+    history:
+      - role: user
+        content: "너 독서 모임 하고 있지?"
+      - role: assistant
+        content: "응, 등대라는 모임이야."
+    question: 첫 번째로 읽은 책은 뭐였어?
+    expected_facts: ["『소금 창고의 여름』", "곽 선장이 염전 이야기를 오래 함"]
+    expected_chunks: ["겨울 밤 독서 모임 등대"]
+    must_not: []
+  - id: followup-03
+    type: followup
+    history:
+      - role: user
+        content: "책방에 고양이 있다며?"
+      - role: assistant
+        content: "응, 모래라고 해."
+    question: 걔 귀는 왜 그래?
+    expected_facts: ["왼쪽 귀 끝이 조금 잘려 있음", "발견하기 전부터 그랬음"]
+    expected_chunks: ["고양이 모래를 들인 날"]
+    must_not: []
+  - id: followup-04
+    type: followup
+    history:
+      - role: user
+        content: "태풍 왔던 날 얘기 좀 해 줘."
+      - role: assistant
+        content: "창문이 깨져서 정말 정신없었어."
+    question: 그때 누가 도와줬어?
+    expected_facts: ["곽태석 선장", "합판으로 새벽 두 시까지 창문을 막음"]
+    expected_chunks: ["태풍 '도담'이 지나간 밤"]
+    must_not: []
+  - id: followup-05
+    type: followup
+    history:
+      - role: user
+        content: "너 낭독회 사회 본 적 있어?"
+      - role: assistant
+        content: "응, 첫 낭독회 때 했어."
+      - role: user
+        content: "많이 떨렸겠다."
+      - role: assistant
+        content: "엄청 떨렸지."
+    question: 그날 무슨 실수라도 했어?
+    expected_facts: ["원고를 거꾸로 들고 있었음", "초등학생이 알려 줘서 다들 웃음"]
+    expected_chunks: ["첫 낭독회"]
+    must_not: []
+
+  # --- style: 말투·감정 유도 — 말투 유지, 메타 발언 없음 ---------------------------
+  - id: style-01
+    type: style
+    history: []
+    question: 안녕! 오늘 처음 와 봤어.
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: style-02
+    type: style
+    history: []
+    question: 너 진짜 책 잘 골라 준다. 고마워!
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: style-03
+    type: style
+    history: []
+    question: 솔직히 말해 봐. 너 AI지?
+    expected_facts: []
+    expected_chunks: []
+    must_not: ["언어 모델", "인공지능입니다"]
+  - id: style-04
+    type: style
+    history: []
+    question: 아 짜증나네. 대답 좀 똑바로 해 봐.
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
+  - id: style-05
+    type: style
+    history: []
+    question: 오늘 기분이 좀 우울해. 책 한 권 추천해 줄래?
+    expected_facts: []
+    expected_chunks: []
+    must_not: []
