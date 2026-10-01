@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Persona Runtime public API",
-    "version": "1.0.0-draft.2",
+    "version": "1.0.0-draft.3",
     "description": "목표 계약 초안. 초기 제품 제한·보존·토큰 메모리 보관 반영. 서버 구현 완료 아님. 동작은 service-api-v1.md, 차이는 implementation-gap-v1.md. 남은 정책은 x-pending-policy-decisions. 합성 예시만 사용."
   },
   "servers": [
@@ -80,6 +80,129 @@
           },
           "429": {
             "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/auth/signup": {
+      "post": {
+        "operationId": "signup",
+        "summary": "회원가입",
+        "tags": [
+          "Identity"
+        ],
+        "description": "인증 없이 호출한다. username은 소문자로 정규화한 뒤 ^[a-z0-9_]{3,32}$를 검사하고, password는 8~128 코드포인트이며 공백이 아닌 문자를 포함해야 한다. 규칙 위반 422 invalid_request(fields에 username/password), 가입 꺼짐 403 signup_disabled, username 중복(대소문자 무시) 409 username_taken. 성공하면 바로 세션을 발급한다. Idempotency-Key는 받지 않는다.",
+        "security": [],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignupRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "가입 완료, 세션 발급",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionIssued"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/auth/login": {
+      "post": {
+        "operationId": "login",
+        "summary": "로그인",
+        "tags": [
+          "Identity"
+        ],
+        "description": "인증 없이 호출한다. 없는 아이디와 틀린 비밀번호는 모두 401 invalid_credentials로 구분하지 않는다. 연속 실패가 PERSONA_LOGIN_LOCK_THRESHOLD(기본 5)에 닿으면 PERSONA_LOGIN_LOCK_SECONDS(기본 900초) 동안 잠기며, 잠긴 동안에는 비밀번호가 맞아도 423 account_locked와 Retry-After(초)를 돌려준다. 성공하면 실패 횟수를 초기화한다. Idempotency-Key는 받지 않는다.",
+        "security": [],
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "로그인 성공, 세션 발급",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionIssued"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error423"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "operationId": "logout",
+        "summary": "로그아웃",
+        "tags": [
+          "Identity"
+        ],
+        "description": "Bearer 세션 토큰이 필요하다. 그 세션을 취소한다. 이미 만료·취소됐거나 세션 토큰이 아니면(정적 토큰 포함) 401 unauthorized. Idempotency-Key는 받지 않는다.",
+        "parameters": [],
+        "responses": {
+          "204": {
+            "description": "세션 취소 완료"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
           },
           "500": {
             "$ref": "#/components/responses/Error500"
@@ -1688,7 +1811,7 @@
       "BearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "사전 발급 정적 토큰 → 서버의 고정 사용자 subject. JWT 아님. 브라우저 메모리만 보관하며 새로고침/탭 종료 후 재입력. 만료·회전은 별도 운영 계약."
+        "description": "Bearer 토큰. 기본은 /v1/auth/signup·login이 발급한 세션 토큰(불투명 문자열, JWT 아님, 발급 후 PERSONA_SESSION_TTL_SECONDS 뒤 만료, 활동으로 연장하지 않음, /v1/auth/logout으로 취소)이다. 전환기 동안 PERSONA_STATIC_TOKEN_ENABLED=true면 사전 발급 정적 토큰(서버의 고정 사용자 subject)도 받는다. 브라우저 메모리만 보관하며 새로고침/탭 종료 후 다시 로그인한다."
       }
     },
     "schemas": {
@@ -1739,7 +1862,8 @@
         },
         "required": [
           "error"
-        ]
+        ],
+        "description": "오류 본문. 인증 경로 오류 코드: username_taken(409, 가입 아이디 중복), invalid_credentials(401, 아이디·비밀번호 불일치), account_locked(423, 로그인 잠금, Retry-After 헤더), signup_disabled(403, 가입 꺼짐)."
       },
       "User": {
         "type": "object",
@@ -1755,6 +1879,63 @@
         "required": [
           "id",
           "display_name"
+        ]
+      },
+      "SignupRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "소문자로 정규화한 뒤 ^[a-z0-9_]{3,32}$"
+          },
+          "password": {
+            "type": "string",
+            "description": "8~128 코드포인트, 공백이 아닌 문자 포함"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ]
+      },
+      "LoginRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ]
+      },
+      "SessionIssued": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "token": {
+            "type": "string",
+            "description": "Bearer 세션 토큰. 이 응답에서만 원문을 준다(서버는 sha256만 저장). 브라우저 메모리에만 보관한다."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "세션 만료 시각(RFC3339). 활동으로 연장하지 않는다."
+          }
+        },
+        "required": [
+          "user",
+          "token",
+          "expires_at"
         ]
       },
       "Settings": {
@@ -3366,6 +3547,16 @@
           }
         }
       },
+      "Error403": {
+        "description": "허용되지 않음",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
       "Error404": {
         "description": "존재하지 않거나 타인 소유",
         "content": {
@@ -3398,6 +3589,25 @@
       },
       "Error415": {
         "description": "지원하지 않는 Content-Type/파일 형식",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error423": {
+        "description": "계정 잠김",
+        "headers": {
+          "Retry-After": {
+            "description": "잠금이 풀리기까지 남은 초",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
         "content": {
           "application/json": {
             "schema": {

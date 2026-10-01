@@ -155,3 +155,27 @@ def test_mock_profile_selects_fake_client_shape_only_in_mock_mode() -> None:
         assert _recorded_mock_profile() == "medium"
     finally:
         llm_client.close()
+
+
+def test_auth_settings_defaults_keep_static_token_and_open_signup() -> None:
+    """새 env를 하나도 주지 않아도 기존 배포가 그대로 뜬다(정적 토큰 유지, 가입 열림)."""
+    settings = Settings(**BASE_ENV)
+
+    assert settings.static_token_enabled is True
+    assert settings.signup_enabled is True
+    assert settings.session_ttl_seconds == 604800
+    assert settings.login_lock_threshold == 5
+    assert settings.login_lock_seconds == 900
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "PERSONA_SESSION_TTL_SECONDS",
+        "PERSONA_LOGIN_LOCK_THRESHOLD",
+        "PERSONA_LOGIN_LOCK_SECONDS",
+    ],
+)
+def test_auth_limits_must_be_positive(env_name: str) -> None:
+    with pytest.raises(ValueError):
+        Settings(**BASE_ENV, **{env_name: "0"})

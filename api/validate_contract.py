@@ -35,14 +35,26 @@ def main() -> None:
         for method, op in item.items()
         if method in {"get", "put", "post", "patch", "delete"}
     ]
-    assert len(operations) == 23
+    assert len(operations) == 26
     ids = [op["operationId"] for _, _, op in operations]
     assert len(ids) == len(set(ids)), "operationId duplicates"
     assert spec["security"] == [{"BearerAuth": []}]
-    assert len(spec["paths"]) == 17
+    assert len(spec["paths"]) == 20
+    # 인증 경로만 예외다(2026-10-01 소유자 승인 계약). signup·login은 토큰을 받기 전에 부르므로
+    # 인증을 끄고(security: []), 세 경로 모두 Idempotency-Key를 받지 않는다. 예외를 경로 이름으로
+    # 고정해 두어, 다른 operation이 조용히 인증·멱등 계약에서 빠지는 것은 여전히 잡는다.
+    unauthenticated = {("post", "/v1/auth/signup"), ("post", "/v1/auth/login")}
+    without_idempotency = unauthenticated | {("post", "/v1/auth/logout")}
     for method, path, op in operations:
-        assert "security" not in op, f"unexpected auth override: {path}"
-        if method != "get":
+        if (method, path) in unauthenticated:
+            assert op.get("security") == [], f"auth path must not require a token: {path}"
+        else:
+            assert "security" not in op, f"unexpected auth override: {path}"
+        if (method, path) in without_idempotency:
+            assert {"$ref": "#/components/parameters/IdempotencyKey"} not in op["parameters"], (
+                f"auth path must not take Idempotency-Key: {path}"
+            )
+        elif method != "get":
             assert {"$ref": "#/components/parameters/IdempotencyKey"} in op["parameters"], (
                 f"missing idempotency contract: {method} {path}"
             )
@@ -84,7 +96,7 @@ def main() -> None:
     }
     for key, expected in expected_policy.items():
         assert policy[key] == expected, f"policy drift: {key}"
-    assert spec["info"]["version"] == "1.0.0-draft.2"
+    assert spec["info"]["version"] == "1.0.0-draft.3"
 
     sse_count = 0
     for _, _, op in operations:

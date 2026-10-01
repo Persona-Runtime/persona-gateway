@@ -281,6 +281,58 @@
           "speech_examples": ""
         }
       }
+    },
+    {
+      "name": "signup-request",
+      "schema": "SignupRequest",
+      "valid": true,
+      "value": {
+        "username": "demo_user",
+        "password": "demo-password-1"
+      }
+    },
+    {
+      "name": "signup-request-extra-field",
+      "schema": "SignupRequest",
+      "valid": false,
+      "value": {
+        "username": "demo_user",
+        "password": "demo-password-1",
+        "invite": "x"
+      }
+    },
+    {
+      "name": "login-request-missing-password",
+      "schema": "LoginRequest",
+      "valid": false,
+      "value": {
+        "username": "demo_user"
+      }
+    },
+    {
+      "name": "session-issued",
+      "schema": "SessionIssued",
+      "valid": true,
+      "value": {
+        "user": {
+          "id": "local:00000000-0000-4000-8000-000000000010",
+          "display_name": "demo_user"
+        },
+        "token": "demo-session-token",
+        "expires_at": "2026-10-08T12:00:00+00:00"
+      }
+    },
+    {
+      "name": "session-issued-without-expiry",
+      "schema": "SessionIssued",
+      "valid": false,
+      "value": {
+        "user": {
+          "id": "local:00000000-0000-4000-8000-000000000010",
+          "display_name": "demo_user"
+        },
+        "token": "demo-session-token"
+      }
     }
   ]
 }
