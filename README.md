@@ -232,6 +232,12 @@ uv run pytest
 - 운영 설정은 `DATABASE_URL`, `PERSONA_EMBEDDING_URL`, `PERSONA_STATIC_BEARER_TOKEN`,
   `PERSONA_STATIC_USER_ID`, `PERSONA_STATIC_DISPLAY_NAME`, `PERSONA_CURSOR_SIGNING_KEY`로
   공급한다. 실제 값은 공개하지 않는다.
+- 계정·세션 인증(migration `0006_auth_sessions`)은 `PERSONA_STATIC_TOKEN_ENABLED`(기본 true),
+  `PERSONA_SESSION_TTL_SECONDS`(604800), `PERSONA_LOGIN_LOCK_THRESHOLD`(5),
+  `PERSONA_LOGIN_LOCK_SECONDS`(900), `PERSONA_SIGNUP_ENABLED`(true)로 조정한다. 기본값이면 env를
+  넣지 않아도 된다. 새 테이블 `credentials`·`sessions`는 platform grants에 SELECT·INSERT·UPDATE가
+  있어야 쓸 수 있다. 이 이미지는 0005·0006 DB 모두에서 Ready이며(bridge), 0005에서는 auth 경로만
+  503이다. 배포 순서는 이 이미지 롤아웃 → migration 0006 → grants다.
 - 채팅 업스트림은 `PERSONA_CHAT_INFERENCE_MODE`로 고른다(`mock` 기본, `llm`). 아래
   "채팅 업스트림" 참고.
 - `/healthz`는 프로세스 생존, `/readyz`는 필수 스키마·revision과 DB 연결 상태를 확인한다.

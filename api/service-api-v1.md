@@ -12,16 +12,25 @@ operation과 path 수는 그대로다.
 ## 1. 공통 계약
 
 - 외부 API는 `/v1`, 사용자 화면은 같은 origin을 사용한다. 실제 토큰 전송 경로는 HTTPS/Tailnet이다.
-- 단일 계정의 사전 발급 정적 Bearer 토큰을 검증한다. `GET /v1/me`는 검증/사용자 조회이지 토큰 발급 API가 아니다.
+- (2026-10-01 A-1) 계정·세션 인증. `POST /v1/auth/signup`(공개 가입, 초대 코드 없음)·`POST /v1/auth/login`이
+  불투명 세션 토큰(`secrets.token_urlsafe(32)`)을 발급하고, 이후 요청은 그 토큰을 `Authorization: Bearer`로 보낸다.
+  서버는 토큰의 sha256만 저장한다. 세션은 발급 후 `PERSONA_SESSION_TTL_SECONDS`(기본 7일) 뒤 만료되며 활동으로
+  연장하지 않는다. `POST /v1/auth/logout`이 그 세션을 서버에서 취소한다. 가입 사용자의 subject는 `local:<uuid>`,
+  표시 이름은 username이다. 비밀번호는 argon2id로 해시한다.
+- 로그인 실패는 없는 아이디·틀린 비밀번호를 구분하지 않고 401 `invalid_credentials`다. 연속 실패가
+  `PERSONA_LOGIN_LOCK_THRESHOLD`(기본 5)에 닿으면 `PERSONA_LOGIN_LOCK_SECONDS`(기본 900초) 동안 423
+  `account_locked`(`Retry-After`)이며, 잠긴 동안에는 비밀번호가 맞아도 들어오지 못한다.
+- 전환기 동안 사전 발급 정적 Bearer 토큰도 받는다(`PERSONA_STATIC_TOKEN_ENABLED`, 기본 true). Bearer 판정은
+  정적 토큰을 먼저 비교하고 아니면 세션으로 조회한다. `GET /v1/me`는 검증/사용자 조회이지 토큰 발급 API가 아니다.
 - (Gate 4, `PERSONA_FORWARD_AUTH_ENABLED`로 게이팅, 기본 꺼짐) 켜져 있으면 정적 토큰 대신 Traefik의
   ForwardAuth Middleware가 세팅하는 `X-Auth-Request-User`(GitHub 로그인)를 신원으로 받아들인다.
   이 경로는 인터넷 진입(`app.personaruntime.xyz`)에서 GitHub OAuth(oauth2-proxy)를 거친 요청 전용이며,
   subject는 `github:<login>`(소문자)이다. 두 경로는 공존한다 — 정적 토큰 경로는 이 기능과 무관하게
   계속 동작하며, 플랫폼 쪽 NetworkPolicy·Middleware 선언(least-privilege-boundary.md §2)이 헤더 위조를
   막는 전제다. 클러스터 미적용 상태에서는 이 경로가 실제로 켜지지 않는다.
-- 회원가입·비밀번호 찾기·토큰 발급·OIDC 전환은 이번 범위 밖이다. 사용자 ID는 서버의 토큰 매핑으로 결정한다.
+- 비밀번호 찾기·변경, 세션 일괄 취소, OIDC 전환은 이번 범위 밖이다. 사용자 ID는 서버의 토큰·세션 매핑으로 결정한다.
 - 토큰은 브라우저 메모리에만 보관한다. 새로고침·탭 종료 후 다시 입력한다. localStorage/sessionStorage/IndexedDB·영구 쿠키에 저장하거나 빌드에 삽입하지 않는다. URL·로그·분석 이벤트에도 넣지 않는다.
-- UI 로그아웃은 메모리의 토큰·사용자 자료를 지우는 동작이며 서버 토큰 폐기는 아니다. 메모리 보관도 실행 중 XSS에 대한 방어를 대체하지 않는다. 만료·회전 절차는 별도 미결이다.
+- UI 로그아웃은 `POST /v1/auth/logout`으로 세션을 서버에서 취소한 뒤 메모리의 토큰·사용자 자료를 지운다. 정적 토큰은 서버에서 폐기되지 않는다. 메모리 보관도 실행 중 XSS에 대한 방어를 대체하지 않는다.
 - 인증 없음/불일치는 401. 리소스 소유권은 매 요청 검증하며 타인 소유와 부재는 같은 404로 처리한다. 상태 API도 인증 대상이다.
 - UUID 식별자, UTC RFC3339 날짜, JSON의 `snake_case` 사용. JSON 필드명/타입은 OpenAPI가 기준이다.
 - 응답과 원문·대화에는 `Cache-Control: no-store`. CORS wildcard와 비밀값을 포함한 오류 응답은 사용하지 않는다.

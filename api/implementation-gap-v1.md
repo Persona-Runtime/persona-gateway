@@ -7,7 +7,8 @@
 ## 확인된 구현
 
 기존 Go Gateway·dispatcher·DDL은 검증된 레포 밖 로컬 보관본으로 전환했고 활성 런타임이 아니다.
-`python-backend/`는 정적 Bearer 인증의 `GET /v1/me`, `GET /v1/personas`, `POST /v1/personas`,
+`python-backend/`는 계정·세션 인증(`POST /v1/auth/signup|login|logout`, 2026-10-01 A-1)과 전환기용 정적 Bearer 인증,
+`GET /v1/me`, `GET /v1/personas`, `POST /v1/personas`,
 `GET /v1/personas/{id}`와 초안 4 operation(`POST`/`GET`/`PATCH`/`DELETE .../draft`)을 구현한다. Python 경로는 FastAPI·psycopg·Alembic과 독립 `persona_minimal` schema를 사용한다.
 새 명세 전체는 22 operations다.
 
