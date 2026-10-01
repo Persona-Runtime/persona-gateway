@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .retrieval.prompt import DEFAULT_PROMPT_VERSION, PromptVersion
+
 
 class Settings(BaseSettings):
     # hide_input_in_errors: 설정 검증 실패 메시지(기동 로그)에 입력값을 싣지 않는다 —
@@ -148,4 +150,49 @@ class Settings(BaseSettings):
         ]
         if missing:
             raise ValueError(f"llm inference mode requires {', '.join(missing)}")
+        return self
+
+    # --- 생성 품질 (Q-1) ---------------------------------------------------
+    # 프롬프트 버전과 vLLM 샘플링 값. 전부 서버 설정으로만 고른다(요청으로 바꾸는 경로 없음).
+    # 골든셋(scripts/quality-eval)이 같은 코드로 v1/v2·샘플링 조합을 비교하려고 env로 뺐다.
+    # 샘플링 값은 llm 모드에서만 upstream에 실리고 mock 모드는 읽기만 한다.
+    prompt_version: PromptVersion = Field(
+        default=DEFAULT_PROMPT_VERSION, validation_alias="PERSONA_PROMPT_VERSION"
+    )
+    # 기본값 출처: Qwen3-4B-Instruct-2507 모델 카드 권장값 temperature 0.7 · top_p 0.8 ·
+    # top_k 20 · min_p 0. presence_penalty는 권장 범위 0~2인데 1.5 이상에서 언어 섞임 보고가
+    # 있어 1.0에서 시작한다. repetition_penalty 1.0은 "끔"과 같다.
+    vllm_temperature: float = Field(default=0.7, validation_alias="PERSONA_VLLM_TEMPERATURE")
+    vllm_top_p: float = Field(default=0.8, validation_alias="PERSONA_VLLM_TOP_P")
+    vllm_top_k: int = Field(default=20, validation_alias="PERSONA_VLLM_TOP_K")
+    vllm_min_p: float = Field(default=0.0, validation_alias="PERSONA_VLLM_MIN_P")
+    vllm_presence_penalty: float = Field(
+        default=1.0, validation_alias="PERSONA_VLLM_PRESENCE_PENALTY"
+    )
+    vllm_repetition_penalty: float = Field(
+        default=1.0, validation_alias="PERSONA_VLLM_REPETITION_PENALTY"
+    )
+
+    @model_validator(mode="after")
+    def sampling_is_in_range(self) -> Settings:
+        """vLLM이 거부하는 샘플링 값을 기동 시점에 막는다.
+
+        잘못된 값을 그대로 두면 기동은 되고 모든 채팅 요청만 upstream 400으로 실패한다.
+        범위는 vLLM SamplingParams 검증과 같다. 오류에는 env 이름만 적고 값은 적지 않는다.
+        """
+        invalid = [
+            env_name
+            for env_name, is_valid in (
+                ("PERSONA_VLLM_TEMPERATURE", self.vllm_temperature >= 0),
+                ("PERSONA_VLLM_TOP_P", 0 < self.vllm_top_p <= 1),
+                # -1은 vLLM에서 "top_k 끔"이다. 0은 거부된다.
+                ("PERSONA_VLLM_TOP_K", self.vllm_top_k == -1 or self.vllm_top_k >= 1),
+                ("PERSONA_VLLM_MIN_P", 0 <= self.vllm_min_p <= 1),
+                ("PERSONA_VLLM_PRESENCE_PENALTY", -2 <= self.vllm_presence_penalty <= 2),
+                ("PERSONA_VLLM_REPETITION_PENALTY", self.vllm_repetition_penalty > 0),
+            )
+            if not is_valid
+        ]
+        if invalid:
+            raise ValueError(f"sampling settings out of range: {', '.join(invalid)}")
         return self

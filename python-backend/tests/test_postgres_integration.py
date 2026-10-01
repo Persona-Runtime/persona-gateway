@@ -3342,6 +3342,8 @@ class _BrokenInferenceClient:
     UpstreamError 전용 except로는 안 잡혀야 stream_generation의 마지막
     안전망(except Exception)을 검증할 수 있다."""
 
+    prompt_version = "v2"
+
     def start(self, generation_id: UUID, messages: list, *, max_tokens: int):
         del generation_id, messages, max_tokens
         raise RuntimeError("어댑터 내부 버그")

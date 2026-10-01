@@ -24,6 +24,8 @@ ServiceMonitor/PodMonitor·대시보드는 persona-platform 쪽 별도 작업이
 - persona_chat_generations_reclaimed_total{reason}: 소유자 lease 만료·정상 종료로
   reconciling으로 넘긴 수. reason은 startup_lease_expired·request_lease_expired·shutdown.
 - persona_chat_lease_heartbeat_failures_total: lease 연장 실패 횟수.
+- persona_chat_generation_config_info{mode,prompt_version,...}: 기동 시 고른 프롬프트 버전과
+  샘플링 값. 프롬프트 버전은 generation 행에 저장하지 않으므로 이 값과 배포 시각으로 대조한다.
 """
 
 from __future__ import annotations
@@ -105,4 +107,11 @@ LEASE_HEARTBEAT_FAILURES = Counter(
 MOCK_WORKLOAD = Info(
     "persona_chat_mock_workload",
     "mock 모드에 적용된 응답 profile(조각 수·조각 간격). LLM token 수가 아니다",
+)
+
+# 이 프로세스가 프롬프트를 어떤 버전으로 조립하고 어떤 샘플링으로 요청하는지. 값은 기동 시
+# 한 번 정해지는 설정이라 카디널리티가 고정이다. 골든셋 결과(라벨)와 배포 설정을 대조하는 용도다.
+GENERATION_CONFIG = Info(
+    "persona_chat_generation_config",
+    "기동 시 고른 프롬프트 버전과 vLLM 샘플링 설정(mock 모드는 샘플링을 보내지 않는다)",
 )

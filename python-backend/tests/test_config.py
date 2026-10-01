@@ -155,3 +155,83 @@ def test_mock_profile_selects_fake_client_shape_only_in_mock_mode() -> None:
         assert _recorded_mock_profile() == "medium"
     finally:
         llm_client.close()
+
+
+# --- 생성 품질 (Q-1) -------------------------------------------------------
+
+
+def test_generation_quality_defaults_follow_the_model_card_recommendation() -> None:
+    settings = Settings(**BASE_ENV)
+
+    assert settings.prompt_version == "v2"
+    assert settings.vllm_temperature == 0.7
+    assert settings.vllm_top_p == 0.8
+    assert settings.vllm_top_k == 20
+    assert settings.vllm_min_p == 0.0
+    assert settings.vllm_presence_penalty == 1.0
+    assert settings.vllm_repetition_penalty == 1.0
+
+
+def test_generation_quality_env_names_are_parsed() -> None:
+    settings = Settings(
+        **BASE_ENV,
+        PERSONA_PROMPT_VERSION="v1",
+        PERSONA_VLLM_TEMPERATURE="0.3",
+        PERSONA_VLLM_TOP_P="0.95",
+        PERSONA_VLLM_TOP_K="-1",
+        PERSONA_VLLM_MIN_P="0.05",
+        PERSONA_VLLM_PRESENCE_PENALTY="1.5",
+        PERSONA_VLLM_REPETITION_PENALTY="1.1",
+    )
+
+    assert settings.prompt_version == "v1"
+    assert settings.vllm_temperature == 0.3
+    assert settings.vllm_top_p == 0.95
+    assert settings.vllm_top_k == -1
+    assert settings.vllm_min_p == 0.05
+    assert settings.vllm_presence_penalty == 1.5
+    assert settings.vllm_repetition_penalty == 1.1
+
+
+def test_unknown_prompt_version_fails_at_startup() -> None:
+    with pytest.raises(ValueError) as raised:
+        Settings(**BASE_ENV, PERSONA_PROMPT_VERSION="v3")
+
+    assert "PERSONA_PROMPT_VERSION" in str(raised.value)
+    # hide_input_in_errors: 입력값은 메시지에 싣지 않는다.
+    assert "v3" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("PERSONA_VLLM_TEMPERATURE", "-0.1"),
+        ("PERSONA_VLLM_TOP_P", "0"),
+        ("PERSONA_VLLM_TOP_P", "1.01"),
+        ("PERSONA_VLLM_TOP_K", "0"),
+        ("PERSONA_VLLM_TOP_K", "-2"),
+        ("PERSONA_VLLM_MIN_P", "1.5"),
+        ("PERSONA_VLLM_PRESENCE_PENALTY", "2.5"),
+        ("PERSONA_VLLM_REPETITION_PENALTY", "0"),
+    ],
+)
+def test_out_of_range_sampling_fails_at_startup(env_name: str, value: str) -> None:
+    with pytest.raises(ValueError) as raised:
+        Settings(**BASE_ENV, **{env_name: value})
+
+    assert env_name in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("PERSONA_VLLM_TEMPERATURE", "0"),
+        ("PERSONA_VLLM_TOP_P", "1"),
+        ("PERSONA_VLLM_TOP_K", "1"),
+        ("PERSONA_VLLM_MIN_P", "1"),
+        ("PERSONA_VLLM_PRESENCE_PENALTY", "-2"),
+        ("PERSONA_VLLM_PRESENCE_PENALTY", "2"),
+    ],
+)
+def test_sampling_range_boundaries_are_accepted(env_name: str, value: str) -> None:
+    Settings(**BASE_ENV, **{env_name: value})

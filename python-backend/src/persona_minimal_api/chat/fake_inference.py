@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Iterator
 from uuid import UUID
 
-from ..retrieval.prompt import Message
+from ..retrieval.prompt import DEFAULT_PROMPT_VERSION, Message
 
 # UpstreamError는 vLLM adapter와 함께 쓰려고 inference.py로 옮겼다. 기존 테스트가
 # 여기서 import하므로 같은 이름으로 다시 내보낸다.
@@ -107,6 +107,7 @@ class FakeInferenceClient:
         delay_between_chunks: float = 0.0,
         raise_before_start: Exception | None = None,
         stop_after: int | None = None,
+        prompt_version: str = DEFAULT_PROMPT_VERSION,
     ):
         """
         chunks: 순서대로 내보낼 조각들. 잘린 UTF-8·이벤트 분할 시나리오는 호출자가
@@ -122,7 +123,10 @@ class FakeInferenceClient:
             disconnected")`를 던진다(정상 done이 아니라 "중간 upstream 단절"
             시뮬레이션). Protocol 계약상 예외 없이 조용히 멈추는 건 취소 전용이라
             — 단순 `return`으로는 정상 완료와 구분되지 않는다.
+        prompt_version: InferenceClient 계약 속성. Fake는 프롬프트 내용에 반응하지 않지만,
+            mock 모드에서도 서비스가 같은 버전으로 프롬프트를 조립해야 배선 확인이 된다.
         """
+        self.prompt_version = prompt_version
         self._chunks = chunks
         self._delay_before_first_chunk = delay_before_first_chunk
         self._delay_between_chunks = delay_between_chunks
@@ -132,11 +136,14 @@ class FakeInferenceClient:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_profile(cls, profile: MockWorkloadProfile) -> FakeInferenceClient:
+    def from_profile(
+        cls, profile: MockWorkloadProfile, *, prompt_version: str = DEFAULT_PROMPT_VERSION
+    ) -> FakeInferenceClient:
         """운영 mock용 인스턴스. 실패 시나리오 인자는 쓰지 않는다(테스트 전용)."""
         return cls(
             chunks=profile.fragments(),
             delay_between_chunks=profile.fragment_interval_seconds,
+            prompt_version=prompt_version,
         )
 
     def _cancel_event(self, generation_id: UUID) -> threading.Event:
